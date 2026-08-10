@@ -1,0 +1,21 @@
+[package]
+name = "bailey"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Ergonomic layered sandbox for running untrusted games and binaries on Linux"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+thiserror = "2"
+bitflags = "2"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "bailey"
+path = "src/main.rs"

@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = ["crates/bailey"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
