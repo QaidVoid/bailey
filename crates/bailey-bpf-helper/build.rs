@@ -1,15 +1,8 @@
-//! Build script.
-//!
-//! When the `ebpf` feature is enabled, compiles the `bailey-ebpf` crate for the
-//! BPF target with aya-build and places the object in `OUT_DIR` for the audit
-//! backend to embed. Without the feature this is a no-op, so a default build
-//! needs neither a nightly toolchain nor bpf-linker.
+//! Build script: compiles the `bailey-ebpf` programs for the BPF target with
+//! aya-build and places the object in `OUT_DIR` for the helper to embed.
+//! Requires a nightly toolchain and bpf-linker.
 
 fn main() {
-    if std::env::var_os("CARGO_FEATURE_EBPF").is_none() {
-        return;
-    }
-
     let ebpf_dir = format!("{}/../bailey-ebpf", env!("CARGO_MANIFEST_DIR"));
     aya_build::build_ebpf(
         [aya_build::Package {

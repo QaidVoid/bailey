@@ -20,8 +20,9 @@ around it and gives you the tools to see and shrink what it can reach.
 Implemented and verified: the policy model, cascading config, the enforcement
 backend (Landlock filesystem and network, seccomp, cgroups), namespace isolation
 (`--isolate`: user, mount, and PID namespaces with a reconstructed root),
-reconciliation, the CLI, and bundled profiles. The eBPF audit backend is
-implemented and compile-verified; running it needs a privileged environment
+reconciliation, the CLI, and bundled profiles. The audit backend records access
+with eBPF loaded by a minimal privileged helper, keeping the main tool
+unprivileged; it is compile-verified and needs a privileged environment to run
 (see below).
 
 Deferred: the exec (`bprm`) audit tracepoint, and the namespace fallback path's
@@ -36,15 +37,20 @@ toolchain required:
 cargo build --release
 ```
 
-The eBPF audit backend is behind the `ebpf` feature and needs a nightly
-toolchain and `bpf-linker` at build time:
+The audit backend records access with eBPF, which is loaded by a separate,
+minimal privileged helper (`bailey-bpf-helper`). Only that helper touches eBPF,
+so the main tool carries no eBPF code and needs no privilege. Building the helper
+needs a nightly toolchain and `bpf-linker`:
 
 ```
 rustup toolchain install nightly
 rustup component add rust-src --toolchain nightly
 cargo install bpf-linker
-cargo build --release --features ebpf
+cargo build --release -p bailey-bpf-helper
 ```
+
+The main tool finds the helper via the `BAILEY_BPF_HELPER` environment variable,
+then next to its own executable, then on `PATH`.
 
 ## Quick start
 
@@ -123,8 +129,8 @@ policy and flags anything ungranted, calling out high-risk access (network
 egress, credential reads, access outside the target directory).
 
 ```
-# Record a session and review it. Requires privilege (see below).
-sudo bailey audit --save-trace trace.json ./game
+# Record a session and review it. The helper supplies the privilege (see below).
+bailey audit --save-trace trace.json ./game
 
 # Turn the reviewed trace into a deny-by-default profile.
 # High-risk access is excluded unless you pass --include-high-risk.
@@ -143,12 +149,18 @@ access is flagged and never included without an explicit opt-in.
   Landlock ABI best-effort and reports restrictions the kernel cannot enforce.
 - Cgroup limits are best-effort. Without a writable delegated cgroup they are
   skipped with a warning rather than failing the run.
-- The audit backend loads eBPF programs and requires `CAP_BPF` and
-  `CAP_PERFMON`. Run it under `sudo`, or grant the binary the capabilities:
+- Audit records with eBPF, which needs `CAP_BPF` and `CAP_PERFMON`. Those
+  capabilities live only on the small `bailey-bpf-helper` binary, never on the
+  main tool. Grant them to the helper once:
 
   ```
-  sudo setcap cap_bpf,cap_perfmon+ep ./target/release/bailey
+  sudo setcap cap_bpf,cap_perfmon+ep ./target/release/bailey-bpf-helper
   ```
+
+  Then `bailey audit ...` runs unprivileged and drives the helper. Or skip the
+  capabilities and run the audit under `sudo` instead. The helper never spawns
+  the target; the unprivileged main tool runs it and only tells the helper which
+  PID to observe, so the game itself never runs with elevated privileges.
 
 ## Security notes and limits
 

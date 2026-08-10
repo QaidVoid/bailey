@@ -1,12 +1,11 @@
 //! Audit backend.
 //!
 //! Runs the target permissively while recording its filesystem and network
-//! access through cgroup-scoped eBPF programs, producing a trace of
-//! [`AccessEvent`]s for reconciliation. The eBPF machinery is added in a later
-//! change; the recording entry point is defined here so the CLI can wire the
-//! audit flow ahead of it.
+//! access, producing a trace of [`AccessEvent`]s for reconciliation. The
+//! recording itself is done by the privileged [`crate::backend::audit_helper`],
+//! so the main tool stays unprivileged.
 
-use crate::backend::{Backend, BackendError, Target};
+use crate::backend::{audit_helper, Backend, BackendError, Target};
 use crate::event::AccessEvent;
 use crate::policy::Policy;
 
@@ -22,17 +21,7 @@ impl AuditBackend {
         _policy: &Policy,
         target: &Target,
     ) -> Result<(i32, Vec<AccessEvent>), BackendError> {
-        #[cfg(feature = "ebpf")]
-        {
-            crate::backend::audit_ebpf::run(target)
-        }
-        #[cfg(not(feature = "ebpf"))]
-        {
-            let _ = target;
-            Err(BackendError::Unimplemented(
-                "audit backend (rebuild with --features ebpf)",
-            ))
-        }
+        audit_helper::run(target)
     }
 }
 

@@ -155,8 +155,6 @@ name = "bailey"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "aya",
- "aya-build",
  "bailey-common",
  "bitflags",
  "bytemuck",
@@ -171,6 +169,18 @@ dependencies = [
  "tempfile",
  "thiserror",
  "toml",
+]
+
+[[package]]
+name = "bailey-bpf-helper"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aya",
+ "aya-build",
+ "bailey-common",
+ "bytemuck",
+ "libc",
 ]
 
 [[package]]

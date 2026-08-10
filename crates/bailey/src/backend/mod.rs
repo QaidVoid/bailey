@@ -6,8 +6,7 @@
 //! [`probe`] module detects which kernel features are available.
 
 pub mod audit;
-#[cfg(feature = "ebpf")]
-pub mod audit_ebpf;
+pub mod audit_helper;
 pub mod enforce;
 pub mod isolation;
 pub mod probe;

@@ -1,0 +1,20 @@
+[package]
+name = "bailey-bpf-helper"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Minimal privileged helper that loads bailey's eBPF audit programs and streams access records"
+
+[dependencies]
+aya = "0.14"
+anyhow = "1"
+libc = "0.2"
+bailey-common = { path = "../bailey-common" }
+bytemuck = "1"
+
+[build-dependencies]
+aya-build = "0.2"
+
+[[bin]]
+name = "bailey-bpf-helper"
+path = "src/main.rs"
