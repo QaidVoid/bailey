@@ -1,0 +1,24 @@
+# Additive profile for native Linux games.
+#
+# Layers GPU, audio, display, and font access on top of the untrusted base.
+# It does not grant the game's own directory or save location: add those in
+# per-game config, and tighten the rest with an audit run.
+
+[filesystem]
+read = [
+    "/usr/share/fonts",
+    "~/.fonts",
+    "~/.local/share/fonts",
+    "~/.config/fontconfig",
+    "~/.icons",
+    "/usr/share/icons",
+]
+write = ["/run/user"]
+
+[[device]]
+path = "/dev/dri"
+access = "rw"
+
+[[device]]
+path = "/dev/snd"
+access = "rw"

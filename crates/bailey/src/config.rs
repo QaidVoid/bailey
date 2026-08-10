@@ -85,12 +85,34 @@ pub struct Resolved {
 /// on the command line. Missing config files are skipped; only files that exist
 /// contribute to the result.
 pub fn resolve(target: &Path, explicit: Option<&Path>) -> Result<Resolved, ConfigError> {
-    let paths = discover(target, explicit);
-    let mut layers = Vec::with_capacity(paths.len());
-    for path in paths {
+    resolve_with_bases(&[], target, explicit)
+}
+
+/// Resolve configuration with `bases` applied as the lowest-precedence layers.
+///
+/// Each base is a `(label, toml)` pair, typically a bundled profile. Bases are
+/// applied in order beneath all discovered config, so user config always
+/// overrides them. The label is used only in error messages.
+pub fn resolve_with_bases(
+    bases: &[(&str, &str)],
+    target: &Path,
+    explicit: Option<&Path>,
+) -> Result<Resolved, ConfigError> {
+    let base_dir = target_dir(target);
+    let mut layers = Vec::new();
+    for (label, text) in bases {
+        layers.push(parse_layer(label, text, &base_dir)?);
+    }
+    for path in discover(target, explicit) {
         layers.push(load_layer(&path)?);
     }
     merge(&layers)
+}
+
+/// List the config file paths that contribute to `target`, lowest precedence
+/// first. Bundled profile bases are not included.
+pub fn sources(target: &Path, explicit: Option<&Path>) -> Vec<PathBuf> {
+    discover(target, explicit)
 }
 
 /// A parsed config layer paired with the directory its relative paths resolve
@@ -346,6 +368,19 @@ fn build_egress(network: &RawNetwork) -> Egress {
     } else {
         Egress::DenyAll
     }
+}
+
+fn parse_layer(label: &str, text: &str, base: &Path) -> Result<Layer, ConfigError> {
+    let path = PathBuf::from(label);
+    let raw: RawLayer = toml::from_str(text).map_err(|source| ConfigError::Parse {
+        path: path.clone(),
+        source,
+    })?;
+    Ok(Layer {
+        path,
+        base: base.to_path_buf(),
+        raw,
+    })
 }
 
 fn load_layer(path: &Path) -> Result<Layer, ConfigError> {

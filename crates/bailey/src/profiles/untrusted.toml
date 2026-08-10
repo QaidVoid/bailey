@@ -1,0 +1,34 @@
+# Minimal deny-by-default base profile.
+#
+# Grants only what a dynamically linked binary needs to start and run: the
+# system libraries and interpreter, read access to system configuration, and the
+# handful of device nodes almost every program opens. No home directory access,
+# no network. This is the safe floor that every run starts from.
+
+[filesystem]
+read = ["/usr", "/lib", "/lib64", "/bin", "/sbin", "/etc", "/proc", "/sys"]
+execute = ["/usr", "/lib", "/lib64", "/bin", "/sbin"]
+
+[[device]]
+path = "/dev/null"
+access = "rw"
+
+[[device]]
+path = "/dev/zero"
+access = "r"
+
+[[device]]
+path = "/dev/full"
+access = "rw"
+
+[[device]]
+path = "/dev/urandom"
+access = "r"
+
+[[device]]
+path = "/dev/random"
+access = "r"
+
+[[device]]
+path = "/dev/tty"
+access = "rw"
