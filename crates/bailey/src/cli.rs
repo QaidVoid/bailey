@@ -44,6 +44,9 @@ struct RunArgs {
     /// Bundled profile to use as the base.
     #[arg(short, long, default_value = profiles::DEFAULT)]
     profile: String,
+    /// Reconstruct the target's world with namespaces (defense in depth).
+    #[arg(long)]
+    isolate: bool,
     /// The target executable.
     target: PathBuf,
     /// Arguments passed to the target.
@@ -144,7 +147,10 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
     };
 
     resolved.hooks.run_pre_launch()?;
-    let code = EnforceBackend.run(&resolved.policy, &target)?;
+    let backend = EnforceBackend {
+        isolate: args.isolate,
+    };
+    let code = backend.run(&resolved.policy, &target)?;
     if let Err(err) = resolved.hooks.run_post_exit(code) {
         eprintln!("bailey: post-exit hook failed: {err}");
     }

@@ -24,6 +24,7 @@ use landlock::{
     RulesetAttr, RulesetCreatedAttr, RulesetStatus, ABI,
 };
 
+use crate::backend::isolation::{self, BindMount, IsolationPlan};
 use crate::backend::{Backend, BackendError, Target};
 use crate::policy::{self, Egress, Policy, ResourceLimits};
 
@@ -33,7 +34,10 @@ const TARGET_ABI: ABI = ABI::V5;
 
 /// Deny-by-default enforcement backend.
 #[derive(Debug, Default)]
-pub struct EnforceBackend;
+pub struct EnforceBackend {
+    /// Reconstruct the target's world with namespaces (defense in depth).
+    pub isolate: bool,
+}
 
 impl Backend for EnforceBackend {
     fn run(&self, policy: &Policy, target: &Target) -> Result<i32, BackendError> {
@@ -43,6 +47,20 @@ impl Backend for EnforceBackend {
         let seccomp = build_seccomp_filter()
             .map_err(|err| BackendError::Unsupported(format!("seccomp: {err}")))?;
 
+        let isolation = if self.isolate {
+            if isolation::available() {
+                Some(build_isolation_plan(policy))
+            } else {
+                eprintln!(
+                    "bailey: warning: unprivileged user namespaces unavailable; \
+                     running without namespace isolation"
+                );
+                None
+            }
+        } else {
+            None
+        };
+
         let mut command = Command::new(&target.program);
         command.args(&target.args);
         if let Some(cwd) = &target.cwd {
@@ -51,10 +69,15 @@ impl Backend for EnforceBackend {
 
         // Safety: the closure runs in the forked child before exec. Bailey is
         // single-threaded at this point, so the usual fork-safety hazard of
-        // touching another thread's locks does not apply.
+        // touching another thread's locks does not apply. Namespaces and the
+        // reconstructed root are set up first, then Landlock is applied against
+        // the new root, then seccomp closes the syscall surface last.
         unsafe {
             command.pre_exec(move || {
                 set_no_new_privs()?;
+                if let Some(isolation) = &isolation {
+                    isolation::enter(isolation)?;
+                }
                 plan.apply()?;
                 seccompiler::apply_filter(&seccomp)
                     .map_err(|err| io::Error::other(format!("seccomp: {err}")))?;
@@ -156,6 +179,45 @@ impl LandlockPlan {
         }
         Ok(())
     }
+}
+
+/// Build the bind-mount set for isolation from the policy's granted paths.
+///
+/// Nested paths under an already-included directory are skipped (they come
+/// along with the parent bind), and `/proc` is omitted because a fresh `/proc`
+/// is mounted in the new PID namespace.
+fn build_isolation_plan(policy: &Policy) -> IsolationPlan {
+    let mut paths: Vec<PathBuf> = policy
+        .filesystem
+        .iter()
+        .map(|rule| rule.path.clone())
+        .chain(policy.devices.iter().map(|rule| rule.path.clone()))
+        .filter(|path| !path.starts_with("/proc"))
+        .collect();
+    paths.sort();
+    paths.dedup();
+
+    let mut binds = Vec::new();
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for path in paths {
+        if roots.iter().any(|root| path.starts_with(root)) {
+            continue;
+        }
+        let is_dir = std::fs::metadata(&path)
+            .map(|meta| meta.is_dir())
+            .unwrap_or(false);
+        if !path.exists() {
+            continue;
+        }
+        if is_dir {
+            roots.push(path.clone());
+        }
+        binds.push(BindMount {
+            source: path,
+            is_dir,
+        });
+    }
+    IsolationPlan { binds }
 }
 
 fn fs_access_bits(access: policy::Access) -> Option<BitFlags<AccessFs>> {
