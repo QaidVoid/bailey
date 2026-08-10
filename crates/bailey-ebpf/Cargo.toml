@@ -13,9 +13,5 @@ bailey-common = { path = "../bailey-common" }
 name = "bailey-ebpf"
 path = "src/main.rs"
 
-[profile.dev]
-opt-level = 3
-debug = false
-
-[profile.release]
-lto = true
+# aya-build compiles this crate with --release; the workspace release profile
+# (opt-level 3) is what the BPF verifier needs.

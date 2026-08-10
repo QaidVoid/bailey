@@ -11,6 +11,7 @@ use clap::{Parser, Subcommand};
 
 use crate::backend::{audit::AuditBackend, enforce::EnforceBackend, Backend, Target};
 use crate::config::{self, Resolved};
+use crate::event::AccessEvent;
 use crate::policy::Access;
 use crate::profiles;
 use crate::reconcile::{self, Finding, Risk};
@@ -28,10 +29,10 @@ enum Command {
     /// Run a target under enforcement.
     Run(RunArgs),
     /// Run a target under audit, recording its access and reconciling it.
-    Audit(RunArgs),
+    Audit(AuditArgs),
     /// Resolve and print the effective policy for a target.
     Show(ShowArgs),
-    /// Inspect bundled profiles.
+    /// Inspect bundled profiles and generate profiles from audit traces.
     Profile(ProfileArgs),
 }
 
@@ -43,6 +44,24 @@ struct RunArgs {
     /// Bundled profile to use as the base.
     #[arg(short, long, default_value = profiles::DEFAULT)]
     profile: String,
+    /// The target executable.
+    target: PathBuf,
+    /// Arguments passed to the target.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    args: Vec<String>,
+}
+
+#[derive(Debug, clap::Args)]
+struct AuditArgs {
+    /// Explicit config file, taking highest precedence.
+    #[arg(short, long)]
+    config: Option<PathBuf>,
+    /// Bundled profile to use as the base.
+    #[arg(short, long, default_value = profiles::DEFAULT)]
+    profile: String,
+    /// Write the recorded access trace to this file as JSON.
+    #[arg(long)]
+    save_trace: Option<PathBuf>,
     /// The target executable.
     target: PathBuf,
     /// Arguments passed to the target.
@@ -72,6 +91,27 @@ struct ProfileArgs {
 enum ProfileCommand {
     /// List the bundled profiles.
     List,
+    /// Generate a deny-by-default profile from a saved audit trace.
+    Generate(GenerateArgs),
+}
+
+#[derive(Debug, clap::Args)]
+struct GenerateArgs {
+    /// A trace file previously written with `audit --save-trace`.
+    #[arg(long)]
+    trace: PathBuf,
+    /// The target the trace was recorded for, used to resolve the base policy.
+    #[arg(long)]
+    target: PathBuf,
+    /// Explicit config file used when resolving the base policy.
+    #[arg(short, long)]
+    config: Option<PathBuf>,
+    /// Bundled profile used as the base when resolving.
+    #[arg(short, long, default_value = profiles::DEFAULT)]
+    profile: String,
+    /// Include high-risk access (egress, credentials) in the generated profile.
+    #[arg(long)]
+    include_high_risk: bool,
 }
 
 /// Parse arguments and dispatch the selected command.
@@ -97,7 +137,11 @@ fn dispatch(command: Command) -> anyhow::Result<i32> {
 
 fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
     let resolved = resolve(&args.profile, &args.target, args.config.as_deref())?;
-    let target = target_from(&args);
+    let target = Target {
+        program: args.target,
+        args: args.args,
+        cwd: None,
+    };
 
     resolved.hooks.run_pre_launch()?;
     let code = EnforceBackend.run(&resolved.policy, &target)?;
@@ -107,15 +151,24 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
     Ok(code)
 }
 
-fn cmd_audit(args: RunArgs) -> anyhow::Result<i32> {
+fn cmd_audit(args: AuditArgs) -> anyhow::Result<i32> {
     let resolved = resolve(&args.profile, &args.target, args.config.as_deref())?;
-    let target = target_from(&args);
     let target_dir = target_dir(&args.target);
+    let target = Target {
+        program: args.target,
+        args: args.args,
+        cwd: None,
+    };
 
     resolved.hooks.run_pre_launch()?;
     let (code, trace) = AuditBackend.run_and_record(&resolved.policy, &target)?;
     if let Err(err) = resolved.hooks.run_post_exit(code) {
         eprintln!("bailey: post-exit hook failed: {err}");
+    }
+
+    if let Some(path) = &args.save_trace {
+        std::fs::write(path, serde_json::to_string_pretty(&trace)?)?;
+        eprintln!("bailey: wrote trace to {}", path.display());
     }
 
     let findings = reconcile::reconcile(&trace, &resolved.policy, &target_dir);
@@ -144,20 +197,38 @@ fn cmd_profile(args: ProfileArgs) -> anyhow::Result<i32> {
             }
             Ok(0)
         }
+        ProfileCommand::Generate(args) => cmd_profile_generate(args),
     }
+}
+
+fn cmd_profile_generate(args: GenerateArgs) -> anyhow::Result<i32> {
+    let text = std::fs::read_to_string(&args.trace)?;
+    let trace: Vec<AccessEvent> = serde_json::from_str(&text)?;
+    let resolved = resolve(&args.profile, &args.target, args.config.as_deref())?;
+    let target_dir = target_dir(&args.target);
+
+    let findings = reconcile::reconcile(&trace, &resolved.policy, &target_dir);
+    let excluded = findings
+        .iter()
+        .filter(|finding| finding.risk.is_high())
+        .count();
+    let selected: Vec<Finding> = findings
+        .into_iter()
+        .filter(|finding| args.include_high_risk || !finding.risk.is_high())
+        .collect();
+
+    if excluded > 0 && !args.include_high_risk {
+        eprintln!(
+            "bailey: excluded {excluded} high-risk access(es); pass --include-high-risk to add them"
+        );
+    }
+    print!("{}", reconcile::generate_profile(&selected));
+    Ok(0)
 }
 
 fn resolve(profile: &str, target: &Path, explicit: Option<&Path>) -> anyhow::Result<Resolved> {
     let bases = profiles::base_layers(profile).map_err(|err| anyhow::anyhow!(err))?;
     Ok(config::resolve_with_bases(&bases, target, explicit)?)
-}
-
-fn target_from(args: &RunArgs) -> Target {
-    Target {
-        program: args.target.clone(),
-        args: args.args.clone(),
-        cwd: None,
-    }
 }
 
 fn target_dir(target: &Path) -> PathBuf {
@@ -225,22 +296,18 @@ fn print_findings(findings: &[Finding]) {
                 Risk::High(reason) => reason.as_str(),
                 Risk::Low => "",
             };
-            println!(
-                "  [{:?}] {} ({reason})",
-                finding.kind,
-                describe_resource(finding),
-            );
+            println!("  [{:?}] {} ({reason})", finding.kind, describe(finding));
         }
     }
     if !low.is_empty() {
         println!("\nroutine (safe to grant):");
         for finding in low {
-            println!("  [{:?}] {}", finding.kind, describe_resource(finding));
+            println!("  [{:?}] {}", finding.kind, describe(finding));
         }
     }
 }
 
-fn describe_resource(finding: &Finding) -> String {
+fn describe(finding: &Finding) -> String {
     use crate::event::Resource;
     match &finding.resource {
         Resource::Path(path) => path.display().to_string(),
