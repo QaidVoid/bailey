@@ -18,12 +18,14 @@ around it and gives you the tools to see and shrink what it can reach.
 ## Status
 
 Implemented and verified: the policy model, cascading config, the enforcement
-backend (Landlock filesystem and network, seccomp, cgroups), reconciliation, the
-CLI, and bundled profiles. The eBPF audit backend is implemented and
-compile-verified; running it needs a privileged environment (see below).
+backend (Landlock filesystem and network, seccomp, cgroups), namespace isolation
+(`--isolate`: user, mount, and PID namespaces with a reconstructed root),
+reconciliation, the CLI, and bundled profiles. The eBPF audit backend is
+implemented and compile-verified; running it needs a privileged environment
+(see below).
 
-Deferred: namespace and mount-view hardening (defense in depth on top of
-Landlock), and the exec (`bprm`) audit tracepoint.
+Deferred: the exec (`bprm`) audit tracepoint, and the namespace fallback path's
+runtime test (needs a host with user namespaces disabled).
 
 ## Build
 
@@ -58,6 +60,9 @@ bailey profile list
 
 # Use the native-game profile as the base (adds GPU, audio, display, fonts).
 bailey run --profile native-game ./game
+
+# Add namespace isolation: ungranted paths are absent, host processes invisible.
+bailey run --isolate ./game
 ```
 
 The enforcement backend is unprivileged. If a program will not start, its policy
@@ -147,9 +152,11 @@ access is flagged and never included without an explicit opt-in.
 
 ## Security notes and limits
 
-- Landlock denies access to ungranted paths but does not hide them: a path still
-  exists, opening it just fails. Enforcement is by denial, not by concealment.
-  Namespace-based world reconstruction is a planned defense-in-depth layer.
+- Landlock alone denies access to ungranted paths but does not hide them: a path
+  still exists, opening it just fails. Add `--isolate` for namespace-based world
+  reconstruction, where ungranted paths are absent from the target's mount table
+  and host processes are invisible. Isolation needs unprivileged user namespaces
+  and falls back to Landlock-only with a warning when they are unavailable.
 - Landlock network rules are TCP-port based. Host or CIDR restrictions in
   `egress_allow` are advisory: bailey enforces the port and warns that the host
   is not enforced.
