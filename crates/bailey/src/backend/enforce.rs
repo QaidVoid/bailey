@@ -20,8 +20,8 @@ use std::process::Command;
 
 use enumflags2::BitFlags;
 use landlock::{
-    Access, AccessFs, AccessNet, CompatLevel, Compatible, NetPort, PathBeneath, PathFd, Ruleset,
-    RulesetAttr, RulesetCreatedAttr, RulesetStatus, ABI,
+    ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, NetPort, PathBeneath, PathFd,
+    Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus,
 };
 
 use crate::backend::isolation::{self, BindMount, IsolationPlan};
@@ -231,11 +231,7 @@ fn fs_access_bits(access: policy::Access) -> Option<BitFlags<AccessFs>> {
     if access.contains(policy::Access::EXECUTE) {
         bits |= AccessFs::Execute;
     }
-    if bits.is_empty() {
-        None
-    } else {
-        Some(bits)
-    }
+    if bits.is_empty() { None } else { Some(bits) }
 }
 
 fn landlock_err(err: impl std::fmt::Display) -> io::Error {
@@ -243,13 +239,13 @@ fn landlock_err(err: impl std::fmt::Display) -> io::Error {
 }
 
 fn report_degradation(policy: &Policy) {
-    if let Egress::Allow(rules) = &policy.network.egress {
-        if rules.iter().any(|rule| rule.host != "*") {
-            eprintln!(
-                "bailey: warning: host-based egress rules are not enforced by Landlock; \
+    if let Egress::Allow(rules) = &policy.network.egress
+        && rules.iter().any(|rule| rule.host != "*")
+    {
+        eprintln!(
+            "bailey: warning: host-based egress rules are not enforced by Landlock; \
                  outbound access is limited by TCP port only"
-            );
-        }
+        );
     }
 }
 

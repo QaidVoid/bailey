@@ -5,7 +5,7 @@
 //! recording itself is done by the privileged [`crate::backend::audit_helper`],
 //! so the main tool stays unprivileged.
 
-use crate::backend::{audit_helper, Backend, BackendError, Target};
+use crate::backend::{Backend, BackendError, Target, audit_helper};
 use crate::event::AccessEvent;
 use crate::policy::Policy;
 

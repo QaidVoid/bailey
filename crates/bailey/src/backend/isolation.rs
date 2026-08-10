@@ -10,8 +10,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use nix::mount::{mount, umount2, MntFlags, MsFlags};
-use nix::sched::{unshare, CloneFlags};
+use nix::mount::{MntFlags, MsFlags, mount, umount2};
+use nix::sched::{CloneFlags, unshare};
 use nix::unistd::{chdir, pivot_root};
 
 /// A path to bind into the reconstructed root.
@@ -28,13 +28,59 @@ pub struct IsolationPlan {
     pub binds: Vec<BindMount>,
 }
 
-/// Whether unprivileged user namespaces are available on this host.
+/// Whether namespace isolation actually works on this host.
+///
+/// This probes for real by attempting the core setup (user namespace, uid/gid
+/// maps, mount namespace, and a tmpfs mount) in a throwaway child. A sysctl
+/// alone is not enough: a host can report user namespaces as permitted while a
+/// policy such as AppArmor still blocks `unshare(CLONE_NEWUSER)`. The caller
+/// (the enforcement backend) is single-threaded when it calls this, so the fork
+/// is safe.
 pub fn available() -> bool {
-    fs::read_to_string("/proc/sys/user/max_user_namespaces")
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-        .map(|max| max > 0)
-        .unwrap_or(false)
+    match unsafe { libc::fork() } {
+        -1 => false,
+        0 => {
+            let code = i32::from(probe().is_err());
+            unsafe { libc::_exit(code) }
+        }
+        pid => {
+            let mut status: libc::c_int = 0;
+            unsafe { libc::waitpid(pid, &mut status, 0) };
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+        }
+    }
+}
+
+fn probe() -> io::Result<()> {
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+    unshare(CloneFlags::CLONE_NEWUSER).map_err(errno)?;
+    fs::write("/proc/self/setgroups", "deny")?;
+    fs::write("/proc/self/gid_map", format!("0 {gid} 1"))?;
+    fs::write("/proc/self/uid_map", format!("0 {uid} 1"))?;
+    unshare(CloneFlags::CLONE_NEWNS).map_err(errno)?;
+    mount(
+        None::<&str>,
+        "/",
+        None::<&str>,
+        MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+        None::<&str>,
+    )
+    .map_err(errno)?;
+
+    let dir = PathBuf::from(format!("/tmp/.bailey-probe.{}", unsafe { libc::getpid() }));
+    fs::create_dir_all(&dir)?;
+    let mounted = mount(
+        Some("tmpfs"),
+        &dir,
+        Some("tmpfs"),
+        MsFlags::empty(),
+        None::<&str>,
+    )
+    .map_err(errno);
+    let _ = umount2(&dir, MntFlags::MNT_DETACH);
+    let _ = fs::remove_dir(&dir);
+    mounted
 }
 
 /// Enter the isolation namespaces and reconstruct the root.

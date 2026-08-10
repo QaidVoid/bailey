@@ -9,7 +9,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
-use crate::backend::{audit::AuditBackend, enforce::EnforceBackend, Backend, Target};
+use crate::backend::{Backend, Target, audit::AuditBackend, enforce::EnforceBackend};
 use crate::config::{self, Resolved};
 use crate::event::AccessEvent;
 use crate::policy::Access;

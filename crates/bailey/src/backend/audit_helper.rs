@@ -99,12 +99,12 @@ fn locate_helper() -> Result<PathBuf, BackendError> {
     if let Some(path) = std::env::var_os("BAILEY_BPF_HELPER") {
         return Ok(PathBuf::from(path));
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let candidate = dir.join(HELPER_BIN);
-            if candidate.is_file() {
-                return Ok(candidate);
-            }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let candidate = dir.join(HELPER_BIN);
+        if candidate.is_file() {
+            return Ok(candidate);
         }
     }
     // Fall back to PATH resolution by name.

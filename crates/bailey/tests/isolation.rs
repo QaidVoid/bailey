@@ -1,7 +1,9 @@
 //! Integration tests for namespace isolation.
 //!
 //! These run real programs under user, mount, and PID namespaces. They self-skip
-//! where Landlock or unprivileged user namespaces are unavailable.
+//! where isolation cannot actually be established (for example, a host that
+//! restricts unprivileged user namespaces via AppArmor), detected by checking
+//! whether the target really lands as PID 1.
 
 use std::fs;
 use std::process::Command;
@@ -10,14 +12,21 @@ fn bailey() -> &'static str {
     env!("CARGO_BIN_EXE_bailey")
 }
 
-fn supported() -> bool {
-    bailey::backend::probe::probe().landlock && bailey::backend::isolation::available()
+/// True only when an isolated run genuinely enters a new PID namespace. When the
+/// host forces the Landlock-only fallback, the target keeps its host PID, so
+/// this returns false and the tests skip.
+fn isolation_active() -> bool {
+    let output = Command::new(bailey())
+        .args(["run", "--isolate", "/bin/sh", "--", "-c", "echo $$"])
+        .output();
+    matches!(output, Ok(out) if out.status.success()
+        && String::from_utf8_lossy(&out.stdout).trim() == "1")
 }
 
 #[test]
 fn ungranted_path_is_absent_under_isolation() {
-    if !supported() {
-        eprintln!("skipping: Landlock or user namespaces unavailable");
+    if !isolation_active() {
+        eprintln!("skipping: isolation unavailable on this host");
         return;
     }
     let output = Command::new(bailey())
@@ -35,8 +44,8 @@ fn ungranted_path_is_absent_under_isolation() {
 
 #[test]
 fn target_is_pid_one_under_isolation() {
-    if !supported() {
-        eprintln!("skipping: Landlock or user namespaces unavailable");
+    if !isolation_active() {
+        eprintln!("skipping: isolation unavailable on this host");
         return;
     }
     let output = Command::new(bailey())
@@ -49,8 +58,8 @@ fn target_is_pid_one_under_isolation() {
 
 #[test]
 fn landlock_still_denies_writes_under_isolation() {
-    if !supported() {
-        eprintln!("skipping: Landlock or user namespaces unavailable");
+    if !isolation_active() {
+        eprintln!("skipping: isolation unavailable on this host");
         return;
     }
     let dir = tempfile::tempdir().unwrap();

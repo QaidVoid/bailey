@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use aya::maps::{HashMap as AyaHashMap, RingBuf};
 use aya::programs::TracePoint;
-use aya::{include_bytes_aligned, Ebpf};
+use aya::{Ebpf, include_bytes_aligned};
 use bailey_common::AccessRecord;
 
 fn main() {

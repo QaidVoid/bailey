@@ -206,10 +206,10 @@ struct Accumulator {
 fn discover(target: &Path, explicit: Option<&Path>) -> Vec<PathBuf> {
     let mut paths = Vec::new();
 
-    if let Some(global) = global_config_path() {
-        if global.is_file() {
-            paths.push(global);
-        }
+    if let Some(global) = global_config_path()
+        && global.is_file()
+    {
+        paths.push(global);
     }
 
     let start = target_dir(target);
@@ -472,15 +472,15 @@ fn normalize_lexical(path: &Path) -> PathBuf {
 }
 
 fn expand_tilde(raw: &str) -> PathBuf {
-    if raw == "~" {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home);
-        }
+    if raw == "~"
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home);
     }
-    if let Some(rest) = raw.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return Path::new(&home).join(rest);
-        }
+    if let Some(rest) = raw.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return Path::new(&home).join(rest);
     }
     PathBuf::from(raw)
 }
@@ -498,10 +498,10 @@ fn target_dir(target: &Path) -> PathBuf {
 }
 
 fn global_config_path() -> Option<PathBuf> {
-    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
-        if !xdg.is_empty() {
-            return Some(Path::new(&xdg).join("bailey").join("config.toml"));
-        }
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME")
+        && !xdg.is_empty()
+    {
+        return Some(Path::new(&xdg).join("bailey").join("config.toml"));
     }
     std::env::var_os("HOME").map(|home| {
         Path::new(&home)

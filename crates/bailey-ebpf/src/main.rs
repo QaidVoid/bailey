@@ -140,8 +140,8 @@ fn is_tracked(pid: u32) -> bool {
     unsafe { TRACKED.get(&pid).is_some() }
 }
 
-#[link_section = "license"]
-#[no_mangle]
+#[unsafe(link_section = "license")]
+#[unsafe(no_mangle)]
 static LICENSE: [u8; 4] = *b"GPL\0";
 
 #[cfg(not(test))]
