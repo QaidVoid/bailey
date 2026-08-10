@@ -20,9 +20,19 @@ impl AuditBackend {
     pub fn run_and_record(
         &self,
         _policy: &Policy,
-        _target: &Target,
+        target: &Target,
     ) -> Result<(i32, Vec<AccessEvent>), BackendError> {
-        Err(BackendError::Unimplemented("audit backend (eBPF)"))
+        #[cfg(feature = "ebpf")]
+        {
+            crate::backend::audit_ebpf::run(target)
+        }
+        #[cfg(not(feature = "ebpf"))]
+        {
+            let _ = target;
+            Err(BackendError::Unimplemented(
+                "audit backend (rebuild with --features ebpf)",
+            ))
+        }
     }
 }
 

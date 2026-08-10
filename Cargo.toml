@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/bailey"]
+members = ["crates/bailey", "crates/bailey-common", "crates/bailey-ebpf"]
+# bailey-ebpf is a member so aya-build can resolve it with `--package`, but it is
+# built only for the BPF target, so bare host builds and tests skip it.
+default-members = ["crates/bailey", "crates/bailey-common"]
 
 [workspace.package]
 edition = "2021"

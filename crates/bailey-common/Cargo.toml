@@ -1,0 +1,9 @@
+[package]
+name = "bailey-common"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Shared no_std types crossing the bailey eBPF/userspace boundary"
+
+[dependencies]
+bytemuck = { version = "1", default-features = false, features = ["derive"] }

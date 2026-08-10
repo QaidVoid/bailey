@@ -1,0 +1,21 @@
+[package]
+name = "bailey-ebpf"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "eBPF observation programs for the bailey audit backend"
+
+[dependencies]
+aya-ebpf = "0.2.1"
+bailey-common = { path = "../bailey-common" }
+
+[[bin]]
+name = "bailey-ebpf"
+path = "src/main.rs"
+
+[profile.dev]
+opt-level = 3
+debug = false
+
+[profile.release]
+lto = true

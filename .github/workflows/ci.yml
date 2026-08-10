@@ -19,4 +19,7 @@ jobs:
       - name: Build
         run: cargo build --all-targets
       - name: Test
-        run: cargo test --all
+        run: cargo test
+# The eBPF audit backend (the bailey-ebpf member and the `ebpf` feature) needs a
+# nightly toolchain and bpf-linker, so it is not built here. Bare cargo commands
+# act on default-members, which excludes it.
