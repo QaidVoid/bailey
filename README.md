@@ -201,14 +201,14 @@ Being clear about the edges matters more than sounding complete.
 
 ## Status
 
-Working and verified: the policy model, cascading config, the enforcement backend
-(Landlock filesystem and network rules, seccomp, cgroups), namespace isolation
-under `--isolate`, reconciliation, the CLI, and the bundled profiles.
+Everything described above is implemented and exercised by the test suite,
+including the audit backend: its eBPF programs are loaded and attached for real
+in tests, on a host where the helper has its capabilities. Tests that need
+something the host cannot provide, a delegated cgroup or the audit helper, skip
+rather than pretend.
 
-The audit backend records through the privileged helper and is compile-verified;
-its integration tests need a host where the helper has its capabilities.
-
-Planned work is listed in the documentation's roadmap.
+What bailey does not do is listed above and in the documentation, with the reason
+in each case.
 
 ## Documentation
 

@@ -63,6 +63,6 @@ distributions include it by default on kernels that support it.
 x86_64 and aarch64 are supported for the seccomp filter. Other architectures fail
 to build the filter and therefore fail to establish a sandbox.
 
-The eBPF audit programs currently use x86_64 tracepoint field offsets, so audit
-results on aarch64 are not trustworthy. Making argument access architecture
-independent is on the [roadmap](/roadmap).
+The eBPF audit programs attach by BTF id and take their argument layout from the
+running kernel, so they are not tied to one architecture. They have been
+exercised on x86_64.

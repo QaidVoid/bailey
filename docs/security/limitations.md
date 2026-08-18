@@ -129,4 +129,6 @@ set. It is a hardening layer, not the access control.
 
 ---
 
-Fixes for all of the above are on the [roadmap](/roadmap).
+None of these are pending work with a fix on the way. Each is either a property
+of the mechanisms bailey builds on, or a decision recorded in
+[project status](/roadmap).

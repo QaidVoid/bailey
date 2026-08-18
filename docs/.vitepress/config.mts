@@ -16,7 +16,7 @@ export default defineConfig({
       { text: 'Guide', link: '/guide/what-is-bailey' },
       { text: 'Reference', link: '/reference/cli' },
       { text: 'Security', link: '/security/model' },
-      { text: 'Roadmap', link: '/roadmap' },
+      { text: 'Status', link: '/roadmap' },
     ],
 
     sidebar: {

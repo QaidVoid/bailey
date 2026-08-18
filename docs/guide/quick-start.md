@@ -91,11 +91,9 @@ bailey run --isolate ./program
 This needs unprivileged user namespaces. Where they are unavailable, bailey warns
 and falls back to Landlock and seccomp.
 
-::: warning
-Under `--isolate` today, the working directory is not carried into the new root,
-so relative paths do not resolve. Use absolute paths, or run without `--isolate`,
-until [this is fixed](/roadmap).
-:::
+Isolation also gives the program a private `/tmp`, a private home, and the
+directory you invoked it from, so relative paths work as they do outside. See
+[environment and storage](/guide/environment).
 
 ## 5. Start from a profile
 

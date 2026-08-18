@@ -75,15 +75,22 @@ There is no writable delegated cgroup v2 for your session. On a systemd system,
 running inside a user session usually provides one; running from a bare TTY or an
 unusual init may not.
 
-## Relative paths break under `--isolate`
+## Relative paths fail under `--isolate`
 
 ```
 cat: ./file.txt: No such file or directory
 ```
 
-The working directory is not carried into the reconstructed root, so the program
-starts at `/`. Use absolute paths, or drop `--isolate`, until this is fixed. See
-the [roadmap](/roadmap).
+The target keeps the directory you invoked it from, but under `--isolate` that
+directory only exists inside the sandbox if the policy grants it. Where it does
+not, the run says so and starts in the private home instead:
+
+```
+bailey: warning: the working directory is not granted, so it is absent under
+isolation; starting in /home/you instead
+```
+
+Grant the directory, and the relative path resolves.
 
 ## The audit helper will not start
 

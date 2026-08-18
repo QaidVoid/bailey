@@ -76,7 +76,8 @@ input and window contents. No filesystem policy fixes that; use Wayland.
 drivers are a large kernel attack surface. Every grant is a decision, and the
 device grants are the expensive ones.
 
-**Audit mode.** Currently runs the target with no confinement at all.
+**A partial egress allowance.** Allowing any egress drops the network namespace,
+so non-TCP traffic and the host's loopback are both reachable.
 
 The full list with details is in [known limitations](/security/limitations).
 

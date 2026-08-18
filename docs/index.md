@@ -28,5 +28,5 @@ features:
   - title: Unprivileged
     details: No setuid binary, no daemon, no container runtime. Only the optional audit recorder needs capabilities, and it lives in a separate minimal binary.
   - title: Honest about its edges
-    details: Every mechanism can be absent or partial on a given kernel. Bailey negotiates what it can, tells you what it could not enforce, and documents what it does not cover yet.
+    details: Every mechanism can be absent or partial on a given kernel. Bailey negotiates what it can, reports what it could not enforce after every run, and documents the gaps it does not close.
 ---
