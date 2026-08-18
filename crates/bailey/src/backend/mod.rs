@@ -9,6 +9,7 @@ pub mod audit;
 pub mod audit_helper;
 pub mod enforce;
 pub mod isolation;
+pub mod network;
 pub mod probe;
 
 use std::path::PathBuf;

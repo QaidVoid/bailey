@@ -6,19 +6,20 @@ different decisions.
 
 ## Network
 
-### `egress = "deny"` blocks TCP only
+### A partial egress allowance restricts TCP only
 
-Landlock's network rules cover TCP connect and bind. UDP, QUIC, DNS, ICMP, and
-raw sockets are unaffected.
+When the policy allows any egress, or binds a port, the target stays in the
+host's network namespace and only Landlock's TCP port rules apply. UDP, QUIC,
+DNS, and ICMP are unrestricted in that mode, and the run says so:
 
-```sh
-# Under the default deny-all-egress policy:
-# TCP connect to 1.1.1.1:443 -> blocked
-# UDP datagram to 8.8.8.8:53 -> delivered
+```
+bailey: warning: outbound access is restricted by TCP port only;
+UDP, QUIC, and DNS are not restricted
 ```
 
-A program that wants to send data off the machine can. Planned fix: run the target
-in a network namespace with no route when the policy denies egress.
+A full `egress = "deny"`, which is the default, does not have this problem: the
+target gets its own network namespace with no route off the host, so every
+protocol fails.
 
 ### Host and CIDR rules are advisory
 
@@ -88,10 +89,12 @@ The new root is built at a fixed path under the host's `/tmp`, named by the PID
 inside the new namespace, which is always 1. It is not removed after the run.
 Concurrent isolated runs collide.
 
-### No network namespace
+### Isolation depends on user namespaces
 
-Isolation does not currently affect network reachability, including access to
-host abstract UNIX sockets such as X11 and D-Bus.
+Both the reconstructed root and the network namespace need unprivileged user
+namespaces. Where a host disables them, the run falls back to Landlock and
+seccomp and reports the downgrade, which for the network means TCP-only
+restriction.
 
 ## Resource limits
 

@@ -32,10 +32,12 @@ needs" into a profile you can read.
 
 | Layer | Mechanism | What it does |
 | --- | --- | --- |
-| Filesystem and network | Landlock | Deny-by-default access rules on paths and TCP ports |
+| Filesystem | Landlock | Deny-by-default rules on path hierarchies |
+| Network | Network namespace, Landlock | Denied egress means no route at all; a partial allowance is enforced by TCP port |
 | Syscalls | seccomp | Removes syscalls a normal program never needs |
 | Resources | cgroup v2 | Caps memory, process count, and CPU |
 | World | user, mount, PID namespaces | Rebuilds the root from the policy, so ungranted paths are absent rather than merely denied, and host processes are invisible |
+| Reachability | Landlock scoping | Host abstract UNIX sockets and processes outside the sandbox are out of reach |
 | Observation | eBPF, via a privileged helper | Records what the program opens and connects to, without blocking it |
 
 One policy drives all of it. Config resolves into a single mechanism-independent
@@ -161,10 +163,12 @@ high-risk findings are separated and never included without an explicit opt-in.
 
 ## Requirements
 
-- Linux 5.13 or newer for Landlock. Network rules need 6.7. Bailey negotiates the
-  ABI best-effort and reports what the kernel cannot enforce.
-- Unprivileged user namespaces for `--isolate`. Without them, enforcement falls
-  back to Landlock and seccomp with a warning.
+- Linux 5.13 or newer for Landlock. Network rules need 6.7, and scoping needs
+  6.12. Bailey negotiates the ABI best-effort and reports what the kernel cannot
+  enforce.
+- Unprivileged user namespaces for `--isolate` and for the network namespace.
+  Without them, enforcement falls back to Landlock and seccomp with a warning,
+  and egress is restricted by TCP port only.
 - Cgroup v2 with a writable delegated cgroup for resource limits. Without one,
   limits are skipped with a warning rather than failing the run.
 - Kernel BTF and the privileged helper for `bailey audit`.
@@ -173,9 +177,10 @@ high-risk findings are separated and never included without an explicit opt-in.
 
 Being clear about the edges matters more than sounding complete.
 
-- **`egress = "deny"` currently blocks TCP only.** Landlock's network rules cover
-  TCP connect and bind, so UDP, QUIC, and DNS are not blocked today. Closing this
-  needs a network namespace, which is planned.
+- **A partial egress allowance restricts TCP only.** Allowing any egress, or
+  binding a port, keeps the target in the host's network namespace where only
+  Landlock's TCP port rules apply. The run warns that UDP, QUIC, and DNS are not
+  restricted. A full `egress = "deny"`, the default, has no such gap.
 - **The target inherits your environment.** Variables such as `SSH_AUTH_SOCK` and
   API tokens are passed through. An environment policy is planned.
 - **A nested `deny` needs `--isolate`.** Denying a subdirectory of a granted

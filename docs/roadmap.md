@@ -40,16 +40,20 @@ Making the policy mean what it says. Most of this has shipped:
 
 ## Network confinement
 
-- **Real egress denial.** When the policy denies egress, run in a network
-  namespace with only loopback, so UDP, QUIC, DNS, and everything else fail, not
-  just TCP.
-- **Landlock scoping.** Raise the target ABI so abstract UNIX sockets outside the
-  sandbox are unreachable and host processes cannot be signalled, on kernels that
-  support it.
-- **Optional user-mode networking.** For the partial case, attach a user-mode
-  stack such as `pasta` so allowed egress can be filtered beyond TCP.
-- **Honest reporting.** The run states which network mode is in force and what it
-  does not cover.
+Shipped, except the user-mode stack:
+
+- **Real egress denial.** ✅ When the policy denies egress, the target runs in a
+  network namespace with only loopback, so UDP, QUIC, DNS, and everything else
+  fail, not just TCP. This applies to a plain `bailey run`.
+- **Landlock scoping.** ✅ Abstract UNIX sockets outside the sandbox are
+  unreachable and processes outside it cannot be signalled, on Linux 6.12 and
+  later.
+- **Honest reporting.** ✅ `bailey show` prints the mode in force, and a run warns
+  when the policy is enforced more narrowly than it reads.
+- **Optional user-mode networking.** Still open. For a policy that allows some
+  egress, attaching a stack such as `pasta` would isolate the namespace while
+  keeping connectivity. It would not filter UDP by port, which those stacks do not
+  do, so the gain is isolation rather than filtering.
 
 ## Audit fidelity
 

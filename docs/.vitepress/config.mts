@@ -35,6 +35,7 @@ export default defineConfig({
             { text: 'The policy model', link: '/guide/policy-model' },
             { text: 'Enforcement layers', link: '/guide/enforcement' },
             { text: 'Namespace isolation', link: '/guide/isolation' },
+            { text: 'Network confinement', link: '/guide/network' },
           ],
         },
         {

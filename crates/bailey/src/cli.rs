@@ -9,7 +9,9 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
-use crate::backend::{Backend, Target, audit::AuditBackend, enforce::EnforceBackend};
+use crate::backend::{
+    Backend, Target, audit::AuditBackend, enforce::EnforceBackend, isolation, network,
+};
 use crate::config::{self, Resolved};
 use crate::event::AccessEvent;
 use crate::policy::Access;
@@ -331,6 +333,8 @@ fn print_policy(resolved: &Resolved) {
     println!("network:");
     println!("  egress: {:?}", policy.network.egress);
     println!("  bind_ports: {:?}", policy.network.bind_ports);
+    let mode = network::select(policy, isolation::available());
+    println!("  mode: {}", mode.describe());
 
     println!("devices:");
     if policy.devices.is_empty() {

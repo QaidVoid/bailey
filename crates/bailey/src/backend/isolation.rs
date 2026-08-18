@@ -41,6 +41,8 @@ pub struct IsolationPlan {
     pub binds: Vec<BindMount>,
     /// Paths to cover over after binding.
     pub conceal: Vec<Conceal>,
+    /// Whether to also take the target out of the host's network namespace.
+    pub network: bool,
 }
 
 /// Whether namespace isolation actually works on this host.
@@ -112,7 +114,14 @@ pub fn enter(plan: &IsolationPlan) -> io::Result<()> {
     fs::write("/proc/self/gid_map", format!("0 {gid} 1"))?;
     fs::write("/proc/self/uid_map", format!("0 {uid} 1"))?;
 
-    unshare(CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWPID).map_err(errno)?;
+    let mut flags = CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWPID;
+    if plan.network {
+        flags |= CloneFlags::CLONE_NEWNET;
+    }
+    unshare(flags).map_err(errno)?;
+    if plan.network {
+        crate::backend::network::bring_loopback_up()?;
+    }
 
     match unsafe { libc::fork() } {
         -1 => Err(io::Error::last_os_error()),

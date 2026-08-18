@@ -112,10 +112,12 @@ you set a host other than `*`, because the rule will not restrict by host. An
 entry with no `port` is a resolution error naming the layer, rather than a rule
 that silently becomes a full deny.
 
-::: danger Only TCP is restricted
-Landlock's network rules cover TCP connect and bind. UDP, QUIC, DNS, and ICMP are
-not restricted by `egress = "deny"` today. See
-[known limitations](/security/limitations).
+::: warning Allowing egress weakens the mode
+`egress = "deny"` puts the target in its own network namespace, where every
+protocol fails. Allowing any egress, or binding a port, means the target stays in
+the host's network namespace with only TCP ports enforced, and the run warns that
+UDP, QUIC, and DNS are unrestricted. See
+[network confinement](/guide/network).
 :::
 
 ## Resource limits

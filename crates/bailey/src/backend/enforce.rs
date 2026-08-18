@@ -21,16 +21,22 @@ use std::process::Command;
 use enumflags2::BitFlags;
 use landlock::{
     ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, NetPort, PathBeneath, PathFd,
-    Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus,
+    Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus, Scope,
 };
 
 use crate::backend::isolation::{self, BindMount, Conceal, IsolationPlan};
+use crate::backend::network::{self, NetworkMode};
 use crate::backend::{Backend, BackendError, Target};
 use crate::policy::{self, Egress, Policy, ResourceLimits};
 
 /// Landlock ABI the backend targets. Best-effort compatibility degrades this
 /// gracefully on older kernels.
-const TARGET_ABI: ABI = ABI::V5;
+///
+/// ABI 6 (Linux 6.12) adds scoping, which is what keeps a target away from
+/// abstract UNIX sockets and from signalling processes outside the sandbox. It
+/// adds no filesystem access rights over ABI 5, so raising the target does not
+/// change how a policy's grants are interpreted.
+const TARGET_ABI: ABI = ABI::V6;
 
 /// Deny-by-default enforcement backend.
 #[derive(Debug, Default)]
@@ -47,9 +53,15 @@ impl Backend for EnforceBackend {
         let seccomp = build_seccomp_filter()
             .map_err(|err| BackendError::Unsupported(format!("seccomp: {err}")))?;
 
+        // User namespaces gate both the isolation layer and the network
+        // namespace, so the host is probed once for both.
+        let userns = isolation::available();
+        let mode = network::select(policy, userns);
+        network::report(mode, policy);
+
         let isolation = if self.isolate {
-            if isolation::available() {
-                Some(build_isolation_plan(policy))
+            if userns {
+                Some(build_isolation_plan(policy, mode))
             } else {
                 eprintln!(
                     "bailey: warning: unprivileged user namespaces unavailable; \
@@ -64,6 +76,10 @@ impl Backend for EnforceBackend {
         if isolation.is_none() {
             report_unenforceable_denials(policy);
         }
+
+        // Without the isolation layer, the network namespace is entered on its
+        // own, so a plain `bailey run` still gets real egress denial.
+        let network_only = isolation.is_none() && mode == NetworkMode::Isolated;
 
         // The cgroup is created before the fork so the target can join it from
         // `pre_exec`. Joining before exec is what makes the limits cover every
@@ -92,6 +108,8 @@ impl Backend for EnforceBackend {
                 }
                 if let Some(isolation) = &isolation {
                     isolation::enter(isolation)?;
+                } else if network_only {
+                    network::enter_isolated()?;
                 }
                 plan.apply()?;
                 seccompiler::apply_filter(&seccomp)
@@ -163,6 +181,12 @@ impl LandlockPlan {
         if !net.is_empty() {
             ruleset = ruleset.handle_access(net).map_err(landlock_err)?;
         }
+        // Abstract UNIX sockets live outside the filesystem, so no path rule can
+        // reach them, and signals are not filesystem access at all. Scoping is
+        // the only rule that covers either. Older kernels drop it best-effort.
+        ruleset = ruleset
+            .scope(Scope::from_all(TARGET_ABI))
+            .map_err(landlock_err)?;
 
         let mut created = ruleset.create().map_err(landlock_err)?;
         for (path, access) in &self.filesystem {
@@ -205,7 +229,7 @@ impl LandlockPlan {
 /// A denied path is never bound. Where a denial sits beneath a path that is
 /// bound, it arrives with its parent and is covered over instead, which is what
 /// makes a nested denial enforceable: Landlock rules can only add access.
-fn build_isolation_plan(policy: &Policy) -> IsolationPlan {
+fn build_isolation_plan(policy: &Policy, mode: NetworkMode) -> IsolationPlan {
     let denied = |path: &Path| policy.denied.iter().any(|deny| path.starts_with(deny));
 
     let mut paths: Vec<PathBuf> = policy
@@ -253,7 +277,11 @@ fn build_isolation_plan(policy: &Policy) -> IsolationPlan {
         })
         .collect();
 
-    IsolationPlan { binds, conceal }
+    IsolationPlan {
+        binds,
+        conceal,
+        network: mode == NetworkMode::Isolated,
+    }
 }
 
 fn fs_access_bits(access: policy::Access) -> Option<BitFlags<AccessFs>> {
