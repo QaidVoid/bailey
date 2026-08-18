@@ -1,5 +1,5 @@
-//! Bailey: an ergonomic, layered sandbox for running untrusted games and
-//! binaries on Linux.
+//! Bailey: a layered, deny-by-default sandbox for running untrusted programs on
+//! Linux.
 //!
 //! The crate is organized around a single mechanism-independent
 //! [`policy::Policy`] that is produced by the cascading [`config`] resolver and

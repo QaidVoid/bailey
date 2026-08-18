@@ -16,7 +16,7 @@ use crate::policy::Access;
 use crate::profiles;
 use crate::reconcile::{self, Finding, Risk};
 
-/// Layered sandbox for running untrusted games and binaries.
+/// Layered, deny-by-default sandbox for running untrusted programs on Linux.
 #[derive(Debug, Parser)]
 #[command(name = "bailey", version, about)]
 struct Cli {
