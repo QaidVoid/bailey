@@ -14,7 +14,7 @@ use crate::backend::{
     Backend, Target, audit::AuditBackend, enforce::EnforceBackend, isolation, network,
 };
 use crate::config::{self, Resolved};
-use crate::event::AccessEvent;
+use crate::event::Trace;
 use crate::policy::Access;
 use crate::profiles;
 use crate::reconcile::{self, Finding, Risk};
@@ -66,6 +66,13 @@ struct AuditArgs {
     /// Write the recorded access trace to this file as JSON.
     #[arg(long)]
     save_trace: Option<PathBuf>,
+    /// Reconstruct the target's world with namespaces during the audit.
+    #[arg(long)]
+    isolate: bool,
+    /// Run the target with no confinement at all. It will have your full
+    /// authority for the duration of the audit.
+    #[arg(long)]
+    unconfined: bool,
     /// The target executable, followed by its own arguments.
     #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<String>,
@@ -114,6 +121,9 @@ struct GenerateArgs {
     /// Include high-risk access (egress, credentials) in the generated profile.
     #[arg(long)]
     include_high_risk: bool,
+    /// Generate from a trace that is known to be missing events.
+    #[arg(long)]
+    accept_truncated: bool,
 }
 
 /// Parse arguments and dispatch the selected command.
@@ -150,6 +160,7 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
     resolved.hooks.run_pre_launch()?;
     let backend = EnforceBackend {
         isolate: args.isolate,
+        stop_before_exec: false,
     };
     let code = backend.run(&resolved.policy, &target)?;
     if let Err(err) = resolved.hooks.run_post_exit(code) {
@@ -169,9 +180,20 @@ fn cmd_audit(args: AuditArgs) -> anyhow::Result<i32> {
     };
 
     resolved.hooks.run_pre_launch()?;
-    let (code, trace) = AuditBackend.run_and_record(&resolved.policy, &target)?;
+    let backend = AuditBackend {
+        unconfined: args.unconfined,
+        isolate: args.isolate,
+    };
+    let (code, trace) = backend.run_and_record(&resolved.policy, &target)?;
     if let Err(err) = resolved.hooks.run_post_exit(code) {
         eprintln!("bailey: post-exit hook failed: {err}");
+    }
+
+    if trace.is_truncated() {
+        eprintln!(
+            "bailey: warning: {} access(es) could not be recorded; this trace is incomplete",
+            trace.dropped
+        );
     }
 
     if let Some(path) = &args.save_trace {
@@ -179,7 +201,7 @@ fn cmd_audit(args: AuditArgs) -> anyhow::Result<i32> {
         eprintln!("bailey: wrote trace to {}", path.display());
     }
 
-    let findings = reconcile::reconcile(&trace, &resolved.policy, &target_dir);
+    let findings = reconcile::reconcile(&trace.events, &resolved.policy, &target_dir);
     print_findings(&findings);
     Ok(code)
 }
@@ -211,11 +233,27 @@ fn cmd_profile(args: ProfileArgs) -> anyhow::Result<i32> {
 
 fn cmd_profile_generate(args: GenerateArgs) -> anyhow::Result<i32> {
     let text = std::fs::read_to_string(&args.trace)?;
-    let trace: Vec<AccessEvent> = serde_json::from_str(&text)?;
+    let trace: Trace = serde_json::from_str(&text).map_err(|err| {
+        anyhow::anyhow!(
+            "`{}` is not a trace this build understands ({err});              record a new one with `bailey audit --save-trace`",
+            args.trace.display()
+        )
+    })?;
+    trace.check_version().map_err(|err| anyhow::anyhow!(err))?;
+
+    if trace.is_truncated() && !args.accept_truncated {
+        anyhow::bail!(
+            "this trace is missing {} access(es), so a profile generated from it \
+             would grant less than the target needs; pass --accept-truncated to \
+             proceed anyway",
+            trace.dropped
+        );
+    }
+
     let resolved = resolve(&args.profile, &args.target, args.config.as_deref())?;
     let target_dir = target_dir(&args.target);
 
-    let findings = reconcile::reconcile(&trace, &resolved.policy, &target_dir);
+    let findings = reconcile::reconcile(&trace.events, &resolved.policy, &target_dir);
     let excluded = findings
         .iter()
         .filter(|finding| finding.risk.is_high())
@@ -228,6 +266,12 @@ fn cmd_profile_generate(args: GenerateArgs) -> anyhow::Result<i32> {
     if excluded > 0 && !args.include_high_risk {
         eprintln!(
             "bailey: excluded {excluded} high-risk access(es); pass --include-high-risk to add them"
+        );
+    }
+    if trace.is_truncated() {
+        println!(
+            "# Generated from an incomplete trace: {} access(es) were not recorded.",
+            trace.dropped
         );
     }
     print!("{}", reconcile::generate_profile(&selected));
@@ -372,8 +416,15 @@ fn print_findings(findings: &[Finding]) {
         return;
     }
 
-    let high: Vec<_> = findings.iter().filter(|f| f.risk.is_high()).collect();
-    let low: Vec<_> = findings.iter().filter(|f| !f.risk.is_high()).collect();
+    let unresolved: Vec<_> = findings.iter().filter(|f| f.unresolved).collect();
+    let high: Vec<_> = findings
+        .iter()
+        .filter(|f| !f.unresolved && f.risk.is_high())
+        .collect();
+    let low: Vec<_> = findings
+        .iter()
+        .filter(|f| !f.unresolved && !f.risk.is_high())
+        .collect();
 
     println!("audit: {} ungranted access(es) observed", findings.len());
     if !high.is_empty() {
@@ -389,6 +440,12 @@ fn print_findings(findings: &[Finding]) {
     if !low.is_empty() {
         println!("\nroutine (safe to grant):");
         for finding in low {
+            println!("  [{:?}] {}", finding.kind, describe(finding));
+        }
+    }
+    if !unresolved.is_empty() {
+        println!("\nunresolved (relative paths whose directory could not be read):");
+        for finding in unresolved {
             println!("  [{:?}] {}", finding.kind, describe(finding));
         }
     }

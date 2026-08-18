@@ -70,11 +70,11 @@ a clean trace. Second, generating a profile from a hostile program's trace grant
 exactly what that program did, including its exfiltration. That is why high-risk
 findings are separated and never included silently.
 
-::: danger Audit currently runs the target unconfined
-The resolved policy is not applied during an audit run. The program has your full
-user authority while it is being recorded. Do not audit something you would not be
-willing to run normally. Confining audit runs is
-[proposed](/roadmap).
+::: tip Audit runs confined
+The resolved policy applies during an audit, widened only by read access to the
+target's own directory. A program audited under the default policy still cannot
+reach your home directory or the network; the attempts are recorded instead.
+`--unconfined` lifts that, and says so when it does.
 :::
 
 ## Requirements and privilege
@@ -89,11 +89,18 @@ its entire job.
 
 ## What the trace covers
 
-Today: file opens via `openat`, outbound IPv4 TCP connections, and fork
-propagation so children of the target are included.
+Every way of opening a path, because the recorder attaches below the syscalls at
+`do_filp_open` rather than to `openat` alone. Program executions. Outbound
+connections, IPv4 and IPv6. Each event carries a timestamp and the path as the
+kernel resolved it; a relative path is resolved against the accessing process's
+working directory and marked as such, and one that could not be resolved is
+listed separately rather than compared against your policy as though it were
+absolute.
 
-Not yet: `execve`, IPv6 destinations, other path-opening syscalls, and absolute
-path resolution for relative opens. Timestamps are recorded as zero. The event
-count is capped and truncation is not reported. All of that is on the
-[roadmap](/roadmap); until then, read a trace as a strong hint rather than a
-complete record.
+The trace records what it lost. If the kernel could not deliver an event, or the
+event cap was reached, the count reaches the trace and `profile generate` refuses
+to turn it into a profile without `--accept-truncated`.
+
+What it can miss: a child process that is born and reaped within 200
+microseconds, before the recorder's process-tree scope catches up. See
+[known limitations](/security/limitations).

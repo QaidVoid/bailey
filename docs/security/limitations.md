@@ -88,32 +88,21 @@ memory cap may not be applying one. The warning is the only signal.
 
 ## Audit
 
-### The target runs unconfined
+### A short-lived child can be missed
 
-The resolved policy is not applied during an audit run. Do not audit code you
-would not be willing to run normally.
+Observation is scoped to the target's process tree, and membership is refreshed
+by reading `/proc` every 200 microseconds. A process that is born and reaped
+inside that window is never added, so its access does not appear. In practice a
+child's file reads are captured and its `exec` often is not.
 
-### Observation starts late
+Exact scoping needs either a delegated cgroup, whose membership children inherit,
+or a PID namespace. Neither is wired up yet.
 
-The target is spawned first and the observation scope is seeded afterwards, so
-early access is missed, including the dynamic linker's library search.
+### A trace shows one run
 
-### Coverage gaps
-
-Only `openat` is observed for filesystem access, so other path-opening syscalls
-and `execve` do not appear. Only IPv4 destinations are recorded. Paths are
-recorded as passed rather than resolved, so relative opens do not match absolute
-policy grants. Timestamps are always zero.
-
-### Silent truncation
-
-The trace is capped at 200,000 events. Beyond that, events are dropped with no
-marker, so a generated profile can be incomplete without saying so.
-
-### x86_64 only
-
-The eBPF programs use hard-coded x86_64 tracepoint field offsets, so audit results
-on other architectures are wrong rather than unavailable.
+A program that behaves while it thinks it is being watched, or that only
+misbehaves on a certain date, produces a clean trace. Audit tightens software you
+have some reason to trust; it does not vet unknown code.
 
 ## Other
 

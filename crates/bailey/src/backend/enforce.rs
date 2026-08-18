@@ -51,10 +51,26 @@ const DEFAULT_SHM_BYTES: u64 = 256 * 1024 * 1024;
 pub struct EnforceBackend {
     /// Reconstruct the target's world with namespaces (defense in depth).
     pub isolate: bool,
+    /// Stop the target just before it executes, so a caller can attach
+    /// something to it before it runs. The caller is then responsible for
+    /// continuing it.
+    pub stop_before_exec: bool,
 }
 
 impl Backend for EnforceBackend {
     fn run(&self, policy: &Policy, target: &Target) -> Result<i32, BackendError> {
+        let confined = self.spawn(policy, target)?;
+        confined.wait()
+    }
+}
+
+impl EnforceBackend {
+    /// Establish the confinement and spawn the target under it, without waiting.
+    ///
+    /// This is what lets the audit backend confine and observe the same process:
+    /// it needs the target's PID, and needs the target held, before letting it
+    /// run.
+    pub fn spawn(&self, policy: &Policy, target: &Target) -> Result<Confined, BackendError> {
         report_degradation(policy);
 
         let seccomp = build_seccomp_filter()
@@ -121,6 +137,7 @@ impl Backend for EnforceBackend {
             command.current_dir(cwd);
         }
         let staging = isolation.as_ref().map(|plan| plan.staging.clone());
+        let stop_before_exec = self.stop_before_exec;
 
         // Safety: the closure runs in the forked child before exec. Bailey is
         // single-threaded at this point, so the usual fork-safety hazard of
@@ -130,6 +147,18 @@ impl Backend for EnforceBackend {
         unsafe {
             command.pre_exec(move || {
                 set_no_new_privs()?;
+                if stop_before_exec {
+                    // Trace ourselves, so the kernel stops this process at
+                    // `execve` rather than before it. Stopping earlier would
+                    // deadlock: the parent's spawn does not return until this
+                    // process execs or fails.
+                    libc::ptrace(
+                        libc::PTRACE_TRACEME,
+                        0,
+                        std::ptr::null_mut::<libc::c_void>(),
+                        std::ptr::null_mut::<libc::c_void>(),
+                    );
+                }
                 // Before the namespaces, while the host's cgroup filesystem is
                 // still reachable.
                 if let Some(procs) = &procs {
@@ -147,12 +176,35 @@ impl Backend for EnforceBackend {
             });
         }
 
-        let mut child = command.spawn().map_err(BackendError::Io)?;
-        let status = child.wait().map_err(BackendError::Io)?;
-        drop(cgroup);
+        let child = command.spawn().map_err(BackendError::Io)?;
+        Ok(Confined {
+            child,
+            cgroup,
+            staging,
+        })
+    }
+}
+
+/// A target running under enforcement, not yet waited on.
+pub struct Confined {
+    child: std::process::Child,
+    cgroup: CgroupGuard,
+    staging: Option<PathBuf>,
+}
+
+impl Confined {
+    /// The target's process id.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Wait for the target to exit and tear the run's world down.
+    pub fn wait(mut self) -> Result<i32, BackendError> {
+        let status = self.child.wait().map_err(BackendError::Io)?;
+        drop(self.cgroup);
         // The staging directory was only ever a mountpoint in the target's own
         // namespace; on the host it is an empty directory to clean up.
-        if let Some(staging) = staging {
+        if let Some(staging) = self.staging {
             let _ = std::fs::remove_dir(&staging);
         }
         Ok(status.code().unwrap_or(-1))

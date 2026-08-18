@@ -10,7 +10,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use crate::event::{AccessEvent, AccessKind, Resource};
+use crate::event::{AccessEvent, AccessKind, Resolution, Resource};
 use crate::policy::{Access, Egress, Policy};
 
 /// The risk assigned to an ungranted access.
@@ -39,6 +39,9 @@ pub struct Finding {
     pub resource: Resource,
     /// The assessed risk.
     pub risk: Risk,
+    /// Whether the path could not be resolved to an absolute one, in which case
+    /// it cannot be compared against policy paths or granted.
+    pub unresolved: bool,
 }
 
 /// Diff `trace` against `policy` and return the ungranted accesses, classified
@@ -59,6 +62,7 @@ pub fn reconcile(trace: &[AccessEvent], policy: &Policy, target_dir: &Path) -> V
             kind: event.kind,
             resource: event.resource.clone(),
             risk: classify(&event.resource, target_dir),
+            unresolved: event.resolution == Resolution::Unresolved,
         });
     }
 
@@ -79,6 +83,11 @@ pub fn generate_profile(findings: &[Finding]) -> String {
     let mut bind_ports = BTreeSet::new();
 
     for finding in findings {
+        // A relative path that could not be resolved names nothing in
+        // particular, so granting it would be guesswork.
+        if finding.unresolved {
+            continue;
+        }
         match (&finding.kind, &finding.resource) {
             (AccessKind::Read, Resource::Path(path)) => {
                 read.insert(display(path));
@@ -232,6 +241,7 @@ mod tests {
             resource: Resource::Path(PathBuf::from(path)),
             pid: 1,
             timestamp_ns: 0,
+            resolution: Resolution::Absolute,
         }
     }
 
@@ -241,6 +251,7 @@ mod tests {
             resource: Resource::Net { host: None, port },
             pid: 1,
             timestamp_ns: 0,
+            resolution: Resolution::NotApplicable,
         }
     }
 
@@ -292,6 +303,7 @@ mod tests {
             kind: AccessKind::Read,
             resource: Resource::Path(PathBuf::from("/game/data.pak")),
             risk: Risk::Low,
+            unresolved: false,
         }];
         let profile = generate_profile(&findings);
         assert!(profile.contains("read = [\"/game/data.pak\"]"));

@@ -59,17 +59,26 @@ Shipped, except the user-mode stack:
 
 ## Audit fidelity
 
-- **Audit runs confined.** The resolved policy, widened to a permissive envelope,
-  applies during an audit run, with an explicit opt-out for trusted software.
-- **Nothing missed at startup.** The target is held before exec until observation
-  is confirmed, so the dynamic linker's search appears in the trace.
-- **Cgroup scoping.** Replaces PID-tree tracking, which cannot be raceless.
-- **Resolved absolute paths**, covering every path-opening syscall rather than
-  `openat` alone, plus `execve` for child launches.
-- **IPv6, timestamps, and access modes** in the record.
-- **Truncation reported**, and a truncated trace cannot silently become a profile.
-- **Architecture independence.** BTF-driven argument access instead of hard-coded
-  x86_64 offsets.
+Shipped, except exact scoping:
+
+- **Audit runs confined.** ✅ The resolved policy applies during an audit, widened
+  only by read on the target's own directory, with `--unconfined` as an explicit
+  opt-out.
+- **Nothing missed at startup.** ✅ The target is stopped at `exec` until the
+  recorder confirms it is watching, so the dynamic linker's search appears in the
+  trace.
+- **Full path coverage and resolved paths.** ✅ One hook below the syscalls covers
+  every way of opening a path; relative paths are resolved and marked, and
+  unresolved ones are never turned into grants.
+- **Executions, IPv6, and timestamps** ✅ in the record.
+- **Truncation reported** ✅, and a truncated trace cannot silently become a
+  profile.
+- **Architecture independence.** ✅ BTF-driven `fentry` attachment instead of
+  hard-coded x86_64 offsets, which also removed the tracefs dependency and the
+  extra capability it would have cost the privileged helper.
+- **Exact scoping.** Still open. Observation is scoped to the process tree by
+  polling `/proc`, so a child born and reaped within 200 microseconds is missed.
+  A delegated cgroup or a PID namespace would close it.
 
 ## Operator experience
 
