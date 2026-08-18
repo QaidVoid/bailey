@@ -93,7 +93,6 @@ cpu_percent = 300
 [hooks]
 pre_launch = ["./mount-assets.sh"]
 post_exit = ["./sync-saves.sh"]
-on_violation = ["notify-send 'bailey' \"$BAILEY_VIOLATION\""]
 ```
 
 Every key is documented in the [configuration reference](/reference/config).

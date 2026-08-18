@@ -247,25 +247,6 @@ fn cmd_doctor() -> anyhow::Result<i32> {
         }
     }
 
-    println!("reporting:");
-    if !caps.landlock_logs_denials() {
-        degraded = true;
-        println!("  violation hooks: no");
-        println!("    Landlock does not record denials below ABI 7 (Linux 6.15)");
-    } else if !caps.denial_log_readable {
-        degraded = true;
-        println!("  violation hooks: no");
-        println!("    the kernel log is not readable (kernel.dmesg_restrict)");
-    } else {
-        // Never claimed outright: one precondition cannot be checked without
-        // privilege, and it is the commonest reason a hook stays silent on a
-        // host that passes the two checks above.
-        println!("  violation hooks: possibly");
-        println!("    the checks bailey can make pass, but denial records also");
-        println!("    need the audit subsystem enabled (audit=1 at boot), which");
-        println!("    cannot be checked from here");
-    }
-
     if !degraded {
         println!("\nEverything bailey uses is available on this host.");
     }
@@ -280,7 +261,6 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
     let (program, program_args) = split_command(args.command);
     let resolved = resolve(&args.profile, &program, args.config.as_deref())?;
     warn_if_target_denied(&resolved.policy, &program);
-    warn_if_violation_hooks_cannot_fire(&resolved.hooks);
     let target = Target {
         program,
         args: program_args,
@@ -459,23 +439,6 @@ fn toml_string(path: &Path) -> String {
 
 fn absolute(path: &Path) -> PathBuf {
     std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
-}
-
-/// Warn when a configured `on_violation` hook has no signal to fire on.
-///
-/// Landlock denies silently. The kernel records denials from ABI 7, but reading
-/// them needs access most systems do not give an ordinary user, so a hook can be
-/// perfectly valid config that never runs. Saying so is better than accepting it
-/// in silence.
-fn warn_if_violation_hooks_cannot_fire(hooks: &crate::hooks::Hooks) {
-    if hooks.on_violation.is_empty() || probe::violation_signal_available() {
-        return;
-    }
-    eprintln!(
-        "bailey: warning: an `on_violation` hook is configured but cannot fire on \
-         this host; bailey cannot read the kernel's record of denied access. \
-         Run `bailey doctor` for details."
-    );
 }
 
 /// Warn when the resolved policy denies the target itself, which would

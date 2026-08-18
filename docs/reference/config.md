@@ -146,7 +146,10 @@ Granting your real home in `[filesystem]` turns the private home off entirely.
 | --- | --- | --- |
 | `pre_launch` | list of commands | Before the target starts. Non-zero exit aborts the run |
 | `post_exit` | list of commands | After the target terminates. Gets `BAILEY_EXIT_CODE` |
-| `on_violation` | list of commands | On a denied or flagged access. Gets `BAILEY_VIOLATION`. Does not currently fire |
+
+`on_violation` was removed: nothing could trigger it. A config that still sets it
+is accepted with a warning rather than rejected. See
+[lifecycle hooks](/guide/hooks).
 
 Commands run through `sh -c` and accumulate across layers, running in layer order.
 

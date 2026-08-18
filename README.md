@@ -134,7 +134,6 @@ cpu_percent = 150                   # percent of one core
 [hooks]
 pre_launch = ["./setup.sh"]         # a non-zero exit aborts the run
 post_exit = ["./cleanup.sh"]        # receives BAILEY_EXIT_CODE
-on_violation = ["./log.sh"]         # receives BAILEY_VIOLATION
 ```
 
 `bailey show <target>` prints the merged result and every file that contributed
@@ -188,8 +187,9 @@ Being clear about the edges matters more than sounding complete.
 - **Audit falls back to process-tree scoping without a cgroup.** Where a run can
   be given a cgroup, scoping is exact; otherwise a very short-lived child can be
   missed, and the run says so.
-- **`on_violation` hooks never fire,** because Landlock denies silently and
-  bailey has no denial signal yet.
+- **A denied access is not reported.** Landlock denies silently, and seeing a
+  denial needs the kernel's audit subsystem enabled at boot plus permission to
+  read its records. Use `bailey audit` to find out what a program wanted.
 - **Under `--isolate` the working directory is not carried in,** so relative
   paths do not resolve, and there is no private `/tmp`.
 - **The seccomp filter is a denylist,** covering module loading, `ptrace`, `bpf`,

@@ -5,7 +5,6 @@
 //! enforce before running anything rather than after a program mysteriously
 //! fails.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -21,9 +20,6 @@ const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1 << 0;
 const ABI_NETWORK: u32 = 4;
 /// Landlock ABI level at which scoping became available.
 const ABI_SCOPE: u32 = 6;
-/// Landlock ABI level at which the kernel logs denials.
-const ABI_LOGGING: u32 = 7;
-
 /// Whether the privileged audit helper is usable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HelperStatus {
@@ -48,9 +44,6 @@ pub struct Capabilities {
     pub btf: bool,
     /// Whether a cgroup can be created for a run, which resource limits need.
     pub cgroup_delegated: bool,
-    /// Whether bailey could read the kernel's denial records, which violation
-    /// hooks would need.
-    pub denial_log_readable: bool,
     /// Whether the audit helper is present and permitted.
     pub helper: HelperStatus,
 }
@@ -66,30 +59,6 @@ impl Capabilities {
     pub fn landlock_scope(&self) -> bool {
         self.landlock_abi.is_some_and(|abi| abi >= ABI_SCOPE)
     }
-
-    /// Whether the kernel records Landlock denials at all.
-    pub fn landlock_logs_denials(&self) -> bool {
-        self.landlock_abi.is_some_and(|abi| abi >= ABI_LOGGING)
-    }
-
-    /// Whether the prerequisites bailey can check for `on_violation` hooks are
-    /// met: a Landlock ABI that records denials, and a readable kernel log.
-    ///
-    /// One precondition cannot be checked without privilege: the kernel's audit
-    /// subsystem has to be enabled, which needs `audit=1` on the kernel command
-    /// line. Where it is off, Landlock emits no records at all and a hook stays
-    /// silent even though both checks below pass.
-    pub fn violation_hooks_possible(&self) -> bool {
-        self.landlock_logs_denials() && self.denial_log_readable
-    }
-}
-
-/// Whether `on_violation` hooks could ever fire on this host.
-///
-/// Cheap enough to call on every run that configures such a hook: it asks the
-/// kernel for its Landlock ABI and tries to open the kernel log.
-pub fn violation_signal_available() -> bool {
-    landlock_abi().is_some_and(|abi| abi >= ABI_LOGGING) && denial_log_readable()
 }
 
 /// Probe the running kernel for sandboxing-relevant features.
@@ -103,7 +72,6 @@ pub fn probe(deep: bool) -> Capabilities {
         unprivileged_userns: isolation::available(),
         btf: Path::new("/sys/kernel/btf/vmlinux").exists(),
         cgroup_delegated: cgroup_delegated(),
-        denial_log_readable: denial_log_readable(),
         helper: if deep {
             helper_status()
         } else {
@@ -129,15 +97,6 @@ fn landlock_abi() -> Option<u32> {
 /// runs in, whose children receive the controller files.
 fn cgroup_delegated() -> bool {
     crate::backend::cgroup::usable_root(&["memory", "pids", "cpu"]).is_some()
-}
-
-/// Whether the kernel's log of denied accesses is readable here.
-///
-/// Landlock records denials from ABI 7 onwards, but reading them needs either a
-/// readable kernel log or the audit subsystem, both of which are commonly
-/// restricted.
-fn denial_log_readable() -> bool {
-    fs::File::open("/dev/kmsg").is_ok()
 }
 
 /// Start the audit helper and see whether it can load its programs.
@@ -204,7 +163,6 @@ mod tests {
             unprivileged_userns: false,
             btf: false,
             cgroup_delegated: false,
-            denial_log_readable: true,
             helper: HelperStatus::Missing,
         };
 
@@ -213,7 +171,5 @@ mod tests {
         assert!(with(Some(4)).landlock_network());
         assert!(!with(Some(5)).landlock_scope());
         assert!(with(Some(6)).landlock_scope());
-        assert!(!with(Some(6)).violation_hooks_possible());
-        assert!(with(Some(7)).violation_hooks_possible());
     }
 }

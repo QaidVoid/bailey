@@ -23,7 +23,6 @@ fn doctor_reports_every_mechanism_with_its_consequence() {
         "cgroup delegation",
         "kernel BTF",
         "helper",
-        "violation hooks",
     ] {
         assert!(
             report.contains(mechanism),
@@ -101,31 +100,6 @@ fn the_summary_can_be_suppressed_and_machine_read() {
 }
 
 #[test]
-fn a_violation_hook_that_cannot_fire_is_reported() {
-    let dir = tempfile::tempdir().unwrap();
-    let config = dir.path().join("bailey.toml");
-    fs::write(&config, "[hooks]\non_violation = [\"true\"]\n").unwrap();
-
-    let output = Command::new(bailey())
-        .args(["run", "-c"])
-        .arg(&config)
-        .arg("/bin/true")
-        .output()
-        .unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    // On a host that can read the kernel's denial log the hook is viable and
-    // nothing is said; otherwise the config must not be accepted in silence.
-    let readable = fs::File::open("/dev/kmsg").is_ok();
-    if !readable {
-        assert!(
-            stderr.contains("cannot fire"),
-            "a hook that can never run must be reported: {stderr}"
-        );
-    }
-}
-
-#[test]
 fn every_bundled_profile_can_be_shown_and_used() {
     let listed = run(&["profile", "list"]);
     let list = String::from_utf8_lossy(&listed.stdout);
@@ -172,4 +146,28 @@ fn completions_and_a_man_page_are_generated() {
     assert!(man.status.success());
     let page = String::from_utf8_lossy(&man.stdout);
     assert!(page.contains(".TH bailey"), "man output must be a man page");
+}
+
+#[test]
+fn a_removed_hook_is_explained_rather_than_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("bailey.toml");
+    fs::write(&config, "[hooks]\non_violation = [\"true\"]\n").unwrap();
+
+    let output = Command::new(bailey())
+        .args(["run", "-c"])
+        .arg(&config)
+        .arg("/bin/true")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "an existing config must still run, not fail to parse"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("on_violation") && stderr.contains("ignored"),
+        "the removed hook must be explained: {stderr}"
+    );
 }

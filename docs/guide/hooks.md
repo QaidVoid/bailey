@@ -7,7 +7,6 @@ declared in config and accumulate across layers, running in layer order.
 [hooks]
 pre_launch = ["./mount-assets.sh"]
 post_exit = ["./sync-saves.sh"]
-on_violation = ["logger -t bailey \"$BAILEY_VIOLATION\""]
 ```
 
 Each command runs through `sh -c`, so shell syntax works.
@@ -33,17 +32,25 @@ reported and the target's status is still propagated.
 post_exit = ["rsync -a ./saves/ ~/backups/game-saves/"]
 ```
 
-## `on_violation`
+## What happened to `on_violation`
 
-Intended to run when an access is denied or flagged, with a description available
-as `BAILEY_VIOLATION`.
+There used to be a third hook, meant to run when an access was denied. It was
+removed, because nothing could ever trigger it: Landlock denies silently, and
+seeing a denial requires the kernel's audit subsystem enabled at boot plus
+permission to read its records, which a normal desktop gives neither.
 
-::: danger Not implemented
-This hook never fires. Landlock denies silently and bailey has no denial signal
-yet, so there is nothing to trigger it. The config key is accepted and the runner
-exists, but no code path calls it. Wiring it to Landlock's audit logging is
-[proposed](/roadmap).
-:::
+A config that still sets it keeps working. The key is ignored with an
+explanation rather than rejected:
+
+```
+bailey: warning: `hooks.on_violation` in ./bailey.toml is ignored; it was
+removed because Landlock denies silently and no signal reaches bailey to
+trigger it. Use `bailey audit` to see what a program wanted.
+```
+
+For the question the hook was there to answer, "what is this program trying to
+reach", [`bailey audit`](/guide/audit) answers it more completely and works
+today.
 
 ## Exit status
 

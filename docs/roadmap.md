@@ -83,7 +83,7 @@ Shipped:
 
 ## Operator experience
 
-Shipped, except reading denials:
+Shipped:
 
 - **`bailey doctor`.** ✅ Reports which layers this host can enforce and what each
   missing feature costs, including whether the audit helper can really load.
@@ -93,11 +93,11 @@ Shipped, except reading denials:
   runtime directory scoped to your own uid; `desktop-app`, `ai-agent`, and
   `network-client` are new, and `profile show` prints any of them for editing.
 - **Generated shell completions and a man page.** ✅
-- **Unusable violation hooks are reported.** ✅ A configured `on_violation` hook
-  that has no signal to fire on is called out rather than silently ignored.
-- **Reading denials.** Still open. Landlock records them from ABI 7, but reading
-  the record needs a readable kernel log or `CAP_AUDIT_READ`, so hooks cannot yet
-  be driven from it on a normal host.
+- **The violation hook is gone.** ✅ Investigation showed no denial signal is
+  reachable on a normal host: it needs the kernel's audit subsystem enabled at
+  boot as well as permission to read its records. Rather than carry a config key
+  that silently does nothing, the hook was removed; a config that still sets it is
+  accepted with an explanation, and `bailey audit` answers the same question.
 
 ## Not planned
 

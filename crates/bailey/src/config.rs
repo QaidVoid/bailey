@@ -242,6 +242,8 @@ struct RawHooks {
     pre_launch: Vec<String>,
     #[serde(default)]
     post_exit: Vec<String>,
+    /// Accepted so an existing config gets an explanation rather than a parse
+    /// error. The hook was removed because nothing could ever trigger it.
     #[serde(default)]
     on_violation: Vec<String>,
 }
@@ -437,9 +439,15 @@ fn apply_layer(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> 
             .pre_launch
             .extend(hooks.pre_launch.iter().cloned());
         acc.hooks.post_exit.extend(hooks.post_exit.iter().cloned());
-        acc.hooks
-            .on_violation
-            .extend(hooks.on_violation.iter().cloned());
+        if !hooks.on_violation.is_empty() {
+            eprintln!(
+                "bailey: warning: `hooks.on_violation` in {} is ignored; it was \
+                 removed because Landlock denies silently and no signal reaches \
+                 bailey to trigger it. Use `bailey audit` to see what a program \
+                 wanted.",
+                layer.path.display()
+            );
+        }
     }
 
     Ok(())

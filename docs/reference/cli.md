@@ -128,7 +128,6 @@ Set for hook commands:
 | Variable | Where |
 | --- | --- |
 | `BAILEY_EXIT_CODE` | `post_exit` hooks |
-| `BAILEY_VIOLATION` | `on_violation` hooks, which do not currently fire |
 
 ## Exit status
 

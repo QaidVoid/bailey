@@ -20,10 +20,6 @@ kernel:
 audit:
   kernel BTF: yes
   helper: ready (/usr/local/bin/bailey-bpf-helper)
-reporting:
-  violation hooks: no
-    the kernel records denials but bailey cannot read them
-    `on_violation` hooks will not fire
 ```
 
 Each answer is followed by what it costs. "Landlock: yes" would not tell you
@@ -63,27 +59,6 @@ bailey run --json ./program      # one line of JSON on stdout
 ```json
 {"applied":["landlock","seccomp","network namespace"],"skipped":[],"exit_code":0}
 ```
-
-## Violation hooks
-
-`hooks.on_violation` is meant to run when an access is denied. Landlock denies
-silently, and three separate things have to hold before a denial is even
-observable: Landlock ABI 7 or later, the kernel's audit subsystem enabled with
-`audit=1` at boot, and the resulting records readable. A kernel booted without
-`audit=1` emits nothing at all, which is easy to mistake for a permissions
-problem.
-
-Where bailey cannot read those records, a configured hook is reported rather than
-accepted in silence:
-
-```
-bailey: warning: an `on_violation` hook is configured but cannot fire on this
-host; bailey cannot read the kernel's record of denied access.
-```
-
-The hook still does not fire. Reporting it is not a fix, but it is the difference
-between config that visibly does nothing and config you believe is protecting
-you. See [known limitations](/security/limitations).
 
 ## Shell completions and a man page
 

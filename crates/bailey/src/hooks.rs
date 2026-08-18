@@ -1,8 +1,8 @@
 //! Lifecycle hooks and their execution.
 //!
 //! Hooks are user-defined shell commands run at defined points in a sandbox
-//! run. A failing `pre-launch` hook aborts the run; `post-exit` and
-//! `on-violation` hooks are best-effort and do not abort.
+//! run. A failing `pre-launch` hook aborts the run; a `post-exit` hook is
+//! best-effort and does not.
 
 use std::process::Command;
 
@@ -13,8 +13,6 @@ pub struct Hooks {
     pub pre_launch: Vec<String>,
     /// Commands run after the target terminates.
     pub post_exit: Vec<String>,
-    /// Commands run when an access is denied or flagged.
-    pub on_violation: Vec<String>,
 }
 
 /// An error produced while running a hook command.
@@ -53,17 +51,6 @@ impl Hooks {
         run_all(
             &self.post_exit,
             &[("BAILEY_EXIT_CODE", exit_code.to_string())],
-        )
-    }
-
-    /// Run the `on-violation` commands in order.
-    ///
-    /// A description of the violation is exposed to each command as the
-    /// `BAILEY_VIOLATION` environment variable.
-    pub fn run_on_violation(&self, description: &str) -> Result<(), HookError> {
-        run_all(
-            &self.on_violation,
-            &[("BAILEY_VIOLATION", description.to_string())],
         )
     }
 }
