@@ -99,9 +99,57 @@ than a black box.
 
 ## Writing your own
 
-There is no user-profile directory yet. Reuse in the meantime comes from the
-cascade: put shared rules in a `bailey.toml` high in a directory tree, or in your
-global config, and let everything below inherit them.
+A profile is just a TOML fragment, so you can add your own in
+`$XDG_CONFIG_HOME/bailey/profiles/<name>.toml`, and select it by name:
+
+```toml
+# ~/.config/bailey/profiles/claude.toml
+[filesystem]
+read = ["~/.local/share/claude"]
+
+[network]
+egress_allow = [{ host = "*", port = 443 }]
+```
+
+```sh
+bailey run --isolate --profile claude claude
+```
+
+`bailey profile list` shows yours under the bundled ones, and
+`bailey profile show <name>` prints either. The bundled names are reserved: a
+file called `untrusted.toml` is ignored with a warning rather than quietly
+replacing the safe floor.
+
+## Letting a profile claim a program
+
+Naming the profile on every run gets old. A profile can say which programs it is
+for, and bailey will pick it up automatically:
+
+```toml
+# ~/.config/bailey/profiles/claude.toml
+applies_to = ["claude"]
+```
+
+```sh
+bailey run --isolate claude          # uses the claude profile, wherever you are
+```
+
+```
+bailey: using profile `claude`, which claims this target
+```
+
+An entry with no `/` matches the program's file name, so it works wherever the
+binary is installed. An entry with a `/` must match the resolved path exactly.
+
+Two rules keep this from becoming surprising: an explicit `--profile` always
+wins, and a run says which profile was chosen for it. If two profiles claim the
+same program, the run stops and names both rather than picking one.
+
+## Sharing rules by location instead
+
+Where the rules belong to a place rather than a program, the cascade already
+covers it: put them in a `bailey.toml` high in a directory tree and everything
+below inherits them.
 
 ```
 ~/games/

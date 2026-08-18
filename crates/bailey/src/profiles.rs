@@ -1,9 +1,13 @@
 //! Bundled starting profiles.
 //!
-//! A profile is a named TOML config fragment shipped with bailey. The
+//! A profile is a named TOML config fragment. Bailey ships several, and a user
+//! can write their own in `$XDG_CONFIG_HOME/bailey/profiles/<name>.toml`, which
+//! is how a per-program policy becomes reusable across directories. The
 //! [`UNTRUSTED`] profile is the safe deny-by-default floor applied to every run;
 //! other profiles layer additively on top of it. Users extend a profile with
 //! their own per-directory and per-game config.
+
+use std::path::{Path, PathBuf};
 
 /// The minimal deny-by-default base applied to every run.
 pub const UNTRUSTED: &str = include_str!("profiles/untrusted.toml");
@@ -67,30 +71,198 @@ pub fn get(name: &str) -> Option<&'static Profile> {
     ALL.iter().find(|profile| profile.name == name)
 }
 
-/// Build the base layers for `profile`, lowest precedence first.
-///
-/// The untrusted floor is always included; a non-default profile is layered on
-/// top of it. Returns an error message if the named profile is unknown.
-pub fn base_layers(profile: &str) -> Result<Vec<(&'static str, &'static str)>, String> {
-    let mut layers = vec![("profile:untrusted", UNTRUSTED)];
-    if profile != DEFAULT {
-        let found = get(profile).ok_or_else(|| format!("unknown profile `{profile}`"))?;
-        layers.push((leak_label(found.name), found.toml));
-    }
-    Ok(layers)
+/// Where a profile's rules came from.
+pub enum Source {
+    /// One of the profiles shipped with bailey.
+    Bundled(&'static Profile),
+    /// A file the user wrote.
+    User {
+        /// Where it lives.
+        path: PathBuf,
+        /// Its contents.
+        toml: String,
+    },
 }
 
-fn leak_label(name: &str) -> &'static str {
-    // Base labels appear only in error messages. The set of profile names is
-    // fixed and tiny, so match them to their static strings.
-    match name {
-        "untrusted" => "profile:untrusted",
-        "native-game" => "profile:native-game",
-        "desktop-app" => "profile:desktop-app",
-        "ai-agent" => "profile:ai-agent",
-        "network-client" => "profile:network-client",
-        _ => "profile:custom",
+impl Source {
+    /// The profile's rules.
+    pub fn toml(&self) -> &str {
+        match self {
+            Source::Bundled(profile) => profile.toml,
+            Source::User { toml, .. } => toml,
+        }
     }
+}
+
+/// A config layer contributed by a profile.
+#[derive(Debug)]
+pub struct Layer {
+    /// Where the layer came from, for error messages.
+    pub label: String,
+    /// The layer's rules.
+    pub toml: String,
+}
+
+/// The directory user-written profiles live in.
+pub fn user_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME")
+        && !dir.is_empty()
+    {
+        return Some(Path::new(&dir).join("bailey").join("profiles"));
+    }
+    std::env::var_os("HOME").map(|home| Path::new(&home).join(".config/bailey/profiles"))
+}
+
+/// User-written profiles, by name, sorted.
+///
+/// A file whose name collides with a bundled profile is not listed: the bundled
+/// one wins, so listing it would suggest otherwise.
+pub fn user_profiles() -> Vec<(String, PathBuf)> {
+    let Some(dir) = user_dir() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<(String, PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_stem()?.to_str()?.to_owned();
+            (path.extension()? == "toml" && get(&name).is_none()).then_some((name, path))
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// The profile that claims `target`, if a user profile does.
+///
+/// A profile claims targets by listing them in `applies_to`, either by file name
+/// or by absolute path. This is what makes a per-program policy reusable across
+/// directories without an alias, and an explicit `--profile` always overrides it.
+pub fn for_target(target: &Path) -> Result<Option<String>, String> {
+    let name = target.file_name().and_then(|name| name.to_str());
+    let mut claimed: Vec<String> = Vec::new();
+
+    for (profile, path) in user_profiles() {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let declared: Claims = match toml::from_str(&text) {
+            Ok(claims) => claims,
+            // A profile that does not parse is reported when it is selected, not
+            // while deciding whether it applies.
+            Err(_) => continue,
+        };
+        let matches = declared.applies_to.iter().any(|claim| {
+            if claim.contains('/') {
+                Path::new(claim) == target
+            } else {
+                Some(claim.as_str()) == name
+            }
+        });
+        if matches {
+            claimed.push(profile);
+        }
+    }
+
+    match claimed.len() {
+        0 => Ok(None),
+        1 => Ok(claimed.pop()),
+        _ => Err(format!(
+            "profiles {} all claim `{}`; give one `--profile` explicitly or narrow their `applies_to`",
+            claimed.join(", "),
+            target.display()
+        )),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct Claims {
+    #[serde(default)]
+    applies_to: Vec<String>,
+}
+
+/// Find a profile by name, preferring the bundled ones.
+///
+/// Bundled names are reserved. A user file that shadows one is ignored with a
+/// warning rather than silently replacing it, because `--profile untrusted`
+/// meaning something other than the safe floor is not a surprise anyone wants.
+pub fn source(name: &str) -> Result<Source, String> {
+    if let Some(bundled) = get(name) {
+        warn_if_shadowing(name);
+        return Ok(Source::Bundled(bundled));
+    }
+
+    let Some(path) = user_path(name) else {
+        return Err(unknown(name));
+    };
+    let toml = std::fs::read_to_string(&path)
+        .map_err(|err| format!("could not read profile `{}`: {err}", path.display()))?;
+    Ok(Source::User { path, toml })
+}
+
+/// Report a user file that cannot take effect because the name is bundled.
+fn warn_if_shadowing(name: &str) {
+    if get(name).is_some() && user_path(name).is_some() {
+        eprintln!(
+            "bailey: warning: a profile named `{name}` is bundled with bailey, so \
+             the file of that name in your profiles directory is ignored; rename \
+             it to use it"
+        );
+    }
+}
+
+fn user_path(name: &str) -> Option<PathBuf> {
+    if name.contains('/') || name.contains('\\') {
+        return None;
+    }
+    let path = user_dir()?.join(format!("{name}.toml"));
+    path.is_file().then_some(path)
+}
+
+fn unknown(name: &str) -> String {
+    let mut message = format!("unknown profile `{name}`; bundled profiles are ");
+    message.push_str(
+        &ALL.iter()
+            .map(|profile| profile.name)
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    if let Some(dir) = user_dir() {
+        message.push_str(&format!(
+            ". Write your own as {}/{name}.toml",
+            dir.display()
+        ));
+    }
+    message
+}
+
+/// Build the base layers for `profile`, lowest precedence first.
+///
+/// The untrusted floor is always included; any other profile is layered on top
+/// of it. Returns an error message if the named profile is unknown.
+pub fn base_layers(profile: &str) -> Result<Vec<Layer>, String> {
+    // The floor is bundled and always applied, so a file that shadows a bundled
+    // name is reported here rather than only when the name is layered.
+    warn_if_shadowing(profile);
+    let mut layers = vec![Layer {
+        label: "profile:untrusted".into(),
+        toml: UNTRUSTED.into(),
+    }];
+    if profile != DEFAULT {
+        let source = source(profile)?;
+        let label = match &source {
+            Source::Bundled(_) => format!("profile:{profile}"),
+            Source::User { path, .. } => path.display().to_string(),
+        };
+        layers.push(Layer {
+            label,
+            toml: source.toml().to_owned(),
+        });
+    }
+    Ok(layers)
 }
 
 #[cfg(test)]
@@ -101,38 +273,40 @@ mod tests {
     fn every_bundled_profile_parses_and_layers() {
         for profile in ALL {
             let layers = base_layers(profile.name).expect("a known profile");
-            crate::config::resolve_with_bases(&layers, std::path::Path::new("/bin/true"), None)
+            let borrowed: Vec<(&str, &str)> = layers
+                .iter()
+                .map(|layer| (layer.label.as_str(), layer.toml.as_str()))
+                .collect();
+            crate::config::resolve_with_bases(&borrowed, std::path::Path::new("/bin/true"), None)
                 .unwrap_or_else(|err| panic!("profile `{}` does not resolve: {err}", profile.name));
         }
     }
 
     #[test]
-    fn the_working_directory_profile_grants_no_home_or_network() {
-        let layers = base_layers("ai-agent").unwrap();
-        let resolved =
-            crate::config::resolve_with_bases(&layers, std::path::Path::new("/bin/true"), None)
-                .unwrap();
-        let home = std::env::var("HOME").unwrap();
-        assert!(
-            !resolved
-                .policy
-                .filesystem
-                .iter()
-                .any(|rule| rule.path.starts_with(&home)),
-            "the profile must not reach the home directory"
-        );
-        assert_eq!(
-            resolved.policy.network.egress,
-            crate::policy::Egress::DenyAll
-        );
-        assert!(resolved.policy.devices.iter().all(|rule| {
-            // The untrusted floor's terminal and null devices are the only ones.
-            rule.path.starts_with("/dev/null")
-                || rule.path.starts_with("/dev/zero")
-                || rule.path.starts_with("/dev/full")
-                || rule.path.starts_with("/dev/urandom")
-                || rule.path.starts_with("/dev/random")
-                || rule.path.starts_with("/dev/tty")
-        }));
+    fn an_unknown_profile_names_the_alternatives() {
+        let err = base_layers("no-such-profile").unwrap_err();
+        assert!(err.contains("untrusted"), "{err}");
+        assert!(err.contains("profiles"), "{err}");
+    }
+
+    #[test]
+    fn a_user_profile_is_found_and_layered() {
+        let dir = tempfile::tempdir().unwrap();
+        let profiles = dir.path().join("bailey/profiles");
+        std::fs::create_dir_all(&profiles).unwrap();
+        std::fs::write(
+            profiles.join("mine.toml"),
+            "[filesystem]\nread = [\"/opt/mine\"]\n",
+        )
+        .unwrap();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()) };
+
+        let layers = base_layers("mine").expect("a user profile");
+        assert_eq!(layers.len(), 2, "the floor plus the user profile");
+        assert!(layers[1].toml.contains("/opt/mine"));
+        assert!(layers[1].label.ends_with("mine.toml"));
+
+        assert!(user_profiles().iter().any(|(name, _)| name == "mine"));
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
     }
 }

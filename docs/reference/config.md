@@ -8,7 +8,9 @@ ignored rule.
 Lowest precedence first:
 
 1. The implicit grant of the target executable, read and execute.
-2. Bundled profile: the `untrusted` floor, plus the profile named by `--profile`.
+2. Profile: the `untrusted` floor, plus the profile named by `--profile`, or one
+   that claims this target with `applies_to`. A profile is either bundled or a
+   file in `$XDG_CONFIG_HOME/bailey/profiles/`.
 3. `$XDG_CONFIG_HOME/bailey/config.toml`, or `~/.config/bailey/config.toml`.
 4. Every `bailey.toml` found walking up from the target's directory and from the
    working directory, ordered by path depth, shallowest first. A file found by
@@ -128,6 +130,20 @@ The target's environment is built, not inherited: it starts empty, gets a base
 set of `PATH`, `HOME`, `TMPDIR`, `TERM`, `LANG`, `LC_*`, `USER`, `LOGNAME`,
 `SHELL`, and `TZ`, and takes nothing else from the caller unless named here. See
 [environment and storage](/guide/environment).
+
+## `applies_to`
+
+A top-level key, meaningful only in a profile under
+`$XDG_CONFIG_HOME/bailey/profiles/`. It lists the programs the profile is for, so
+that bailey selects it without `--profile`.
+
+```toml
+applies_to = ["claude", "/opt/thing/bin/thing"]
+```
+
+An entry with no `/` matches the target's file name; one with a `/` must match
+the resolved path. An explicit `--profile` overrides it, and two profiles
+claiming one target is an error.
 
 ## `home`
 

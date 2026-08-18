@@ -171,6 +171,12 @@ struct RawLayer {
     hooks: Option<RawHooks>,
     env: Option<RawEnv>,
     home: Option<String>,
+    /// Which targets a profile claims. Parsed only so that a profile carrying
+    /// the key is still a valid config layer; the value is read by
+    /// `profiles::for_target`, from the file rather than from here.
+    #[serde(default)]
+    #[allow(dead_code)]
+    applies_to: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]

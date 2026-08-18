@@ -1,6 +1,7 @@
 //! Integration tests for what bailey reports about a host and about a run.
 
 use std::fs;
+use std::path::Path;
 use std::process::Command;
 
 fn bailey() -> &'static str {
@@ -169,5 +170,109 @@ fn a_removed_hook_is_explained_rather_than_rejected() {
     assert!(
         stderr.contains("on_violation") && stderr.contains("ignored"),
         "the removed hook must be explained: {stderr}"
+    );
+}
+
+/// A run with its own config home, so user profiles land somewhere temporary.
+fn with_profiles(config_home: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(bailey())
+        .args(args)
+        .env("XDG_CONFIG_HOME", config_home)
+        .output()
+        .unwrap()
+}
+
+fn write_profile(config_home: &Path, name: &str, body: &str) {
+    let dir = config_home.join("bailey/profiles");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join(format!("{name}.toml")), body).unwrap();
+}
+
+#[test]
+fn a_user_profile_can_be_listed_shown_and_used() {
+    let dir = tempfile::tempdir().unwrap();
+    write_profile(dir.path(), "mine", "[filesystem]\nread = [\"/opt/mine\"]\n");
+
+    let listed = with_profiles(dir.path(), &["profile", "list"]);
+    let list = String::from_utf8_lossy(&listed.stdout);
+    assert!(list.contains("yours:") && list.contains("mine"), "{list}");
+
+    let shown = with_profiles(dir.path(), &["profile", "show", "mine"]);
+    assert!(String::from_utf8_lossy(&shown.stdout).contains("/opt/mine"));
+
+    let used = with_profiles(dir.path(), &["show", "--profile", "mine", "/bin/true"]);
+    assert!(
+        String::from_utf8_lossy(&used.stdout).contains("/opt/mine"),
+        "a user profile must contribute to the policy"
+    );
+}
+
+#[test]
+fn a_profile_claims_its_target_unless_one_is_given() {
+    let dir = tempfile::tempdir().unwrap();
+    write_profile(
+        dir.path(),
+        "claims-true",
+        "applies_to = [\"true\"]\n[filesystem]\nread = [\"/opt/claimed\"]\n",
+    );
+
+    let auto = with_profiles(dir.path(), &["show", "/bin/true"]);
+    assert!(
+        String::from_utf8_lossy(&auto.stdout).contains("/opt/claimed"),
+        "a profile that claims the target must be selected"
+    );
+    assert!(
+        String::from_utf8_lossy(&auto.stderr).contains("claims this target"),
+        "a policy selected for the user must be reported"
+    );
+
+    let explicit = with_profiles(dir.path(), &["show", "--profile", "untrusted", "/bin/true"]);
+    assert!(
+        !String::from_utf8_lossy(&explicit.stdout).contains("/opt/claimed"),
+        "an explicit --profile must win"
+    );
+
+    let other = with_profiles(dir.path(), &["show", "/bin/sh"]);
+    assert!(
+        !String::from_utf8_lossy(&other.stdout).contains("/opt/claimed"),
+        "a profile must not apply to a target it does not claim"
+    );
+}
+
+#[test]
+fn two_profiles_claiming_one_target_is_an_error() {
+    let dir = tempfile::tempdir().unwrap();
+    write_profile(dir.path(), "first", "applies_to = [\"true\"]\n");
+    write_profile(dir.path(), "second", "applies_to = [\"true\"]\n");
+
+    let output = with_profiles(dir.path(), &["show", "/bin/true"]);
+    assert!(
+        !output.status.success(),
+        "ambiguous selection must not proceed"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("first") && stderr.contains("second"),
+        "the error must name both profiles: {stderr}"
+    );
+}
+
+#[test]
+fn a_bundled_name_cannot_be_shadowed() {
+    let dir = tempfile::tempdir().unwrap();
+    write_profile(
+        dir.path(),
+        "untrusted",
+        "[filesystem]\nread = [\"/opt/shadow\"]\n",
+    );
+
+    let output = with_profiles(dir.path(), &["show", "--profile", "untrusted", "/bin/true"]);
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("/opt/shadow"),
+        "a bundled profile must win over a file of the same name"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("ignored"),
+        "the shadowing attempt must be reported"
     );
 }

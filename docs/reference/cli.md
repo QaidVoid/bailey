@@ -23,7 +23,7 @@ exit status.
 | Option | Description |
 | --- | --- |
 | `-c, --config <FILE>` | Explicit config file, highest precedence |
-| `-p, --profile <NAME>` | Bundled profile used as the base. Default `untrusted` |
+| `-p, --profile <NAME>` | Profile used as the base, bundled or your own. Defaults to one that claims the target, else `untrusted` |
 | `--isolate` | Rebuild the target's world with user, mount, and PID namespaces |
 | `--quiet` | Do not print what the run enforced |
 | `--json` | Print what the run enforced as JSON |
@@ -87,7 +87,8 @@ definitions.
 
 ## `bailey profile list`
 
-Lists the bundled profiles with their descriptions, marking the default base.
+Lists the bundled profiles with their descriptions, marking the default base, and
+then any profiles of your own with the file each came from.
 
 ## `bailey profile show`
 
@@ -95,7 +96,7 @@ Lists the bundled profiles with their descriptions, marking the default base.
 bailey profile show <NAME>
 ```
 
-Prints a bundled profile's TOML, so it can be copied and edited.
+Prints a profile's TOML, bundled or your own, so it can be copied and edited.
 
 ## `bailey profile generate`
 

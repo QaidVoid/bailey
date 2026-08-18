@@ -55,9 +55,10 @@ struct RunArgs {
     /// Explicit config file, taking highest precedence.
     #[arg(short, long)]
     config: Option<PathBuf>,
-    /// Bundled profile to use as the base.
-    #[arg(short, long, default_value = profiles::DEFAULT)]
-    profile: String,
+    /// Profile to use as the base. Defaults to a profile that claims this
+    /// target, or to the untrusted floor.
+    #[arg(short, long)]
+    profile: Option<String>,
     /// Reconstruct the target's world with namespaces (defense in depth).
     #[arg(long)]
     isolate: bool,
@@ -77,9 +78,10 @@ struct AuditArgs {
     /// Explicit config file, taking highest precedence.
     #[arg(short, long)]
     config: Option<PathBuf>,
-    /// Bundled profile to use as the base.
-    #[arg(short, long, default_value = profiles::DEFAULT)]
-    profile: String,
+    /// Profile to use as the base. Defaults to a profile that claims this
+    /// target, or to the untrusted floor.
+    #[arg(short, long)]
+    profile: Option<String>,
     /// Write the recorded access trace to this file as JSON.
     #[arg(long)]
     save_trace: Option<PathBuf>,
@@ -100,9 +102,10 @@ struct ShowArgs {
     /// Explicit config file, taking highest precedence.
     #[arg(short, long)]
     config: Option<PathBuf>,
-    /// Bundled profile to use as the base.
-    #[arg(short, long, default_value = profiles::DEFAULT)]
-    profile: String,
+    /// Profile to use as the base. Defaults to a profile that claims this
+    /// target, or to the untrusted floor.
+    #[arg(short, long)]
+    profile: Option<String>,
     /// The target executable, by path or by name on `PATH`.
     target: String,
 }
@@ -134,9 +137,9 @@ struct GenerateArgs {
     /// Explicit config file used when resolving the base policy.
     #[arg(short, long)]
     config: Option<PathBuf>,
-    /// Bundled profile used as the base when resolving.
-    #[arg(short, long, default_value = profiles::DEFAULT)]
-    profile: String,
+    /// Profile used as the base when resolving. Defaults as `run` does.
+    #[arg(short, long)]
+    profile: Option<String>,
     /// Include high-risk access (egress, credentials) in the generated profile.
     #[arg(long)]
     include_high_risk: bool,
@@ -259,7 +262,8 @@ fn yes_no(value: bool) -> &'static str {
 
 fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
     let (program, program_args) = split_command(args.command)?;
-    let resolved = resolve(&args.profile, &program, args.config.as_deref())?;
+    let profile = select_profile(args.profile.as_deref(), &program)?;
+    let resolved = resolve(&profile, &program, args.config.as_deref())?;
     warn_if_target_denied(&resolved.policy, &program);
     let target = Target {
         program,
@@ -289,7 +293,8 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
 
 fn cmd_audit(args: AuditArgs) -> anyhow::Result<i32> {
     let (program, program_args) = split_command(args.command)?;
-    let resolved = resolve(&args.profile, &program, args.config.as_deref())?;
+    let profile = select_profile(args.profile.as_deref(), &program)?;
+    let resolved = resolve(&profile, &program, args.config.as_deref())?;
     let target_dir = target_dir(&program);
     let target = Target {
         program,
@@ -326,8 +331,9 @@ fn cmd_audit(args: AuditArgs) -> anyhow::Result<i32> {
 
 fn cmd_show(args: ShowArgs) -> anyhow::Result<i32> {
     let target = resolve_target(&args.target)?;
-    let resolved = resolve(&args.profile, &target, args.config.as_deref())?;
-    print_sources(&args.profile, &target, args.config.as_deref());
+    let profile = select_profile(args.profile.as_deref(), &target)?;
+    let resolved = resolve(&profile, &target, args.config.as_deref())?;
+    print_sources(&profile, &target, args.config.as_deref());
     print_policy(&resolved, &target);
     Ok(0)
 }
@@ -344,12 +350,19 @@ fn cmd_profile(args: ProfileArgs) -> anyhow::Result<i32> {
                 println!("{}{}", profile.name, marker);
                 println!("  {}", profile.description);
             }
+            let yours = profiles::user_profiles();
+            if !yours.is_empty() {
+                println!("\nyours:");
+                for (name, path) in yours {
+                    println!("{name}");
+                    println!("  {}", path.display());
+                }
+            }
             Ok(0)
         }
         ProfileCommand::Show { name } => {
-            let profile =
-                profiles::get(&name).ok_or_else(|| anyhow::anyhow!("unknown profile `{name}`"))?;
-            print!("{}", profile.toml);
+            let source = profiles::source(&name).map_err(|err| anyhow::anyhow!(err))?;
+            print!("{}", source.toml());
             Ok(0)
         }
         ProfileCommand::Generate(args) => cmd_profile_generate(args),
@@ -375,7 +388,8 @@ fn cmd_profile_generate(args: GenerateArgs) -> anyhow::Result<i32> {
         );
     }
 
-    let resolved = resolve(&args.profile, &args.target, args.config.as_deref())?;
+    let profile = select_profile(args.profile.as_deref(), &args.target)?;
+    let resolved = resolve(&profile, &args.target, args.config.as_deref())?;
     let target_dir = target_dir(&args.target);
 
     let findings = reconcile::reconcile(&trace.events, &resolved.policy, &target_dir);
@@ -403,10 +417,33 @@ fn cmd_profile_generate(args: GenerateArgs) -> anyhow::Result<i32> {
     Ok(0)
 }
 
+/// Decide which profile a run uses.
+///
+/// An explicit `--profile` wins. Otherwise a user profile that claims this
+/// target is used, and the choice is reported, since a policy that was selected
+/// for you should not be invisible.
+fn select_profile(requested: Option<&str>, target: &Path) -> anyhow::Result<String> {
+    if let Some(name) = requested {
+        return Ok(name.to_owned());
+    }
+    match profiles::for_target(target).map_err(|err| anyhow::anyhow!(err))? {
+        Some(name) => {
+            eprintln!("bailey: using profile `{name}`, which claims this target");
+            Ok(name)
+        }
+        None => Ok(profiles::DEFAULT.to_owned()),
+    }
+}
+
 fn resolve(profile: &str, target: &Path, explicit: Option<&Path>) -> anyhow::Result<Resolved> {
     let implicit = implicit_target_layer(target);
-    let mut bases: Vec<(&str, &str)> = vec![("implicit:target", &implicit)];
-    bases.extend(profiles::base_layers(profile).map_err(|err| anyhow::anyhow!(err))?);
+    let layers = profiles::base_layers(profile).map_err(|err| anyhow::anyhow!(err))?;
+    let mut bases: Vec<(&str, &str)> = vec![("implicit:target", implicit.as_str())];
+    bases.extend(
+        layers
+            .iter()
+            .map(|layer| (layer.label.as_str(), layer.toml.as_str())),
+    );
     Ok(config::resolve_with_bases(&bases, target, explicit)?)
 }
 
