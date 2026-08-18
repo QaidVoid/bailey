@@ -17,9 +17,12 @@ bailey: warning: outbound access is restricted by TCP port only;
 UDP, QUIC, and DNS are not restricted
 ```
 
-A full `egress = "deny"`, which is the default, does not have this problem: the
-target gets its own network namespace with no route off the host, so every
-protocol fails.
+The same mode leaves the host's loopback reachable, since the target shares your
+network namespace.
+
+A full `egress = "deny"`, which is the default, has neither problem: the target
+gets its own network namespace with no route off the host and no access to your
+loopback, so every protocol fails.
 
 ### Host and CIDR rules are advisory
 

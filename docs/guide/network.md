@@ -49,9 +49,17 @@ bailey: warning: outbound access is restricted by TCP port only;
 UDP, QUIC, and DNS are not restricted
 ```
 
+Two things are worth knowing about this mode, because both are permanent rather
+than pending:
+
+- **UDP, QUIC, DNS, and ICMP are unrestricted.** Landlock has no rule for them.
+- **The host's loopback is reachable.** The target shares your network namespace,
+  so a service on `127.0.0.1` is subject only to the TCP port rules, and any UDP
+  port on loopback is reachable outright.
+
 If you need a program to reach one TCP port and nothing else, this mode does
-that. If you need UDP filtering, bailey cannot give it to you today; deny egress
-entirely, or put the program behind something that can.
+that. If you need more than that, deny egress entirely and give the program its
+data another way, or put it behind a proxy that can filter.
 
 ## Scoping
 

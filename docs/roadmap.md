@@ -42,7 +42,7 @@ Shipped:
 
 ## Network confinement
 
-Shipped, except the user-mode stack:
+Shipped:
 
 - **Real egress denial.** ✅ When the policy denies egress, the target runs in a
   network namespace with only loopback, so UDP, QUIC, DNS, and everything else
@@ -52,10 +52,12 @@ Shipped, except the user-mode stack:
   later.
 - **Honest reporting.** ✅ `bailey show` prints the mode in force, and a run warns
   when the policy is enforced more narrowly than it reads.
-- **Optional user-mode networking.** Still open. For a policy that allows some
-  egress, attaching a stack such as `pasta` would isolate the namespace while
-  keeping connectivity. It would not filter UDP by port, which those stacks do not
-  do, so the gain is isolation rather than filtering.
+- **Optional user-mode networking.** Dropped. Attaching a stack such as `pasta`
+  would give a partial allowance a namespace of its own, putting the host's
+  loopback out of reach and allowing UDP and ICMP to be switched off. It also
+  needs an external binary, interface configuration inside the sandbox, and a
+  synchronised attach, for a gain that applies only once egress has been
+  deliberately allowed. What that mode does not cover is documented instead.
 
 ## Audit fidelity
 
