@@ -14,6 +14,7 @@ read = ["."]
 write = ["."]
 execute = ["/usr/bin/git", "/usr/bin/cargo", "/usr/bin/rustc", "/usr/bin/sh"]
 
+# Enforced under --isolate: these become empty and read-only.
 deny = ["./.env", "./secrets"]
 
 [network]
@@ -54,11 +55,9 @@ it from a shell that does not have them:
 env -i HOME="$HOME" PATH=/usr/bin:/bin TERM="$TERM" bailey run --isolate /usr/bin/agent-cli
 ```
 
-**`deny` does not protect files inside a granted directory.** The
-`deny = ["./.env"]` above does not restrict anything, because `.` is granted.
-Bailey warns about this on every run, but the file is still readable. Keep
-secrets out of the project directory, or grant subdirectories individually
-instead of granting `.`.
+**`deny` inside a granted directory only works under `--isolate`.** The
+`deny = ["./secrets"]` above is enforced when you pass `--isolate`, and is
+reported as unenforced when you do not. The command below uses it.
 
 **`egress = "deny"` blocks TCP only.** An agent can still send UDP and DNS traffic,
 which is enough to exfiltrate anything it can read. If that matters, run it with

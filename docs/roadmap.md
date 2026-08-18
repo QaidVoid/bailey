@@ -18,11 +18,10 @@ Making the policy mean what it says. Most of this has shipped:
   applies when the target is an interpreter under a system path.
 - **Target arguments pass through.** ✅ Bailey stops parsing its own flags at the
   target.
-- **Denials are carried and reported.** ✅ A denial survives resolution, appears
-  in `bailey show`, and produces a warning when it cannot be enforced.
-- **Denials become enforced.** Still open. Landlock cannot subtract rights from a
-  granted parent, so this needs either mount-based concealment under isolation or
-  splitting the parent grant. See [known limitations](/security/limitations).
+- **Denials are carried, enforced, and reported.** ✅ A denial survives
+  resolution and is enforced under `--isolate` by covering the path with an empty
+  read-only filesystem. Without isolation there is no mechanism for it, so the run
+  reports the denial as unenforced instead of failing quietly.
 
 ## The world the target sees
 

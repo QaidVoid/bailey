@@ -24,7 +24,7 @@ use landlock::{
     Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus,
 };
 
-use crate::backend::isolation::{self, BindMount, IsolationPlan};
+use crate::backend::isolation::{self, BindMount, Conceal, IsolationPlan};
 use crate::backend::{Backend, BackendError, Target};
 use crate::policy::{self, Egress, Policy, ResourceLimits};
 
@@ -60,6 +60,10 @@ impl Backend for EnforceBackend {
         } else {
             None
         };
+
+        if isolation.is_none() {
+            report_unenforceable_denials(policy);
+        }
 
         // The cgroup is created before the fork so the target can join it from
         // `pre_exec`. Joining before exec is what makes the limits cover every
@@ -192,18 +196,25 @@ impl LandlockPlan {
     }
 }
 
-/// Build the bind-mount set for isolation from the policy's granted paths.
+/// Build the bind-mount and concealment set for isolation from the policy.
 ///
 /// Nested paths under an already-included directory are skipped (they come
 /// along with the parent bind), and `/proc` is omitted because a fresh `/proc`
 /// is mounted in the new PID namespace.
+///
+/// A denied path is never bound. Where a denial sits beneath a path that is
+/// bound, it arrives with its parent and is covered over instead, which is what
+/// makes a nested denial enforceable: Landlock rules can only add access.
 fn build_isolation_plan(policy: &Policy) -> IsolationPlan {
+    let denied = |path: &Path| policy.denied.iter().any(|deny| path.starts_with(deny));
+
     let mut paths: Vec<PathBuf> = policy
         .filesystem
         .iter()
         .map(|rule| rule.path.clone())
         .chain(policy.devices.iter().map(|rule| rule.path.clone()))
         .filter(|path| !path.starts_with("/proc"))
+        .filter(|path| !denied(path))
         .collect();
     paths.sort();
     paths.dedup();
@@ -228,7 +239,21 @@ fn build_isolation_plan(policy: &Policy) -> IsolationPlan {
             is_dir,
         });
     }
-    IsolationPlan { binds }
+
+    let conceal = policy
+        .denied
+        .iter()
+        .filter(|path| binds.iter().any(|bind| path.starts_with(&bind.source)))
+        .filter_map(|path| {
+            let is_dir = std::fs::metadata(path).ok()?.is_dir();
+            Some(Conceal {
+                path: path.clone(),
+                is_dir,
+            })
+        })
+        .collect();
+
+    IsolationPlan { binds, conceal }
 }
 
 fn fs_access_bits(access: policy::Access) -> Option<BitFlags<AccessFs>> {
@@ -247,6 +272,23 @@ fn fs_access_bits(access: policy::Access) -> Option<BitFlags<AccessFs>> {
 
 fn landlock_err(err: impl std::fmt::Display) -> io::Error {
     io::Error::other(format!("landlock: {err}"))
+}
+
+/// Report denials that cannot be honored without the isolation layer.
+///
+/// A denial beneath a granted parent is enforced by covering the path over
+/// inside the mount namespace. With isolation off there is no mechanism for it,
+/// so the run says so rather than leaving the policy quietly weaker than it
+/// reads.
+fn report_unenforceable_denials(policy: &Policy) {
+    for path in policy.nested_denials() {
+        eprintln!(
+            "bailey: warning: `{}` is denied but nested under a granted path, \
+             and is not enforced without `--isolate`. Grant the specific \
+             subdirectories you need instead of granting the parent.",
+            path.display()
+        );
+    }
 }
 
 fn report_degradation(policy: &Policy) {

@@ -23,6 +23,111 @@ fn isolation_active() -> bool {
         && String::from_utf8_lossy(&out.stdout).trim() == "1")
 }
 
+/// A workspace with a granted directory holding both a denied subdirectory and
+/// an ordinary sibling, plus a config that grants the parent and denies the one
+/// subdirectory.
+fn denial_workspace() -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    fs::create_dir(&work).unwrap();
+    fs::create_dir(work.join("secret")).unwrap();
+    fs::write(work.join("secret/key"), "topsecret").unwrap();
+    fs::write(work.join("visible.txt"), "readable").unwrap();
+
+    let config = dir.path().join("bailey.toml");
+    fs::write(
+        &config,
+        format!(
+            "[filesystem]\n\
+             read = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\", \"/etc\", \"{work}\"]\n\
+             execute = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\"]\n\
+             deny = [\"{work}/secret\"]\n",
+            work = work.display()
+        ),
+    )
+    .unwrap();
+    (dir, config)
+}
+
+#[test]
+fn denied_subdirectory_is_concealed_under_isolation() {
+    if !isolation_active() {
+        eprintln!("skipping: isolation unavailable on this host");
+        return;
+    }
+    let (dir, config) = denial_workspace();
+    let work = dir.path().join("work");
+
+    let denied = Command::new(bailey())
+        .args(["run", "--isolate", "-c"])
+        .arg(&config)
+        .args(["/bin/sh", "-c"])
+        .arg(format!("cat {}/secret/key", work.display()))
+        .output()
+        .unwrap();
+    assert!(
+        !denied.status.success(),
+        "a file under a denied directory must not be readable: {}",
+        String::from_utf8_lossy(&denied.stdout)
+    );
+    assert!(
+        !String::from_utf8_lossy(&denied.stdout).contains("topsecret"),
+        "denied content leaked"
+    );
+
+    let sibling = Command::new(bailey())
+        .args(["run", "--isolate", "-c"])
+        .arg(&config)
+        .args(["/bin/sh", "-c"])
+        .arg(format!("cat {}/visible.txt", work.display()))
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&sibling.stdout).trim(),
+        "readable",
+        "a sibling of the denied path must stay readable"
+    );
+}
+
+#[test]
+fn denied_directory_is_empty_and_read_only_under_isolation() {
+    if !isolation_active() {
+        eprintln!("skipping: isolation unavailable on this host");
+        return;
+    }
+    let (dir, config) = denial_workspace();
+    let work = dir.path().join("work");
+
+    let listing = Command::new(bailey())
+        .args(["run", "--isolate", "-c"])
+        .arg(&config)
+        .args(["/bin/sh", "-c"])
+        .arg(format!("ls -A {}/secret", work.display()))
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&listing.stdout).trim().is_empty(),
+        "the denied directory must have no entries: {}",
+        String::from_utf8_lossy(&listing.stdout)
+    );
+
+    let write = Command::new(bailey())
+        .args(["run", "--isolate", "-c"])
+        .arg(&config)
+        .args(["/bin/sh", "-c"])
+        .arg(format!("echo x > {}/secret/planted", work.display()))
+        .output()
+        .unwrap();
+    assert!(
+        !write.status.success(),
+        "the denied directory must not be writable"
+    );
+    assert!(
+        !work.join("secret/planted").exists(),
+        "a write into the denied directory must not reach the host"
+    );
+}
+
 #[test]
 fn ungranted_path_is_absent_under_isolation() {
     if !isolation_active() {

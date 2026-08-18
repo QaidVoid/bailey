@@ -43,15 +43,15 @@ contributes once. At equal depth, the working directory wins.
 - **Granting and denying the same path within one layer is an error**, naming the
   file and the path.
 
-::: danger A nested `deny` is not enforced yet
-Denying a path that sits inside a directory another layer granted does not
-restrict it: granting `~` and denying `~/.ssh` leaves `~/.ssh` readable. Landlock
-resolves access by walking up from the file, so an ancestor grant satisfies it
-and no narrower rule can subtract from that.
+::: warning A nested `deny` needs `--isolate`
+Denying a path inside a directory another layer granted is enforced by covering
+that path with an empty read-only filesystem, which only the isolation layer can
+do. `bailey run --isolate` enforces it; a plain `bailey run` reports it as
+unenforced and the path stays readable.
 
-Bailey now warns on every run where this applies, and marks the denial as
-`NOT ENFORCED` in `bailey show`, but the read still succeeds. Grant the specific
-subdirectories you want instead. See [known limitations](/security/limitations).
+Landlock rules cannot express this: access resolution walks up from the file, so
+an ancestor grant satisfies it and no narrower rule can subtract. See
+[known limitations](/security/limitations).
 :::
 
 ## Paths

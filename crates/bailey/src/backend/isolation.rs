@@ -22,10 +22,25 @@ pub struct BindMount {
     pub is_dir: bool,
 }
 
+/// A path to conceal inside the reconstructed root.
+///
+/// Concealment is how a denial is enforced beneath a granted parent. Landlock
+/// rules can only add access, so a denied path that arrives with its parent's
+/// bind mount is covered over instead: an empty read-only filesystem in its
+/// place, leaving nothing to read and nothing to write.
+pub struct Conceal {
+    /// Absolute path to cover, as it appears in the new root.
+    pub path: PathBuf,
+    /// Whether the path is a directory.
+    pub is_dir: bool,
+}
+
 /// The set of paths to reconstruct in the target's root.
 pub struct IsolationPlan {
     /// Paths to bind into the new root.
     pub binds: Vec<BindMount>,
+    /// Paths to cover over after binding.
+    pub conceal: Vec<Conceal>,
 }
 
 /// Whether namespace isolation actually works on this host.
@@ -147,6 +162,7 @@ fn setup_root(plan: &IsolationPlan) -> io::Result<()> {
     for bind in &plan.binds {
         bind_into(&new_root, bind)?;
     }
+    conceal_all(&new_root, &plan.conceal)?;
 
     // A fresh /proc, meaningful because we are in a new PID namespace.
     let proc_dir = new_root.join("proc");
@@ -166,6 +182,61 @@ fn setup_root(plan: &IsolationPlan) -> io::Result<()> {
     chdir("/").map_err(errno)?;
     umount2("/.oldroot", MntFlags::MNT_DETACH).map_err(errno)?;
     let _ = fs::remove_dir("/.oldroot");
+    Ok(())
+}
+
+/// Cover each denied path that survived into the new root.
+///
+/// Directories are replaced by an empty read-only tmpfs. Files are covered by a
+/// bind of an empty placeholder, which is unlinked once the binds hold a
+/// reference to it. Read-only is enforced by the mount rather than by the mode
+/// bits, which the target could otherwise bypass as root inside its own user
+/// namespace.
+fn conceal_all(new_root: &Path, conceal: &[Conceal]) -> io::Result<()> {
+    let placeholder = new_root.join(".bailey-empty");
+    let needs_placeholder = conceal.iter().any(|item| !item.is_dir);
+    if needs_placeholder {
+        fs::File::create(&placeholder)?;
+    }
+
+    for item in conceal {
+        let relative = item.path.strip_prefix("/").unwrap_or(&item.path);
+        let target = new_root.join(relative);
+        if !target.exists() {
+            continue;
+        }
+        if item.is_dir {
+            mount(
+                Some("tmpfs"),
+                &target,
+                Some("tmpfs"),
+                MsFlags::MS_RDONLY | MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+                Some("mode=0000"),
+            )
+            .map_err(errno)?;
+        } else {
+            mount(
+                Some(&placeholder),
+                &target,
+                None::<&str>,
+                MsFlags::MS_BIND,
+                None::<&str>,
+            )
+            .map_err(errno)?;
+            mount(
+                None::<&str>,
+                &target,
+                None::<&str>,
+                MsFlags::MS_REMOUNT | MsFlags::MS_BIND | MsFlags::MS_RDONLY,
+                None::<&str>,
+            )
+            .map_err(errno)?;
+        }
+    }
+
+    if needs_placeholder {
+        let _ = fs::remove_file(&placeholder);
+    }
     Ok(())
 }
 

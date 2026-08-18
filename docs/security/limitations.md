@@ -27,10 +27,7 @@ ignores the host. Bailey warns when you set a host other than `*`.
 
 ## Filesystem
 
-### A nested `deny` is not enforced
-
-`deny` retracts a grant of the same path, and records a denial. Enforcement does
-not yet honor a denial that sits inside a directory another layer granted.
+### A nested `deny` needs `--isolate`
 
 ```toml
 [filesystem]
@@ -38,18 +35,23 @@ read = ["."]
 deny = ["./secret"]
 ```
 
-Under this policy, `./secret/key` is still readable. Verified.
+Under `--isolate` this is enforced: `./secret` becomes an empty read-only
+filesystem, so there is nothing to read and nothing can be written. Without
+`--isolate`, `./secret/key` is still readable, and the run says so:
 
-The cause is structural rather than an oversight. Landlock resolves access by
-walking up from the accessed file, and any ancestor rule that grants the access
-allows it, so a narrower rule on a subpath cannot take rights away. A rule with
-no access rights at all is rejected by the kernel. Subtraction is only possible
-by stacking a second ruleset, or by not granting the parent in the first place.
+```
+bailey: warning: `/work/secret` is denied but nested under a granted path,
+and is not enforced without `--isolate`.
+```
 
-Bailey warns on every run where a nested denial applies, and marks it
-`NOT ENFORCED` in `bailey show`, so the policy is never quietly weaker than it
-reads. Until enforcement lands, grant the specific subdirectories you want
-instead of granting the parent and carving out exceptions.
+The reason is structural. Landlock resolves access by walking up from the
+accessed file, and any ancestor rule that grants the access allows it, so a
+narrower rule on a subpath cannot take rights away; a rule with no access rights
+at all is rejected by the kernel. Taking access away from a granted hierarchy is
+only possible by covering the path over, which is what the mount namespace does.
+
+For runs without isolation, grant the specific subdirectories you want instead of
+granting the parent and carving out exceptions.
 
 ## Environment
 

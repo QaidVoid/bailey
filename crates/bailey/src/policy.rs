@@ -111,3 +111,19 @@ pub struct Policy {
     /// Resource limits.
     pub resources: ResourceLimits,
 }
+
+impl Policy {
+    /// Denials that sit beneath a grant which still covers them.
+    ///
+    /// These need a mechanism that can take access away, which Landlock rules
+    /// cannot: access resolution walks up from the accessed path, so an ancestor
+    /// grant satisfies it. Only the isolation layer can enforce these, by
+    /// covering the path over.
+    pub fn nested_denials(&self) -> impl Iterator<Item = &PathBuf> {
+        self.denied.iter().filter(|denied| {
+            self.filesystem
+                .iter()
+                .any(|rule| denied.starts_with(&rule.path) && **denied != rule.path)
+        })
+    }
+}

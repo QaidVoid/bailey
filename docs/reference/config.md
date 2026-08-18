@@ -38,11 +38,10 @@ deny = ["~/.config/app/token"]
 
 Granting and denying the same path within one layer is an error.
 
-::: danger A nested `deny` is not enforced yet
-A denial of a path inside a granted directory is recorded and reported, and is
-then ignored by enforcement. Bailey warns on each run it applies to and marks it
-`NOT ENFORCED` in `bailey show`. Grant the specific subdirectories you want
-instead.
+::: warning A nested `deny` needs `--isolate`
+A denial of a path inside a granted directory is enforced by covering the path
+with an empty read-only filesystem, which only the isolation layer can do.
+Without `--isolate` the denial is reported as unenforced before the run starts.
 :::
 
 ## `[network]`

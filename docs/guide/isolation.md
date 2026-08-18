@@ -17,6 +17,11 @@ nothing, because `/home` does not exist in that world.
 **Processes.** A new PID namespace, with a fresh `/proc`. The program is PID 1 in
 its own namespace and cannot see or signal anything outside its own tree.
 
+**Denials.** A path denied by the policy is covered with an empty read-only
+filesystem, so a `deny` on a subdirectory of a granted directory is actually
+enforced. This is the only place it can be: Landlock rules add access and never
+subtract it.
+
 **Privilege.** All of it happens inside a user namespace, so none of it needs
 root. The invoking user is mapped to uid 0 inside the namespace, which is what
 makes the mount operations permitted; that root is meaningless outside the
@@ -48,7 +53,9 @@ every device grant. Nested paths under an already-bound directory are skipped,
 since they arrive with the parent. `/proc` is excluded, because a fresh one is
 mounted inside the new PID namespace.
 
-A grant naming a path that does not exist on the host is skipped.
+A grant naming a path that does not exist on the host is skipped. A denied path
+is never bound, and where it arrives inside a bound parent it is covered over
+afterwards.
 
 ## Graceful degradation
 
