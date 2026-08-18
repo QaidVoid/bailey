@@ -43,7 +43,7 @@ fn granted_path_is_readable_and_program_runs() {
     let output = Command::new(bailey())
         .args(["run", "-c"])
         .arg(&config)
-        .args(["/bin/sh", "--", "-c"])
+        .args(["/bin/sh", "-c"])
         .arg(format!("cat {}", allowed.display()))
         .output()
         .unwrap();
@@ -74,7 +74,7 @@ fn ungranted_path_is_denied() {
     let output = Command::new(bailey())
         .args(["run", "-c"])
         .arg(&config)
-        .args(["/bin/sh", "--", "-c"])
+        .args(["/bin/sh", "-c"])
         .arg(format!("cat {}", secret.display()))
         .output()
         .unwrap();
@@ -103,7 +103,7 @@ fn denied_syscall_is_blocked() {
     let output = Command::new(bailey())
         .args(["run", "-c"])
         .arg(&config)
-        .args(["/usr/bin/unshare", "--", "-U", "true"])
+        .args(["/usr/bin/unshare", "-U", "true"])
         .output()
         .unwrap();
 

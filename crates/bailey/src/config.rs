@@ -11,11 +11,12 @@
 //! Layers merge deterministically into a single [`Resolved`] value holding a
 //! [`Policy`] and its [`Hooks`]. Filesystem and device grants accumulate
 //! additively; a layer may clear accumulated filesystem grants with
-//! `filesystem.reset = true`, and may remove specific paths with a
-//! `filesystem.deny` list. Scalar settings from a later layer override earlier
+//! `filesystem.reset = true`. A `filesystem.deny` entry retracts a grant of the
+//! same path and records a denial, so that a path nested beneath a surviving
+//! grant is still refused. Scalar settings from a later layer override earlier
 //! ones.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -103,16 +104,50 @@ pub fn resolve_with_bases(
     for (label, text) in bases {
         layers.push(parse_layer(label, text, &base_dir)?);
     }
-    for path in discover(target, explicit) {
-        layers.push(load_layer(&path)?);
+    for source in discover(target, explicit) {
+        layers.push(load_layer(&source.path)?);
     }
     merge(&layers)
 }
 
-/// List the config file paths that contribute to `target`, lowest precedence
-/// first. Bundled profile bases are not included.
-pub fn sources(target: &Path, explicit: Option<&Path>) -> Vec<PathBuf> {
+/// List the config layers that contribute to `target`, lowest precedence first.
+/// Bundled profile bases are not included.
+pub fn sources(target: &Path, explicit: Option<&Path>) -> Vec<Source> {
     discover(target, explicit)
+}
+
+/// Which discovery rule found a config layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// The global config.
+    Global,
+    /// Found walking up from the target executable's directory.
+    Target,
+    /// Found walking up from the working directory.
+    WorkingDir,
+    /// Named on the command line.
+    Explicit,
+}
+
+impl Origin {
+    /// A short label for display.
+    pub fn label(self) -> &'static str {
+        match self {
+            Origin::Global => "global",
+            Origin::Target => "target",
+            Origin::WorkingDir => "working dir",
+            Origin::Explicit => "explicit",
+        }
+    }
+}
+
+/// A discovered config layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Source {
+    /// Path of the config file.
+    pub path: PathBuf,
+    /// How it was found.
+    pub origin: Origin,
 }
 
 /// A parsed config layer paired with the directory its relative paths resolve
@@ -196,6 +231,7 @@ struct RawHooks {
 #[derive(Default)]
 struct Accumulator {
     filesystem: BTreeMap<PathBuf, Access>,
+    denied: BTreeSet<PathBuf>,
     egress: Option<Egress>,
     bind_ports: Vec<u16>,
     devices: BTreeMap<PathBuf, Access>,
@@ -203,29 +239,57 @@ struct Accumulator {
     hooks: Hooks,
 }
 
-fn discover(target: &Path, explicit: Option<&Path>) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
+/// Discover the config layers for `target`, lowest precedence first.
+///
+/// Per-directory files are collected by walking up from both the target's
+/// directory and the working directory, because the target's directory alone is
+/// useless when the target is an interpreter under a system path. The union is
+/// ordered by path depth so that a more specific directory always wins, and a
+/// file found by both walks contributes once.
+fn discover(target: &Path, explicit: Option<&Path>) -> Vec<Source> {
+    let mut sources = Vec::new();
 
     if let Some(global) = global_config_path()
         && global.is_file()
     {
-        paths.push(global);
+        sources.push(Source {
+            path: global,
+            origin: Origin::Global,
+        });
     }
 
-    let start = target_dir(target);
-    let mut directory: Vec<PathBuf> = start
-        .ancestors()
-        .map(|dir| dir.join(CONFIG_NAME))
-        .filter(|candidate| candidate.is_file())
-        .collect();
-    directory.reverse();
-    paths.extend(directory);
+    let mut walked: Vec<(usize, u8, PathBuf, Origin)> = Vec::new();
+    let mut chains = vec![(target_dir(target), Origin::Target)];
+    if let Ok(cwd) = std::env::current_dir() {
+        chains.push((cwd, Origin::WorkingDir));
+    }
+    for (start, origin) in chains {
+        // Later chains win ties at equal depth.
+        let tiebreak = u8::from(origin == Origin::WorkingDir);
+        for dir in start.ancestors() {
+            let candidate = dir.join(CONFIG_NAME);
+            if candidate.is_file() {
+                walked.push((dir.components().count(), tiebreak, candidate, origin));
+            }
+        }
+    }
+    walked.sort_by_key(|entry| (entry.0, entry.1));
+
+    let mut seen = BTreeSet::new();
+    for (_, _, path, origin) in walked {
+        if seen.insert(path.clone()) {
+            sources.push(Source { path, origin });
+        }
+    }
 
     if let Some(explicit) = explicit {
-        paths.push(absolute(explicit));
+        sources.push(Source {
+            path: absolute(explicit),
+            origin: Origin::Explicit,
+        });
     }
 
-    paths
+    sources
 }
 
 fn merge(layers: &[Layer]) -> Result<Resolved, ConfigError> {
@@ -267,17 +331,22 @@ fn apply_layer(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> 
 
     if fs.reset {
         acc.filesystem.clear();
+        acc.denied.clear();
     }
     for (path, access) in granted {
+        // A grant in this layer overrides a denial from a lower one.
+        acc.denied.remove(&path);
         *acc.filesystem.entry(path).or_insert(Access::empty()) |= access;
     }
     for raw in &fs.deny {
-        acc.filesystem.remove(&resolve_path(raw, &layer.base));
+        let path = resolve_path(raw, &layer.base);
+        acc.filesystem.remove(&path);
+        acc.denied.insert(path);
     }
 
     if let Some(network) = &layer.raw.network {
         if network.egress.is_some() || !network.egress_allow.is_empty() {
-            acc.egress = Some(build_egress(network));
+            acc.egress = Some(build_egress(network, &layer.path)?);
         }
         for port in &network.bind_ports {
             if !acc.bind_ports.contains(port) {
@@ -340,6 +409,7 @@ fn finalize(acc: Accumulator) -> Resolved {
     Resolved {
         policy: Policy {
             filesystem,
+            denied: acc.denied.into_iter().collect(),
             network: NetworkPolicy {
                 egress: acc.egress.unwrap_or(Egress::DenyAll),
                 bind_ports: acc.bind_ports,
@@ -351,22 +421,35 @@ fn finalize(acc: Accumulator) -> Resolved {
     }
 }
 
-fn build_egress(network: &RawNetwork) -> Egress {
+/// Build the egress intent for a layer.
+///
+/// An `egress_allow` entry without a port is rejected rather than dropped: the
+/// only mechanism available matches on TCP port, so silently ignoring the rule
+/// would resolve "allow this destination" into a full deny.
+fn build_egress(network: &RawNetwork, path: &Path) -> Result<Egress, ConfigError> {
     if !network.egress_allow.is_empty() {
-        Egress::Allow(
-            network
-                .egress_allow
-                .iter()
-                .map(|rule| EgressRule {
-                    host: rule.host.clone(),
-                    port: rule.port,
-                })
-                .collect(),
-        )
+        let mut rules = Vec::with_capacity(network.egress_allow.len());
+        for rule in &network.egress_allow {
+            let Some(port) = rule.port else {
+                return Err(ConfigError::Invalid {
+                    path: path.to_path_buf(),
+                    reason: format!(
+                        "egress_allow entry for host `{}` has no port; \
+                         outbound rules are matched by TCP port, so a port is required",
+                        rule.host
+                    ),
+                });
+            };
+            rules.push(EgressRule {
+                host: rule.host.clone(),
+                port: Some(port),
+            });
+        }
+        Ok(Egress::Allow(rules))
     } else if network.egress.as_deref() == Some("allow") {
-        Egress::AllowAll
+        Ok(Egress::AllowAll)
     } else {
-        Egress::DenyAll
+        Ok(Egress::DenyAll)
     }
 }
 
@@ -547,6 +630,40 @@ mod tests {
         ];
         let resolved = merge(&layers).unwrap();
         assert!(resolved.policy.filesystem.is_empty());
+        assert_eq!(resolved.policy.denied, vec![PathBuf::from("/a")]);
+    }
+
+    #[test]
+    fn nested_deny_survives_a_granted_parent() {
+        let layers = [
+            layer("/base", "[filesystem]\nread = [\"/a\"]"),
+            layer("/base", "[filesystem]\ndeny = [\"/a/secret\"]"),
+        ];
+        let resolved = merge(&layers).unwrap();
+        assert_eq!(resolved.policy.filesystem.len(), 1);
+        assert_eq!(resolved.policy.filesystem[0].path, PathBuf::from("/a"));
+        assert_eq!(resolved.policy.denied, vec![PathBuf::from("/a/secret")]);
+    }
+
+    #[test]
+    fn later_grant_overrides_an_earlier_denial() {
+        let layers = [
+            layer("/base", "[filesystem]\ndeny = [\"/a\"]"),
+            layer("/base", "[filesystem]\nread = [\"/a\"]"),
+        ];
+        let resolved = merge(&layers).unwrap();
+        assert!(resolved.policy.denied.is_empty());
+        assert_eq!(resolved.policy.filesystem[0].path, PathBuf::from("/a"));
+    }
+
+    #[test]
+    fn reset_clears_denials_too() {
+        let layers = [
+            layer("/base", "[filesystem]\ndeny = [\"/a/secret\"]"),
+            layer("/base", "[filesystem]\nreset = true\nread = [\"/a\"]"),
+        ];
+        let resolved = merge(&layers).unwrap();
+        assert!(resolved.policy.denied.is_empty());
     }
 
     #[test]
@@ -607,6 +724,33 @@ mod tests {
         let resolved = merge(&layers).unwrap();
         assert_eq!(resolved.policy.network.egress, Egress::AllowAll);
         assert_eq!(resolved.policy.network.bind_ports, vec![1, 2]);
+    }
+
+    #[test]
+    fn portless_egress_rule_is_rejected() {
+        let layers = [layer(
+            "/base",
+            "[network]\negress_allow = [{ host = \"example.com\" }]",
+        )];
+        let err = merge(&layers).unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid { .. }));
+        assert!(err.to_string().contains("example.com"));
+    }
+
+    #[test]
+    fn egress_rule_with_port_resolves() {
+        let layers = [layer(
+            "/base",
+            "[network]\negress_allow = [{ host = \"*\", port = 443 }]",
+        )];
+        let resolved = merge(&layers).unwrap();
+        assert_eq!(
+            resolved.policy.network.egress,
+            Egress::Allow(vec![EgressRule {
+                host: "*".into(),
+                port: Some(443),
+            }])
+        );
     }
 
     #[test]

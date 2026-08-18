@@ -17,7 +17,7 @@ fn bailey() -> &'static str {
 /// this returns false and the tests skip.
 fn isolation_active() -> bool {
     let output = Command::new(bailey())
-        .args(["run", "--isolate", "/bin/sh", "--", "-c", "echo $$"])
+        .args(["run", "--isolate", "/bin/sh", "-c", "echo $$"])
         .output();
     matches!(output, Ok(out) if out.status.success()
         && String::from_utf8_lossy(&out.stdout).trim() == "1")
@@ -30,7 +30,7 @@ fn ungranted_path_is_absent_under_isolation() {
         return;
     }
     let output = Command::new(bailey())
-        .args(["run", "--isolate", "/bin/sh", "--", "-c", "ls /home"])
+        .args(["run", "--isolate", "/bin/sh", "-c", "ls /home"])
         .output()
         .unwrap();
     // /home is not granted, so it is absent from the reconstructed root.
@@ -49,7 +49,7 @@ fn target_is_pid_one_under_isolation() {
         return;
     }
     let output = Command::new(bailey())
-        .args(["run", "--isolate", "/bin/sh", "--", "-c", "echo $$"])
+        .args(["run", "--isolate", "/bin/sh", "-c", "echo $$"])
         .output()
         .unwrap();
     assert!(output.status.success());
@@ -75,7 +75,7 @@ fn landlock_still_denies_writes_under_isolation() {
     let output = Command::new(bailey())
         .args(["run", "--isolate", "-c"])
         .arg(&config)
-        .args(["/bin/sh", "--", "-c"])
+        .args(["/bin/sh", "-c"])
         .arg(format!("echo x > {}", file.display()))
         .output()
         .unwrap();

@@ -97,6 +97,13 @@ pub struct ResourceLimits {
 pub struct Policy {
     /// Filesystem grants, sorted by path.
     pub filesystem: Vec<FsRule>,
+    /// Paths denied outright, sorted by path.
+    ///
+    /// A denial is total: no access is permitted to the path or anything under
+    /// it, even where a grant covers a directory containing it. Denials that
+    /// name a path no grant reaches are redundant, since anything ungranted is
+    /// denied already.
+    pub denied: Vec<PathBuf>,
     /// Network access policy.
     pub network: NetworkPolicy,
     /// Device grants, sorted by path.

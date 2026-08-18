@@ -61,6 +61,12 @@ impl Backend for EnforceBackend {
             None
         };
 
+        // The cgroup is created before the fork so the target can join it from
+        // `pre_exec`. Joining before exec is what makes the limits cover every
+        // process the target goes on to create.
+        let cgroup = CgroupGuard::create(&policy.resources);
+        let procs = cgroup.procs_path();
+
         let mut command = Command::new(&target.program);
         command.args(&target.args);
         if let Some(cwd) = &target.cwd {
@@ -75,6 +81,11 @@ impl Backend for EnforceBackend {
         unsafe {
             command.pre_exec(move || {
                 set_no_new_privs()?;
+                // Before the namespaces, while the host's cgroup filesystem is
+                // still reachable.
+                if let Some(procs) = &procs {
+                    std::fs::write(procs, "0")?;
+                }
                 if let Some(isolation) = &isolation {
                     isolation::enter(isolation)?;
                 }
@@ -86,8 +97,8 @@ impl Backend for EnforceBackend {
         }
 
         let mut child = command.spawn().map_err(BackendError::Io)?;
-        let _cgroup = CgroupGuard::apply(&policy.resources, child.id());
         let status = child.wait().map_err(BackendError::Io)?;
+        drop(cgroup);
         Ok(status.code().unwrap_or(-1))
     }
 }
@@ -327,25 +338,33 @@ fn target_arch() -> anyhow::Result<seccompiler::TargetArch> {
 /// cgroup when dropped. All operations are best-effort: on a system without a
 /// writable delegated cgroup the limits are skipped with a warning rather than
 /// failing the run.
+///
+/// The cgroup is created before the target is spawned; the target joins it
+/// itself from `pre_exec`, so membership is inherited by everything it forks.
 struct CgroupGuard {
     dir: Option<PathBuf>,
 }
 
 impl CgroupGuard {
-    fn apply(limits: &ResourceLimits, pid: u32) -> Self {
+    fn create(limits: &ResourceLimits) -> Self {
         if limits.memory_bytes.is_none()
             && limits.pids_max.is_none()
             && limits.cpu_percent.is_none()
         {
             return Self { dir: None };
         }
-        match try_apply_cgroup(limits, pid) {
+        match try_create_cgroup(limits) {
             Ok(dir) => Self { dir: Some(dir) },
             Err(err) => {
                 eprintln!("bailey: warning: resource limits not applied: {err}");
                 Self { dir: None }
             }
         }
+    }
+
+    /// The `cgroup.procs` path the target writes itself into before exec.
+    fn procs_path(&self) -> Option<PathBuf> {
+        self.dir.as_ref().map(|dir| dir.join("cgroup.procs"))
     }
 }
 
@@ -357,9 +376,9 @@ impl Drop for CgroupGuard {
     }
 }
 
-fn try_apply_cgroup(limits: &ResourceLimits, pid: u32) -> io::Result<PathBuf> {
+fn try_create_cgroup(limits: &ResourceLimits) -> io::Result<PathBuf> {
     let base = current_cgroup()?;
-    let dir = base.join(format!("bailey.{pid}"));
+    let dir = base.join(format!("bailey.{}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
 
     if let Some(memory) = limits.memory_bytes {
@@ -373,7 +392,6 @@ fn try_apply_cgroup(limits: &ResourceLimits, pid: u32) -> io::Result<PathBuf> {
         std::fs::write(dir.join("cpu.max"), format!("{quota} 100000"))?;
     }
 
-    std::fs::write(dir.join("cgroup.procs"), pid.to_string())?;
     Ok(dir)
 }
 

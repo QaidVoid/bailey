@@ -47,11 +47,9 @@ struct RunArgs {
     /// Reconstruct the target's world with namespaces (defense in depth).
     #[arg(long)]
     isolate: bool,
-    /// The target executable.
-    target: PathBuf,
-    /// Arguments passed to the target.
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    args: Vec<String>,
+    /// The target executable, followed by its own arguments.
+    #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
+    command: Vec<String>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -65,11 +63,9 @@ struct AuditArgs {
     /// Write the recorded access trace to this file as JSON.
     #[arg(long)]
     save_trace: Option<PathBuf>,
-    /// The target executable.
-    target: PathBuf,
-    /// Arguments passed to the target.
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    args: Vec<String>,
+    /// The target executable, followed by its own arguments.
+    #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
+    command: Vec<String>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -139,10 +135,12 @@ fn dispatch(command: Command) -> anyhow::Result<i32> {
 }
 
 fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
-    let resolved = resolve(&args.profile, &args.target, args.config.as_deref())?;
+    let (program, program_args) = split_command(args.command);
+    let resolved = resolve(&args.profile, &program, args.config.as_deref())?;
+    warn_if_target_denied(&resolved.policy, &program);
     let target = Target {
-        program: args.target,
-        args: args.args,
+        program,
+        args: program_args,
         cwd: None,
     };
 
@@ -158,11 +156,12 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
 }
 
 fn cmd_audit(args: AuditArgs) -> anyhow::Result<i32> {
-    let resolved = resolve(&args.profile, &args.target, args.config.as_deref())?;
-    let target_dir = target_dir(&args.target);
+    let (program, program_args) = split_command(args.command);
+    let resolved = resolve(&args.profile, &program, args.config.as_deref())?;
+    let target_dir = target_dir(&program);
     let target = Target {
-        program: args.target,
-        args: args.args,
+        program,
+        args: program_args,
         cwd: None,
     };
 
@@ -233,8 +232,54 @@ fn cmd_profile_generate(args: GenerateArgs) -> anyhow::Result<i32> {
 }
 
 fn resolve(profile: &str, target: &Path, explicit: Option<&Path>) -> anyhow::Result<Resolved> {
-    let bases = profiles::base_layers(profile).map_err(|err| anyhow::anyhow!(err))?;
+    let implicit = implicit_target_layer(target);
+    let mut bases: Vec<(&str, &str)> = vec![("implicit:target", &implicit)];
+    bases.extend(profiles::base_layers(profile).map_err(|err| anyhow::anyhow!(err))?);
     Ok(config::resolve_with_bases(&bases, target, explicit)?)
+}
+
+/// Split a command line into the target and the arguments passed to it.
+///
+/// Everything after the target is opaque to bailey, so a target's own flags are
+/// never mistaken for bailey's.
+fn split_command(mut command: Vec<String>) -> (PathBuf, Vec<String>) {
+    let program = PathBuf::from(command.remove(0));
+    (program, command)
+}
+
+/// The lowest-precedence layer, granting the target executable itself.
+///
+/// Executing the target is filesystem access like any other, so without this a
+/// program outside the system paths cannot start under its own policy. It sits
+/// beneath the bundled profile so any user layer can retract it.
+fn implicit_target_layer(target: &Path) -> String {
+    let program = toml_string(&absolute(target));
+    format!("[filesystem]\nread = [{program}]\nexecute = [{program}]\n")
+}
+
+/// Render a path as a TOML basic string.
+fn toml_string(path: &Path) -> String {
+    let escaped = path
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    format!("\"{escaped}\"")
+}
+
+fn absolute(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Warn when the resolved policy denies the target itself, which would
+/// otherwise surface only as an opaque permission error at exec time.
+fn warn_if_target_denied(policy: &crate::policy::Policy, target: &Path) {
+    let program = absolute(target);
+    if policy.denied.iter().any(|path| program.starts_with(path)) {
+        eprintln!(
+            "bailey: warning: the policy denies the target `{}`; it will not start",
+            program.display()
+        );
+    }
 }
 
 fn target_dir(target: &Path) -> PathBuf {
@@ -253,7 +298,7 @@ fn print_sources(profile: &str, target: &Path, explicit: Option<&Path>) {
     } else {
         println!("config layers (low to high precedence):");
         for source in sources {
-            println!("  {}", source.display());
+            println!("  {} ({})", source.path.display(), source.origin.label());
         }
     }
     println!();
@@ -268,6 +313,13 @@ fn print_policy(resolved: &Resolved) {
     }
     for rule in &policy.filesystem {
         println!("  {} {}", access_flags(rule.access), rule.path.display());
+    }
+
+    if !policy.denied.is_empty() {
+        println!("denied:");
+        for path in &policy.denied {
+            println!("  --- {}", path.display());
+        }
     }
 
     println!("network:");
