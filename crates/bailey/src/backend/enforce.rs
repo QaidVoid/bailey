@@ -172,10 +172,19 @@ impl EnforceBackend {
         let world = World::derive(&target.program, policy, isolated);
         world.prepare().map_err(BackendError::Io)?;
         if isolated && !world.kept_invocation_dir {
+            // Naming the host path matters: inside the sandbox the private home
+            // sits at the real home's path, so printing that would read as
+            // "it started in your home directory", which is the opposite of
+            // what happened.
+            let landed = world
+                .home_host
+                .as_deref()
+                .unwrap_or(world.cwd.as_path())
+                .display();
             eprintln!(
                 "bailey: warning: the working directory is not granted, so it is \
-                 absent under isolation; starting in {} instead",
-                world.cwd.display()
+                 absent under isolation; starting in the private home instead \
+                 ({landed}). Grant the directory to keep it."
             );
         }
 
