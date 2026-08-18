@@ -71,24 +71,23 @@ its own, writes the limits, and places the target in it:
 | `pids_max` | `pids.max` |
 | `cpu_percent` | `cpu.max`, as a quota against a 100 ms period |
 
-This is best-effort. On a system without a writable delegated cgroup, limits are
-skipped with a warning rather than failing the run. The cgroup is removed when the
-run ends.
+The cgroup is created before the target is spawned, and the target joins it
+itself just before exec, so membership is inherited by every process it goes on
+to create, with and without `--isolate`. The cgroup is removed when the run ends.
 
-::: warning
-The target is placed in the cgroup after it is spawned, so processes it creates
-before that point are not moved into it, and under `--isolate` the limits do not
-reach the target at all. See [known limitations](/security/limitations).
-:::
+This is best-effort. On a system without a writable delegated cgroup, limits are
+skipped with a warning rather than failing the run.
 
 ## Order of application
 
 Inside the forked child, before exec:
 
 1. `PR_SET_NO_NEW_PRIVS`.
-2. Namespaces and the reconstructed root, if `--isolate` is on.
-3. Landlock ruleset, applied against the world the program will see.
-4. seccomp filter, last, so it does not block the setup it would otherwise
+2. Joining the run's cgroup, while the host's cgroup filesystem is still
+   reachable.
+3. Namespaces and the reconstructed root, if `--isolate` is on.
+4. Landlock ruleset, applied against the world the program will see.
+5. seccomp filter, last, so it does not block the setup it would otherwise
    prevent.
 
 Then exec. Every layer is in place before the program's first instruction.

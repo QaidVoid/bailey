@@ -9,17 +9,9 @@ are the shapes it takes.
 bailey: io error: Permission denied (os error 13)
 ```
 
-Bailey could not exec the target. The policy does not grant execute on the binary.
-Add it:
-
-```toml
-[filesystem]
-read = ["."]
-execute = ["./program"]
-```
-
-The `untrusted` floor grants the system paths, so a binary under `/usr/bin` runs
-without this. Anything in your home directory does not.
+Bailey could not exec the target. The target is granted implicitly, so this means
+a config layer retracted that grant. `bailey show <target>` prints the denials;
+bailey also warns up front when the policy denies the target itself.
 
 ## The program starts and immediately fails
 
@@ -30,10 +22,9 @@ is:
 bailey show ./program
 ```
 
-Check that the layer you expected is listed. The most common surprise is that the
-per-directory walk starts at the **target's** directory, not your shell's, so a
-`bailey.toml` in your project is not picked up when the target is an interpreter
-under `/usr/bin`. Pass it explicitly with `--config`.
+Check that the layer you expected is listed. Each is labelled with the walk that
+found it, `target` or `working dir`, which is usually enough to explain a config
+that did not apply.
 
 Then find out what it wanted:
 
@@ -111,18 +102,17 @@ BAILEY_BPF_HELPER=$PWD/target/release/bailey-bpf-helper bailey audit ./program
 
 ## A network rule seems to do nothing
 
-Two known causes:
+The traffic is probably not TCP. Only TCP connect and bind are restricted; UDP,
+QUIC, and DNS are not. See [known limitations](/security/limitations).
 
-- The rule has no `port`. Portless `egress_allow` entries are dropped, which turns
-  the policy into a full deny. Always give a port.
-- The traffic is not TCP. Only TCP connect and bind are restricted; UDP, QUIC, and
-  DNS are not. See [known limitations](/security/limitations).
+A rule with no `port` no longer fails quietly: it is a resolution error naming
+the layer.
 
 ## A `deny` seems to do nothing
 
-`deny` retracts a grant of exactly the same path. It does not restrict a path
-nested inside a granted directory. Instead of granting a parent and denying a
-child, grant the specific children you want:
+A denial nested inside a granted directory is not enforced. Bailey warns when
+this applies and marks it `NOT ENFORCED` in `bailey show`. Instead of granting a
+parent and denying a child, grant the specific children you want:
 
 ```toml
 [filesystem]

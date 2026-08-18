@@ -7,11 +7,13 @@ ignored rule.
 
 Lowest precedence first:
 
-1. Bundled profile: the `untrusted` floor, plus the profile named by `--profile`.
-2. `$XDG_CONFIG_HOME/bailey/config.toml`, or `~/.config/bailey/config.toml`.
-3. Every `bailey.toml` found walking up from the target's directory, outermost
-   first.
-4. The file given to `--config`.
+1. The implicit grant of the target executable, read and execute.
+2. Bundled profile: the `untrusted` floor, plus the profile named by `--profile`.
+3. `$XDG_CONFIG_HOME/bailey/config.toml`, or `~/.config/bailey/config.toml`.
+4. Every `bailey.toml` found walking up from the target's directory and from the
+   working directory, ordered by path depth, shallowest first. A file found by
+   both walks contributes once; at equal depth the working directory wins.
+5. The file given to `--config`.
 
 ## `[filesystem]`
 
@@ -20,7 +22,7 @@ Lowest precedence first:
 | `read` | list of paths | Grant read on each path hierarchy |
 | `write` | list of paths | Grant write on each path hierarchy |
 | `execute` | list of paths | Grant execute on each path hierarchy |
-| `deny` | list of paths | Remove a grant of exactly this path from lower layers |
+| `deny` | list of paths | Retract a grant of the same path and record the path as denied |
 | `reset` | bool | Clear all filesystem grants from lower layers before applying this one |
 
 Rights for the same path combine across layers. A grant on a directory covers
@@ -36,9 +38,11 @@ deny = ["~/.config/app/token"]
 
 Granting and denying the same path within one layer is an error.
 
-::: danger `deny` is a retraction, not a rule
-It removes a grant of the same path. It does not restrict a path nested inside a
-directory another layer granted.
+::: danger A nested `deny` is not enforced yet
+A denial of a path inside a granted directory is recorded and reported, and is
+then ignored by enforcement. Bailey warns on each run it applies to and marks it
+`NOT ENFORCED` in `bailey show`. Grant the specific subdirectories you want
+instead.
 :::
 
 ## `[network]`
@@ -60,8 +64,8 @@ accumulate across layers; `egress` is replaced by the nearest layer that sets it
 
 - `host` is advisory. Landlock matches on TCP port only, and bailey warns when
   `host` is anything other than `*`.
-- An entry without a `port` is dropped, which turns the rule into a full deny.
-  Always give a port.
+- An entry without a `port` is a resolution error, because the resulting policy
+  would mean the opposite of what it says.
 - Only TCP is restricted. See [known limitations](/security/limitations).
 
 ## `[[device]]`

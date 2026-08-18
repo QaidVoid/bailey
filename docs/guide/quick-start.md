@@ -40,41 +40,28 @@ resources: ResourceLimits { memory_bytes: None, pids_max: None, cpu_percent: Non
 That is the `untrusted` floor profile: enough for a dynamically linked binary to
 start, and nothing else. No home directory, no network, no GPU.
 
-## 2. Grant the program itself
-
-The floor does not grant your program, because your program is not part of the
-system. Put a `bailey.toml` next to it:
-
-```toml
-[filesystem]
-read = ["."]
-execute = ["./program"]
-```
-
-Paths are relative to the config file's own directory, so this grants the
-directory the program lives in and execute on the program.
+## 2. Run it
 
 ```sh
 bailey run ./program
 ```
 
-::: warning
-Without this grant the run fails with `Permission denied` before the program
-starts, because executing the binary is itself filesystem access that the policy
-must allow. Granting the target implicitly is
-[proposed](/roadmap) but not implemented.
-:::
+The program itself is granted implicitly, as the lowest layer, so a binary
+outside the system paths starts without any config. Everything else it wants is
+denied, which is usually the next thing you find out.
 
 ## 3. Add what it actually needs
 
-Programs need more than their own directory. Add grants one at a time and rerun:
+Put a `bailey.toml` next to the program and add grants one at a time:
 
 ```toml
 [filesystem]
 read = ["."]
 write = ["./data"]
-execute = ["./program"]
 ```
+
+Paths are relative to the config file's own directory, so `.` here means the
+directory the program lives in.
 
 When you cannot guess, stop guessing and record a session:
 

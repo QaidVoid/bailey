@@ -178,8 +178,9 @@ Being clear about the edges matters more than sounding complete.
   needs a network namespace, which is planned.
 - **The target inherits your environment.** Variables such as `SSH_AUTH_SOCK` and
   API tokens are passed through. An environment policy is planned.
-- **`deny` only retracts a grant of the same path.** Denying a subdirectory of a
-  granted directory does not currently restrict it.
+- **A nested `deny` is not enforced.** Denying a subdirectory of a granted
+  directory does not restrict it, because Landlock rules can only add access, not
+  subtract it. Bailey warns whenever this applies rather than failing quietly.
 - **`bailey audit` runs the target unconfined.** Use it on software you already
   have reason to trust.
 - **`on_violation` hooks never fire,** because Landlock denies silently and

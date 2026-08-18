@@ -54,9 +54,11 @@ it from a shell that does not have them:
 env -i HOME="$HOME" PATH=/usr/bin:/bin TERM="$TERM" bailey run --isolate /usr/bin/agent-cli
 ```
 
-**`deny` does not protect files inside a granted directory.** The `deny = ["./.env"]`
-above does not work, because `.` is granted. Keep secrets out of the project
-directory, or grant subdirectories individually instead of granting `.`.
+**`deny` does not protect files inside a granted directory.** The
+`deny = ["./.env"]` above does not restrict anything, because `.` is granted.
+Bailey warns about this on every run, but the file is still readable. Keep
+secrets out of the project directory, or grant subdirectories individually
+instead of granting `.`.
 
 **`egress = "deny"` blocks TCP only.** An agent can still send UDP and DNS traffic,
 which is enough to exfiltrate anything it can read. If that matters, run it with

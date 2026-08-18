@@ -26,13 +26,13 @@ exit status.
 | `-p, --profile <NAME>` | Bundled profile used as the base. Default `untrusted` |
 | `--isolate` | Rebuild the target's world with user, mount, and PID namespaces |
 
-`ARGS` are passed to the target.
+`ARGS` are passed to the target untouched. Bailey stops interpreting options at
+the target, so `bailey run ./tool -c ./tool.conf` gives `-c ./tool.conf` to
+`./tool`. Bailey's own options go before the target.
 
-::: warning Flag collision
-Bailey's own options are parsed even after the target, so a target argument such
-as `-c` is consumed by bailey rather than passed through. Avoid target flags that
-collide with `-c`, `-p`, or `-h` until this is fixed.
-:::
+The target executable is granted read and execute implicitly, as the lowest
+config layer, so a binary outside the system paths runs without config. Any user
+layer can retract that grant.
 
 ## `bailey audit`
 

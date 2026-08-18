@@ -6,21 +6,23 @@ limitations](/security/limitations).
 
 ## Policy fidelity
 
-Making the policy mean what it says.
+Making the policy mean what it says. Most of this has shipped:
 
-- **Denials become real rules.** A `deny` on a path inside a granted directory
-  becomes a reduced-rights Landlock rule on that subpath, and the path is dropped
-  from the isolation bind set. Today it does nothing.
-- **Unenforceable rules fail loudly.** An `egress_allow` entry without a port is
-  an error at resolution time rather than a silent conversion to deny-all.
-- **The target executable is granted implicitly.** `bailey run ./program` works on
-  a fresh install instead of failing with `Permission denied`.
-- **Cgroup membership before exec.** The target joins its cgroup from the pre-exec
-  child, so limits cover every descendant and work under `--isolate`.
-- **Config discovery covers the working directory.** So a project's `bailey.toml`
-  applies when the target is an interpreter.
-- **Target arguments pass through.** Bailey stops parsing its own flags after the
+- **Unenforceable rules fail loudly.** ✅ An `egress_allow` entry without a port
+  is an error at resolution time rather than a silent conversion to deny-all.
+- **The target executable is granted implicitly.** ✅ `bailey run ./program` works
+  with no config instead of failing with `Permission denied`.
+- **Cgroup membership before exec.** ✅ The target joins its cgroup from the
+  pre-exec child, so limits cover every descendant and work under `--isolate`.
+- **Config discovery covers the working directory.** ✅ A project's `bailey.toml`
+  applies when the target is an interpreter under a system path.
+- **Target arguments pass through.** ✅ Bailey stops parsing its own flags at the
   target.
+- **Denials are carried and reported.** ✅ A denial survives resolution, appears
+  in `bailey show`, and produces a warning when it cannot be enforced.
+- **Denials become enforced.** Still open. Landlock cannot subtract rights from a
+  granted parent, so this needs either mount-based concealment under isolation or
+  splitting the parent grant. See [known limitations](/security/limitations).
 
 ## The world the target sees
 

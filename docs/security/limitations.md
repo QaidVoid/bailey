@@ -25,16 +25,12 @@ in a network namespace with no route when the policy denies egress.
 `egress_allow = [{ host = "example.com", port = 443 }]` enforces the port and
 ignores the host. Bailey warns when you set a host other than `*`.
 
-### Portless rules become deny
-
-An `egress_allow` entry without a `port` is dropped during planning. If it is the
-only entry, the policy becomes deny-all, silently. Always give a port.
-
 ## Filesystem
 
-### `deny` does not restrict a path inside a granted directory
+### A nested `deny` is not enforced
 
-`deny` retracts a grant of exactly the same path. It does not add a restriction.
+`deny` retracts a grant of the same path, and records a denial. Enforcement does
+not yet honor a denial that sits inside a directory another layer granted.
 
 ```toml
 [filesystem]
@@ -42,16 +38,18 @@ read = ["."]
 deny = ["./secret"]
 ```
 
-Under this policy, `./secret/key` is readable. Verified. Grant the specific
-subdirectories you want instead of granting the parent and carving out
-exceptions. Planned fix: a denial becomes a reduced-rights Landlock rule on the
-subpath.
+Under this policy, `./secret/key` is still readable. Verified.
 
-### The target executable is not granted
+The cause is structural rather than an oversight. Landlock resolves access by
+walking up from the accessed file, and any ancestor rule that grants the access
+allows it, so a narrower rule on a subpath cannot take rights away. A rule with
+no access rights at all is rejected by the kernel. Subtraction is only possible
+by stacking a second ruleset, or by not granting the parent in the first place.
 
-`bailey run ./program` fails with `Permission denied` before the program starts
-unless a config grants execute on it. The bundled floor grants the system paths
-only.
+Bailey warns on every run where a nested denial applies, and marks it
+`NOT ENFORCED` in `bailey show`, so the policy is never quietly weaker than it
+reads. Until enforcement lands, grant the specific subdirectories you want
+instead of granting the parent and carving out exceptions.
 
 ## Environment
 
@@ -95,12 +93,11 @@ host abstract UNIX sockets such as X11 and D-Bus.
 
 ## Resource limits
 
-### Applied after the target starts
+### Skipped without a delegated cgroup
 
-The target is moved into its cgroup after being spawned, so anything it forks
-first is not moved with it. Under `--isolate` the PID that gets moved is the
-intermediate namespace process rather than the target, so limits do not reach the
-target at all.
+Limits need a writable cgroup v2 for your session. Where there is none they are
+skipped with a warning rather than failing the run, so a policy that sets a
+memory cap may not be applying one. The warning is the only signal.
 
 ## Audit
 
@@ -142,17 +139,6 @@ trigger. The config key is accepted anyway.
 
 It removes a fixed set of dangerous syscalls rather than allowing a known-good
 set. It is a hardening layer, not the access control.
-
-### Config discovery starts at the target
-
-The upward walk for `bailey.toml` starts at the target executable's directory. For
-an interpreter under `/usr/bin`, your project's config is never found. Pass it with
-`--config`.
-
-### Bailey's flags shadow the target's
-
-Options are parsed even after the target, so `bailey run ./tool -c file` gives
-`-c` to bailey rather than to `./tool`.
 
 ---
 

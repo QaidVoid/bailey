@@ -138,6 +138,7 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
     let (program, program_args) = split_command(args.command);
     let resolved = resolve(&args.profile, &program, args.config.as_deref())?;
     warn_if_target_denied(&resolved.policy, &program);
+    warn_about_nested_denials(&resolved.policy);
     let target = Target {
         program,
         args: program_args,
@@ -270,6 +271,33 @@ fn absolute(path: &Path) -> PathBuf {
     std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+/// Whether a denial sits beneath a grant that still covers it.
+///
+/// Such a denial is currently not enforced: Landlock resolves access by walking
+/// up from the accessed path, so an ancestor grant satisfies the access and a
+/// narrower rule beneath it cannot take rights away.
+fn is_nested_denial(policy: &crate::policy::Policy, denied: &Path) -> bool {
+    policy
+        .filesystem
+        .iter()
+        .any(|rule| denied.starts_with(&rule.path) && denied != rule.path)
+}
+
+/// Warn about denials the enforcement backend cannot honor, so a policy is
+/// never quietly weaker than it reads.
+fn warn_about_nested_denials(policy: &crate::policy::Policy) {
+    for path in &policy.denied {
+        if is_nested_denial(policy, path) {
+            eprintln!(
+                "bailey: warning: `{}` is denied but nested under a granted path; \
+                 this denial is not enforced. Grant the specific subdirectories \
+                 you need instead of granting the parent.",
+                path.display()
+            );
+        }
+    }
+}
+
 /// Warn when the resolved policy denies the target itself, which would
 /// otherwise surface only as an opaque permission error at exec time.
 fn warn_if_target_denied(policy: &crate::policy::Policy, target: &Path) {
@@ -318,7 +346,12 @@ fn print_policy(resolved: &Resolved) {
     if !policy.denied.is_empty() {
         println!("denied:");
         for path in &policy.denied {
-            println!("  --- {}", path.display());
+            let note = if is_nested_denial(policy, path) {
+                "  (NOT ENFORCED: nested under a grant)"
+            } else {
+                ""
+            };
+            println!("  --- {}{note}", path.display());
         }
     }
 
