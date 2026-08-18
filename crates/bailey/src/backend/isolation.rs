@@ -194,17 +194,8 @@ fn setup_root(plan: &IsolationPlan) -> io::Result<()> {
         mount_tmpfs(&new_root.join("tmp"), plan.tmp_bytes, "mode=1777")?;
     }
 
-    for bind in &plan.binds {
-        bind_into(&new_root, bind)?;
-    }
-
-    // After the binds, so that a bind covering /dev does not hide it.
-    if plan.private_shm {
-        mount_tmpfs(&new_root.join("dev/shm"), plan.shm_bytes, "mode=1777")?;
-    }
-
-    // The private home is bound at the path the real home would have, so a
-    // program that hard-codes its home still writes inside the sandbox.
+    // The private home goes before the binds, so that a granted path *inside*
+    // the home lands within the private one rather than being covered by it.
     if let Some((host, inside)) = &plan.home {
         let target = new_root.join(inside.strip_prefix("/").unwrap_or(inside));
         fs::create_dir_all(&target)?;
@@ -216,6 +207,15 @@ fn setup_root(plan: &IsolationPlan) -> io::Result<()> {
             None::<&str>,
         )
         .map_err(errno)?;
+    }
+
+    for bind in &plan.binds {
+        bind_into(&new_root, bind)?;
+    }
+
+    // After the binds, so that a bind covering /dev does not hide it.
+    if plan.private_shm {
+        mount_tmpfs(&new_root.join("dev/shm"), plan.shm_bytes, "mode=1777")?;
     }
 
     conceal_all(&new_root, &plan.conceal)?;

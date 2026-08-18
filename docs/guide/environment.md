@@ -81,15 +81,18 @@ per target:
 home = "~/games/thegame/home"
 ```
 
-To opt out entirely and give a program your real home, grant it:
+To opt out entirely and give a program your real home, grant the home itself:
 
 ```toml
 [filesystem]
 read = ["~"]
 ```
 
-Any grant that touches your home directory turns the private home off, on the
-assumption that you meant what you wrote.
+Only a grant on the home directory itself, or on an ancestor of it, does that. A
+grant on something *inside* your home, such as a project directory, leaves the
+private home in place, and under `--isolate` that granted path appears within
+it. Most programs live under your home, and the target is granted implicitly, so
+the narrower rule is what keeps the private home from switching itself off.
 
 ## Private temporary storage
 

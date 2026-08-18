@@ -103,8 +103,8 @@ struct ShowArgs {
     /// Bundled profile to use as the base.
     #[arg(short, long, default_value = profiles::DEFAULT)]
     profile: String,
-    /// The target executable.
-    target: PathBuf,
+    /// The target executable, by path or by name on `PATH`.
+    target: String,
 }
 
 #[derive(Debug, clap::Args)]
@@ -258,7 +258,7 @@ fn yes_no(value: bool) -> &'static str {
 }
 
 fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
-    let (program, program_args) = split_command(args.command);
+    let (program, program_args) = split_command(args.command)?;
     let resolved = resolve(&args.profile, &program, args.config.as_deref())?;
     warn_if_target_denied(&resolved.policy, &program);
     let target = Target {
@@ -288,7 +288,7 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
 }
 
 fn cmd_audit(args: AuditArgs) -> anyhow::Result<i32> {
-    let (program, program_args) = split_command(args.command);
+    let (program, program_args) = split_command(args.command)?;
     let resolved = resolve(&args.profile, &program, args.config.as_deref())?;
     let target_dir = target_dir(&program);
     let target = Target {
@@ -325,9 +325,10 @@ fn cmd_audit(args: AuditArgs) -> anyhow::Result<i32> {
 }
 
 fn cmd_show(args: ShowArgs) -> anyhow::Result<i32> {
-    let resolved = resolve(&args.profile, &args.target, args.config.as_deref())?;
-    print_sources(&args.profile, &args.target, args.config.as_deref());
-    print_policy(&resolved, &args.target);
+    let target = resolve_target(&args.target)?;
+    let resolved = resolve(&args.profile, &target, args.config.as_deref())?;
+    print_sources(&args.profile, &target, args.config.as_deref());
+    print_policy(&resolved, &target);
     Ok(0)
 }
 
@@ -413,9 +414,38 @@ fn resolve(profile: &str, target: &Path, explicit: Option<&Path>) -> anyhow::Res
 ///
 /// Everything after the target is opaque to bailey, so a target's own flags are
 /// never mistaken for bailey's.
-fn split_command(mut command: Vec<String>) -> (PathBuf, Vec<String>) {
-    let program = PathBuf::from(command.remove(0));
-    (program, command)
+fn split_command(mut command: Vec<String>) -> anyhow::Result<(PathBuf, Vec<String>)> {
+    let program = resolve_target(&command.remove(0))?;
+    Ok((program, command))
+}
+
+/// Find the program a name refers to.
+///
+/// A name with no separator is looked up on `PATH`, the way a shell would, so
+/// `bailey run curl` means what it appears to. A name that resolves to nothing
+/// is an error: silently building a policy for a file that does not exist tells
+/// the user about a sandbox they are not going to get.
+fn resolve_target(name: &str) -> anyhow::Result<PathBuf> {
+    if name.contains('/') {
+        let path = PathBuf::from(name);
+        if !path.is_file() {
+            anyhow::bail!("`{name}` does not exist");
+        }
+        return Ok(path);
+    }
+
+    let paths = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&paths)
+        .map(|dir| dir.join(name))
+        .find(|candidate| is_executable(candidate))
+        .ok_or_else(|| anyhow::anyhow!("`{name}` was not found on PATH"))
+}
+
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
 }
 
 /// The lowest-precedence layer, granting the target executable itself.

@@ -32,6 +32,10 @@ exit status.
 the target, so `bailey run ./tool -c ./tool.conf` gives `-c ./tool.conf` to
 `./tool`. Bailey's own options go before the target.
 
+A target with no `/` in it is looked up on `PATH`, the way a shell would, so
+`bailey run curl` means what it appears to. A target that resolves to nothing is
+an error rather than a policy for a file that does not exist.
+
 The target executable is granted read and execute implicitly, as the lowest
 config layer, so a binary outside the system paths runs without config. Any user
 layer can retract that grant.

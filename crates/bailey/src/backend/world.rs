@@ -72,9 +72,14 @@ impl World {
     /// temporary storage can be private.
     pub fn derive(target: &Path, policy: &Policy, isolated: bool) -> Self {
         let real_home = real_home();
-        let touches_home = policy_touches(policy, &real_home);
+        // Only a grant on the home itself, or on an ancestor of it, counts as
+        // asking for the real home. A grant on something *inside* it does not:
+        // the target executable is granted implicitly, and most programs live
+        // under the home, so treating that as an opt-out would silently disable
+        // the private home for nearly every run.
+        let asked_for_real_home = covered_by_grant(policy, &real_home);
 
-        let home_host = if touches_home {
+        let home_host = if asked_for_real_home {
             None
         } else {
             Some(policy.home.clone().unwrap_or_else(|| default_home(target)))

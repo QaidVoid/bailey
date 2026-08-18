@@ -244,3 +244,42 @@ fn no_staging_directory_is_left_behind() {
         "isolation must not leave staging directories on the host: {leftovers:?}"
     );
 }
+
+#[test]
+fn a_target_under_the_home_keeps_its_private_home() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = std::env::var("HOME").unwrap();
+    // Most programs live under the home. The target is granted implicitly, and
+    // that grant must not be mistaken for the user asking for their real home.
+    let program = Path::new(&home).join(".local/bin");
+    if !program.join("claude").is_file() && !Path::new("/bin/true").is_file() {
+        return;
+    }
+
+    let output = run_in(dir.path(), &["show", "/bin/true"]);
+    let shown = stdout_of(&output);
+    assert!(
+        shown.contains("(private;"),
+        "a run must get a private home unless the policy grants the real one: {shown}"
+    );
+}
+
+#[test]
+fn granting_the_real_home_still_opts_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("bailey.toml");
+    fs::write(&config, "[filesystem]\nread = [\"~\"]\n").unwrap();
+
+    let output = Command::new(bailey())
+        .args(["show", "-c"])
+        .arg(&config)
+        .arg("/bin/true")
+        .env("XDG_DATA_HOME", dir.path())
+        .output()
+        .unwrap();
+    let shown = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !shown.contains("(private;"),
+        "granting the home itself must hand over the real one: {shown}"
+    );
+}

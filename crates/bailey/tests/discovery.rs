@@ -74,3 +74,37 @@ fn target_outside_system_paths_runs_without_config() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn a_bare_name_resolves_on_path() {
+    let output = Command::new(bailey())
+        .args(["show", "sh"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "a name on PATH must resolve");
+    let shown = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        shown.contains("/sh"),
+        "the resolved path must be the one on PATH: {shown}"
+    );
+}
+
+#[test]
+fn a_target_that_does_not_exist_is_an_error() {
+    for name in ["definitely-not-a-real-command", "./also-not-real"] {
+        let output = Command::new(bailey())
+            .args(["show", name])
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "a missing target must fail rather than describe a policy for nothing"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(name),
+            "the error must name the target: {stderr}"
+        );
+    }
+}
