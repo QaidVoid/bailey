@@ -109,13 +109,24 @@ have some reason to trust; it does not vet unknown code.
 
 ## Other
 
-### `on_violation` hooks do not fire on most hosts
+### `on_violation` hooks do not fire
 
-Landlock denies silently. The kernel records denials from ABI 7 (Linux 6.15), but
-reading them needs a readable kernel log or `CAP_AUDIT_READ`, which most systems
-do not give an ordinary user. Bailey now reports a configured hook that cannot
-fire, and `bailey doctor` says whether this host can produce the signal, but the
-hook still does not run where the record is unreadable.
+Landlock denies silently. Three things must hold for a hook to run, and most
+systems fail at least one:
+
+1. **Landlock ABI 7 or later** (Linux 6.15), which is when the kernel began
+   recording denials at all.
+2. **The audit subsystem enabled**, which needs `audit=1` on the kernel command
+   line. Without it Landlock emits nothing, whatever the log permissions are.
+3. **The records readable**, which needs `kernel.dmesg_restrict=0` or
+   `CAP_AUDIT_READ`.
+
+Bailey checks the first and third and reports a configured hook that cannot fire.
+The second cannot be queried without privilege, so `bailey doctor` says
+"possibly" rather than claiming a hook will work.
+
+Reading the records is not implemented. For finding out what a program wanted,
+`bailey audit` answers the same question more completely and works today.
 
 ### The seccomp filter is a denylist
 

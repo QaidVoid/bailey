@@ -67,10 +67,11 @@ bailey run --json ./program      # one line of JSON on stdout
 ## Violation hooks
 
 `hooks.on_violation` is meant to run when an access is denied. Landlock denies
-silently, and while the kernel records denials from ABI 7 (Linux 6.15) onwards,
-reading that record needs access most systems do not give an ordinary user:
-`kernel.dmesg_restrict` is commonly `1`, and the audit subsystem needs
-`CAP_AUDIT_READ`.
+silently, and three separate things have to hold before a denial is even
+observable: Landlock ABI 7 or later, the kernel's audit subsystem enabled with
+`audit=1` at boot, and the resulting records readable. A kernel booted without
+`audit=1` emits nothing at all, which is easy to mistake for a permissions
+problem.
 
 Where bailey cannot read those records, a configured hook is reported rather than
 accepted in silence:

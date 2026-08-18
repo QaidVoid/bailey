@@ -72,8 +72,13 @@ impl Capabilities {
         self.landlock_abi.is_some_and(|abi| abi >= ABI_LOGGING)
     }
 
-    /// Whether `on_violation` hooks can fire: the kernel has to record denials
-    /// and bailey has to be able to read them.
+    /// Whether the prerequisites bailey can check for `on_violation` hooks are
+    /// met: a Landlock ABI that records denials, and a readable kernel log.
+    ///
+    /// One precondition cannot be checked without privilege: the kernel's audit
+    /// subsystem has to be enabled, which needs `audit=1` on the kernel command
+    /// line. Where it is off, Landlock emits no records at all and a hook stays
+    /// silent even though both checks below pass.
     pub fn violation_hooks_possible(&self) -> bool {
         self.landlock_logs_denials() && self.denial_log_readable
     }

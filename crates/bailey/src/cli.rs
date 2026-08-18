@@ -248,18 +248,22 @@ fn cmd_doctor() -> anyhow::Result<i32> {
     }
 
     println!("reporting:");
-    println!(
-        "  violation hooks: {}",
-        yes_no(caps.violation_hooks_possible())
-    );
-    if !caps.violation_hooks_possible() {
+    if !caps.landlock_logs_denials() {
         degraded = true;
-        if !caps.landlock_logs_denials() {
-            println!("    the kernel does not record Landlock denials (needs ABI 7, Linux 6.15)");
-        } else {
-            println!("    the kernel records denials but bailey cannot read them");
-            println!("    `on_violation` hooks will not fire");
-        }
+        println!("  violation hooks: no");
+        println!("    Landlock does not record denials below ABI 7 (Linux 6.15)");
+    } else if !caps.denial_log_readable {
+        degraded = true;
+        println!("  violation hooks: no");
+        println!("    the kernel log is not readable (kernel.dmesg_restrict)");
+    } else {
+        // Never claimed outright: one precondition cannot be checked without
+        // privilege, and it is the commonest reason a hook stays silent on a
+        // host that passes the two checks above.
+        println!("  violation hooks: possibly");
+        println!("    the checks bailey can make pass, but denial records also");
+        println!("    need the audit subsystem enabled (audit=1 at boot), which");
+        println!("    cannot be checked from here");
     }
 
     if !degraded {
