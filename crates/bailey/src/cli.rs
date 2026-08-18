@@ -222,6 +222,8 @@ fn cmd_doctor() -> anyhow::Result<i32> {
     if !caps.cgroup_delegated {
         degraded = true;
         println!("    resource limits will be skipped");
+        println!("    a run needs a cgroup it may create children in, with the memory, pids");
+        println!("    and cpu controllers delegated; set BAILEY_CGROUP_ROOT to name one");
     }
 
     println!("audit:");

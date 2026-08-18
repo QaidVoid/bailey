@@ -119,6 +119,7 @@ number excluded is reported on stderr.
 | Variable | Effect |
 | --- | --- |
 | `BAILEY_BPF_HELPER` | Path to the privileged audit helper |
+| `BAILEY_CGROUP_ROOT` | Cgroup to create runs in, when the search finds the wrong one |
 | `XDG_CONFIG_HOME` | Location of the global config, `$XDG_CONFIG_HOME/bailey/config.toml` |
 | `HOME` | Used for `~` expansion in config, and for the global config fallback |
 

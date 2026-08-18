@@ -7,27 +7,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use bailey::backend::cgroup;
+
 fn bailey() -> &'static str {
     env!("CARGO_BIN_EXE_bailey")
 }
 
-fn current_cgroup() -> Option<PathBuf> {
-    let content = fs::read_to_string("/proc/self/cgroup").ok()?;
-    let relative = content.lines().find_map(|line| line.strip_prefix("0::"))?;
-    let relative = relative.trim().strip_prefix('/').unwrap_or("");
-    Some(Path::new("/sys/fs/cgroup").join(relative))
-}
-
-fn cgroup_writable() -> bool {
-    let Some(base) = current_cgroup() else {
-        return false;
-    };
-    let probe = base.join("bailey.test-probe");
-    let created = fs::create_dir(&probe).is_ok();
-    if created {
-        let _ = fs::remove_dir(&probe);
-    }
-    created
+/// Whether this host gives the user a cgroup runs can be created in, asked the
+/// same way the enforcement backend asks it.
+fn cgroup_usable() -> bool {
+    bailey::backend::cgroup::usable_root(&["memory", "pids"]).is_some()
 }
 
 fn config_with_limits(dir: &Path) -> PathBuf {
@@ -63,8 +52,8 @@ fn cgroup_of_a_forked_descendant(isolate: bool) -> String {
 
 #[test]
 fn forked_descendant_is_in_the_run_cgroup() {
-    if !cgroup_writable() {
-        eprintln!("skipping: no writable delegated cgroup");
+    if !cgroup_usable() {
+        eprintln!("skipping: no delegated cgroup to create runs in");
         return;
     }
     let reported = cgroup_of_a_forked_descendant(false);
@@ -76,8 +65,8 @@ fn forked_descendant_is_in_the_run_cgroup() {
 
 #[test]
 fn limits_apply_under_isolation() {
-    if !cgroup_writable() {
-        eprintln!("skipping: no writable delegated cgroup");
+    if !cgroup_usable() {
+        eprintln!("skipping: no delegated cgroup to create runs in");
         return;
     }
     let reported = cgroup_of_a_forked_descendant(true);
@@ -89,8 +78,8 @@ fn limits_apply_under_isolation() {
 
 #[test]
 fn cgroup_is_removed_after_the_run() {
-    if !cgroup_writable() {
-        eprintln!("skipping: no writable delegated cgroup");
+    if !cgroup_usable() {
+        eprintln!("skipping: no delegated cgroup to create runs in");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -105,7 +94,7 @@ fn cgroup_is_removed_after_the_run() {
         .unwrap();
     assert!(output.status.success());
 
-    let base = current_cgroup().unwrap();
+    let base = cgroup::usable_root(&["memory", "pids"]).unwrap();
     let leftovers: Vec<_> = fs::read_dir(&base)
         .unwrap()
         .filter_map(Result::ok)

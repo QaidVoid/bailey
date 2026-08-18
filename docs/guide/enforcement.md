@@ -75,8 +75,33 @@ The cgroup is created before the target is spawned, and the target joins it
 itself just before exec, so membership is inherited by every process it goes on
 to create, with and without `--isolate`. The cgroup is removed when the run ends.
 
-This is best-effort. On a system without a writable delegated cgroup, limits are
-skipped with a warning rather than failing the run.
+### It needs a delegated cgroup
+
+The run's cgroup is created as a *sibling* of bailey's own, not a child of it.
+The kernel refuses to enable a controller on a cgroup that contains processes,
+and bailey's own cgroup always contains bailey, so a child of it could never
+receive `memory.max` to write.
+
+Bailey therefore walks up from its own cgroup to the nearest ancestor that it may
+create directories in and whose children receive the controller files. That is
+the shape a session manager produces when it delegates a subtree: a directory you
+own, with the controllers enabled, and your processes in a leaf of it.
+
+```
+/sys/fs/cgroup/bailey/          # yours, controllers delegated, no processes
+    shell/                      # your shell, and bailey
+    bailey.12345/               # the run's limits
+```
+
+Where the search picks the wrong one, name it explicitly:
+
+```sh
+export BAILEY_CGROUP_ROOT=/sys/fs/cgroup/bailey
+```
+
+This is best-effort throughout. Without such a cgroup, limits are skipped and the
+run's summary says so rather than failing the run. `bailey doctor` answers the
+same question before you start.
 
 ## Order of application
 

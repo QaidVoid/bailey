@@ -120,26 +120,10 @@ fn landlock_abi() -> Option<u32> {
     (version > 0).then_some(version as u32)
 }
 
-/// Whether a run could create its own cgroup, which is what resource limits
-/// need. Session managers that do not delegate a cgroup leave limits
-/// unenforceable.
+/// Whether a run could be given resource limits: a cgroup this user may create
+/// runs in, whose children receive the controller files.
 fn cgroup_delegated() -> bool {
-    let Some(base) = current_cgroup() else {
-        return false;
-    };
-    let probe = base.join(format!("bailey.probe.{}", std::process::id()));
-    let created = fs::create_dir(&probe).is_ok();
-    if created {
-        let _ = fs::remove_dir(&probe);
-    }
-    created
-}
-
-fn current_cgroup() -> Option<PathBuf> {
-    let content = fs::read_to_string("/proc/self/cgroup").ok()?;
-    let relative = content.lines().find_map(|line| line.strip_prefix("0::"))?;
-    let relative = relative.trim().strip_prefix('/').unwrap_or("");
-    Some(Path::new("/sys/fs/cgroup").join(relative))
+    crate::backend::cgroup::usable_root(&["memory", "pids", "cpu"]).is_some()
 }
 
 /// Whether the kernel's log of denied accesses is readable here.

@@ -82,9 +82,11 @@ restriction.
 
 ### Skipped without a delegated cgroup
 
-Limits need a writable cgroup v2 for your session. Where there is none they are
-skipped with a warning rather than failing the run, so a policy that sets a
-memory cap may not be applying one. The warning is the only signal.
+Limits need a cgroup you may create children in, with the controllers delegated
+to it. A session manager that does not hand your user such a subtree leaves
+limits unenforceable: they are skipped and the run's summary says so, rather than
+failing the run. `bailey doctor` reports it, and `BAILEY_CGROUP_ROOT` names one
+explicitly. See [enforcement layers](/guide/enforcement).
 
 ## Audit
 

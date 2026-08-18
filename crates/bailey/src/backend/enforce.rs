@@ -24,6 +24,7 @@ use landlock::{
     Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus, Scope,
 };
 
+use crate::backend::cgroup;
 use crate::backend::isolation::{self, BindMount, Conceal, IsolationPlan};
 use crate::backend::network::{self, NetworkMode};
 use crate::backend::world::{self, World};
@@ -682,7 +683,13 @@ impl Drop for CgroupGuard {
 }
 
 fn try_create_cgroup(limits: &ResourceLimits) -> io::Result<PathBuf> {
-    let base = current_cgroup()?;
+    let needed = cgroup::needed_controllers(limits);
+    let base = cgroup::usable_root(&needed).ok_or_else(|| {
+        io::Error::other(
+            "no cgroup this user may create runs in; a delegated subtree is \
+             needed, or name one with BAILEY_CGROUP_ROOT",
+        )
+    })?;
     let dir = base.join(format!("bailey.{}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
 
@@ -698,17 +705,6 @@ fn try_create_cgroup(limits: &ResourceLimits) -> io::Result<PathBuf> {
     }
 
     Ok(dir)
-}
-
-fn current_cgroup() -> io::Result<PathBuf> {
-    let content = std::fs::read_to_string("/proc/self/cgroup")?;
-    let relative = content
-        .lines()
-        .find_map(|line| line.strip_prefix("0::"))
-        .ok_or_else(|| io::Error::other("no cgroup v2 membership in /proc/self/cgroup"))?
-        .trim();
-    let relative = relative.strip_prefix('/').unwrap_or(relative);
-    Ok(Path::new("/sys/fs/cgroup").join(relative))
 }
 
 #[cfg(test)]

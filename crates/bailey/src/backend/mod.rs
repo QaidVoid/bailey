@@ -7,6 +7,7 @@
 
 pub mod audit;
 pub mod audit_helper;
+pub mod cgroup;
 pub mod enforce;
 pub mod isolation;
 pub mod network;
