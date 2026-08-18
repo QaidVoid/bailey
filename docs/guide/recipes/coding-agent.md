@@ -18,7 +18,9 @@ execute = ["/usr/bin/git", "/usr/bin/cargo", "/usr/bin/rustc", "/usr/bin/sh"]
 deny = ["./.env", "./secrets"]
 
 [network]
-egress = "deny"
+# An agent that cannot reach its model is not an agent. This costs the network
+# namespace: see /guide/network.
+egress_allow = [{ host = "*", port = 443 }]
 
 [resources]
 memory = "4GiB"

@@ -61,9 +61,14 @@ ordinary graphical application.
 
 ## `ai-agent`
 
-For a tool that should see one project and nothing else: a coding agent, a build
-script, anything that runs commands chosen at run time. No home directory, no
-network, no devices.
+For a coding agent: one project, and the API it talks to. Outbound HTTPS, no home
+directory, no devices.
+
+Allowing egress at all gives up the network namespace, so the agent shares your
+network namespace where UDP, DNS and your host's loopback are reachable and only
+TCP ports are enforced. That is the price of a program that must call an API. For
+an agent that must *not* reach the network, use `untrusted`, which denies it
+outright.
 
 It cannot know where your project is, so grant that yourself:
 
@@ -76,11 +81,15 @@ deny = ["./secrets"]
 ```
 
 ```sh
-bailey run --isolate --profile ai-agent /usr/bin/agent-cli
+bailey run --isolate --profile ai-agent agent-cli
 ```
 
 Use `--isolate`: it is what makes the `deny` enforceable and what puts the agent
 in a world where your other projects do not exist.
+
+Remember that nothing intercepts your shell. Running `agent-cli` on its own runs
+it unsandboxed; the policy applies only when you launch it through bailey. The
+`bailey: enforced:` line after a run is the confirmation.
 
 ## `network-client`
 
@@ -166,7 +175,7 @@ below inherits them.
 | A binary you downloaded and want to poke at | `untrusted` |
 | A native Linux game | `native-game` plus a per-game config |
 | A graphical application | `desktop-app` |
-| An agent or tool that should see one project | `ai-agent` plus a grant on that directory |
+| A coding agent | `ai-agent` plus a grant on the project directory |
 | Something that only fetches over HTTPS | `network-client` |
 
 Then run [`bailey audit`](/guide/audit) to find what is missing rather than

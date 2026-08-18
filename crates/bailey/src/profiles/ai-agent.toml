@@ -1,16 +1,27 @@
-# Additive profile for a tool that should see one project and nothing else.
+# Additive profile for a coding agent: one project, and the API it talks to.
 #
-# A coding agent, a build script, or anything else that runs commands chosen at
-# run time. It gets the working directory and the system paths the untrusted
-# base already grants, and nothing more: no home directory, no network, no
-# devices.
+# An agent runs commands chosen at run time against code you care about, which
+# is the case this tool exists for. It gets outbound HTTPS so it can reach its
+# model, and the system paths the untrusted floor already grants. It does not
+# get your home directory or any device.
 #
-# Grant the working directory in a `bailey.toml` next to the project, since the
-# profile cannot know where it is. Pair this with `--isolate` so a `deny` inside
-# the project is actually enforced.
-
-[filesystem]
-read = ["/usr/share/ca-certificates"]
+# Grant the project in a `bailey.toml` next to it, since a profile cannot know
+# where you are:
+#
+#     [filesystem]
+#     read = ["."]
+#     write = ["."]
+#
+# Pair it with `--isolate`, which is what makes a `deny` inside the project
+# enforceable and puts your other projects out of the agent's reach.
+#
+# The cost of allowing egress at all: a partial allowance gives up the network
+# namespace, so the agent shares the host's, where UDP, DNS and the host's
+# loopback are reachable and only TCP ports are enforced. There is no way around
+# that today for a program that must call an API. For an agent that must not
+# reach the network, use the `untrusted` floor, which denies it outright.
+#
+# Certificates come from the floor's read access to /usr and /etc.
 
 [network]
-egress = "deny"
+egress_allow = [{ host = "*", port = 443 }]

@@ -18,7 +18,7 @@ pub const NATIVE_GAME: &str = include_str!("profiles/native-game.toml");
 /// Additive profile for a desktop application (display, audio, fonts).
 pub const DESKTOP_APP: &str = include_str!("profiles/desktop-app.toml");
 
-/// Additive profile for a tool confined to one project directory.
+/// Additive profile for a coding agent: its project and outbound HTTPS.
 pub const AI_AGENT: &str = include_str!("profiles/ai-agent.toml");
 
 /// Additive profile for a tool that only fetches over the network.
@@ -56,7 +56,7 @@ pub const ALL: &[Profile] = &[
     },
     Profile {
         name: "ai-agent",
-        description: "A tool confined to its working directory: no home, no network, no devices",
+        description: "A coding agent: its project and outbound HTTPS, no home, no devices",
         toml: AI_AGENT,
     },
     Profile {
@@ -280,6 +280,37 @@ mod tests {
             crate::config::resolve_with_bases(&borrowed, std::path::Path::new("/bin/true"), None)
                 .unwrap_or_else(|err| panic!("profile `{}` does not resolve: {err}", profile.name));
         }
+    }
+
+    /// The profile is named for a job that requires reaching an API. One that
+    /// denied the network would be a trap: every agent would fail to connect,
+    /// from the profile meant for agents.
+    #[test]
+    fn the_agent_profile_can_reach_its_api() {
+        let layers = base_layers("ai-agent").unwrap();
+        let borrowed: Vec<(&str, &str)> = layers
+            .iter()
+            .map(|layer| (layer.label.as_str(), layer.toml.as_str()))
+            .collect();
+        let resolved =
+            crate::config::resolve_with_bases(&borrowed, std::path::Path::new("/bin/true"), None)
+                .unwrap();
+
+        assert!(
+            matches!(&resolved.policy.network.egress, crate::policy::Egress::Allow(rules)
+                if rules.iter().any(|rule| rule.port == Some(443))),
+            "the agent profile must allow the API it needs"
+        );
+
+        let home = std::env::var("HOME").unwrap();
+        assert!(
+            !resolved
+                .policy
+                .filesystem
+                .iter()
+                .any(|rule| rule.path.starts_with(&home)),
+            "and still not reach the home directory"
+        );
     }
 
     #[test]
