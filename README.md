@@ -185,9 +185,9 @@ Being clear about the edges matters more than sounding complete.
   directory is enforced by covering it with an empty read-only filesystem, which
   only the isolation layer can do, since Landlock rules add access and never
   subtract it. Without `--isolate` the run reports the denial as unenforced.
-- **Audit can miss a very short-lived child.** Observation is scoped to the
-  target's process tree by polling `/proc`; a process born and reaped within 200
-  microseconds is missed.
+- **Audit falls back to process-tree scoping without a cgroup.** Where a run can
+  be given a cgroup, scoping is exact; otherwise a very short-lived child can be
+  missed, and the run says so.
 - **`on_violation` hooks never fire,** because Landlock denies silently and
   bailey has no denial signal yet.
 - **Under `--isolate` the working directory is not carried in,** so relative

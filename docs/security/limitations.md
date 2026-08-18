@@ -90,15 +90,16 @@ explicitly. See [enforcement layers](/guide/enforcement).
 
 ## Audit
 
-### A short-lived child can be missed
+### A short-lived child can be missed without a cgroup
 
-Observation is scoped to the target's process tree, and membership is refreshed
-by reading `/proc` every 200 microseconds. A process that is born and reaped
-inside that window is never added, so its access does not appear. In practice a
-child's file reads are captured and its `exec` often is not.
+Where the run gets a cgroup, scoping is exact: membership is inherited at fork,
+so nothing can be missed. Where no cgroup can be created, observation falls back
+to following the process tree through `/proc`, and a process born and reaped
+between two passes is never added. In practice such a child's file reads are
+captured and its `exec` is not.
 
-Exact scoping needs either a delegated cgroup, whose membership children inherit,
-or a PID namespace. Neither is wired up yet.
+The run warns when it is on the fallback, and `bailey doctor` reports whether
+this host can provide a cgroup.
 
 ### A trace shows one run
 

@@ -294,6 +294,7 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
         } else {
             Summary::Text
         },
+        always_cgroup: false,
     };
     let code = backend.run(&resolved.policy, &target)?;
     if let Err(err) = resolved.hooks.run_post_exit(code) {

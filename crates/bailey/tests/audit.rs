@@ -196,3 +196,48 @@ fn execution_of_a_child_program_is_recorded() {
         "an executed program must appear as an execute event: {executed:?}"
     );
 }
+
+#[test]
+fn a_short_lived_child_is_recorded_when_scoping_by_cgroup() {
+    let Some(helper) = helper() else {
+        eprintln!("skipping: no audit helper configured");
+        return;
+    };
+    // Scoping by cgroup needs only a cgroup to create, not the controllers that
+    // resource limits need. Without one, observation follows the process tree
+    // and this case is a race rather than a guarantee.
+    if bailey::backend::cgroup::usable_root(&[]).is_none() {
+        eprintln!("skipping: no cgroup to scope observation to");
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    // `cat` lives a couple of milliseconds. Under process-tree scoping its exec
+    // falls inside the polling window and is missed; under cgroup scoping it is
+    // in scope from its first instruction.
+    let trace = trace_of(
+        &helper,
+        dir.path(),
+        &["/bin/sh", "-c", "cat /etc/hostname > /dev/null"],
+    );
+
+    let events = trace["events"].as_array().unwrap();
+    let read_hostname = events.iter().any(|event| {
+        event["kind"] == "read"
+            && event["resource"]["path"]
+                .as_str()
+                .is_some_and(|path| path.contains("hostname"))
+    });
+    let exec_cat = events.iter().any(|event| {
+        event["kind"] == "execute"
+            && event["resource"]["path"]
+                .as_str()
+                .is_some_and(|path| path.contains("cat"))
+    });
+
+    assert!(read_hostname, "the child's read must be recorded");
+    assert!(
+        exec_cat,
+        "the child's exec must be recorded, which process-tree scoping misses"
+    );
+}

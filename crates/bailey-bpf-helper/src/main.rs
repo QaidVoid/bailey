@@ -12,8 +12,9 @@
 //! Protocol, all on the helper's stdin/stdout:
 //!
 //! 1. The helper loads and attaches, then writes `HELLO` and `PROTOCOL_VERSION`.
-//! 2. The parent writes the target PID as 4 little-endian bytes.
-//! 3. The helper seeds the PID and writes `ACK`. Only then may the parent let
+//! 2. The parent writes the target PID as 4 little-endian bytes, then the run's
+//!    cgroup id as 8 more. A cgroup id of `NO_CGROUP` means the run has none.
+//! 3. The helper seeds the scope and writes `ACK`. Only then may the parent let
 //!    the target run, so nothing it does is missed.
 //! 4. The helper streams `FRAME_RECORD` frames, each followed by an
 //!    `AccessRecord`.
@@ -32,7 +33,9 @@ use std::time::Duration;
 use aya::maps::{Array, HashMap as AyaHashMap, MapData, RingBuf};
 use aya::programs::FEntry;
 use aya::{Btf, Ebpf, include_bytes_aligned};
-use bailey_common::{ACK, AccessRecord, FRAME_RECORD, FRAME_SUMMARY, HELLO, PROTOCOL_VERSION};
+use bailey_common::{
+    ACK, AccessRecord, FRAME_RECORD, FRAME_SUMMARY, HELLO, NO_CGROUP, PROTOCOL_VERSION,
+};
 
 /// How often the descendant set is refreshed.
 ///
@@ -80,6 +83,10 @@ fn run() -> anyhow::Result<()> {
         ebpf.take_map("TRACKED")
             .ok_or_else(|| anyhow::anyhow!("TRACKED map missing"))?,
     )?;
+    let mut scope: Array<MapData, u64> = Array::try_from(
+        ebpf.take_map("SCOPE")
+            .ok_or_else(|| anyhow::anyhow!("SCOPE map missing"))?,
+    )?;
     let dropped: Array<MapData, u64> = Array::try_from(
         ebpf.take_map("DROPPED")
             .ok_or_else(|| anyhow::anyhow!("DROPPED map missing"))?,
@@ -91,12 +98,17 @@ fn run() -> anyhow::Result<()> {
 
     // Blocking read: the parent is holding the target before exec until the
     // acknowledgement below, so there is nothing to race with yet.
-    let mut pid_bytes = [0u8; 4];
-    read_exact_fd(libc::STDIN_FILENO, &mut pid_bytes)?;
-    let target = u32::from_le_bytes(pid_bytes);
+    let mut scope_bytes = [0u8; 12];
+    read_exact_fd(libc::STDIN_FILENO, &mut scope_bytes)?;
+    let target = u32::from_le_bytes(scope_bytes[..4].try_into()?);
+    let cgroup = u64::from_le_bytes(scope_bytes[4..].try_into()?);
 
-    tracked.insert(target, 1, 0)?;
+    scope.set(0, cgroup, 0)?;
+    let by_cgroup = cgroup != NO_CGROUP;
     let mut known = BTreeSet::from([target]);
+    if !by_cgroup {
+        tracked.insert(target, 1, 0)?;
+    }
 
     stdout.write_all(&[ACK])?;
     stdout.flush()?;
@@ -104,7 +116,11 @@ fn run() -> anyhow::Result<()> {
     set_nonblocking(libc::STDIN_FILENO);
 
     loop {
-        follow_descendants(&mut tracked, &mut known);
+        // Only the process-tree fallback needs maintaining; cgroup membership is
+        // the kernel's to track.
+        if !by_cgroup {
+            follow_descendants(&mut tracked, &mut known);
+        }
         drain(&mut ring, &mut stdout)?;
         if stdin_closed() {
             break;
@@ -112,7 +128,9 @@ fn run() -> anyhow::Result<()> {
         thread::sleep(POLL_INTERVAL);
     }
 
-    follow_descendants(&mut tracked, &mut known);
+    if !by_cgroup {
+        follow_descendants(&mut tracked, &mut known);
+    }
     drain(&mut ring, &mut stdout)?;
 
     let lost = dropped.get(&0, 0).unwrap_or(0);

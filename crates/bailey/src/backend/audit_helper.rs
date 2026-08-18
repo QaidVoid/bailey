@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use bailey_common::{
     ACK, AccessRecord, FAMILY_INET, FAMILY_INET6, FRAME_RECORD, FRAME_SUMMARY, HELLO, KIND_BIND,
-    KIND_CONNECT, KIND_EXECUTE, KIND_READ, KIND_WRITE, PROTOCOL_VERSION,
+    KIND_CONNECT, KIND_EXECUTE, KIND_READ, KIND_WRITE, NO_CGROUP, PROTOCOL_VERSION,
 };
 
 use crate::backend::enforce::Confined;
@@ -95,11 +95,16 @@ impl Recorder {
         })
     }
 
-    /// Tell the helper which process to observe, and wait for it to confirm.
-    pub fn observe(&mut self, pid: u32) -> Result<(), BackendError> {
-        self.stdin
-            .write_all(&pid.to_le_bytes())
-            .map_err(BackendError::Io)?;
+    /// Tell the helper what to observe, and wait for it to confirm.
+    ///
+    /// A cgroup id scopes observation exactly, since membership is inherited at
+    /// fork; without one the helper follows the process tree, which cannot see a
+    /// process that is born and reaped between two passes.
+    pub fn observe(&mut self, pid: u32, cgroup: u64) -> Result<(), BackendError> {
+        let mut scope = [0u8; 12];
+        scope[..4].copy_from_slice(&pid.to_le_bytes());
+        scope[4..].copy_from_slice(&cgroup.to_le_bytes());
+        self.stdin.write_all(&scope).map_err(BackendError::Io)?;
         self.stdin.flush().map_err(BackendError::Io)?;
 
         let mut ack = [0u8; 1];
@@ -131,8 +136,16 @@ impl Recorder {
 /// confirms it is watching.
 pub fn record(recorder: &mut Recorder, confined: Confined) -> Result<i32, BackendError> {
     let pid = confined.pid();
+    let cgroup = confined.cgroup_id().unwrap_or(NO_CGROUP);
+    if cgroup == NO_CGROUP {
+        eprintln!(
+            "bailey: warning: no cgroup for this run, so observation follows the \
+             process tree; a process that is born and reaped between passes can \
+             be missed. Run `bailey doctor` for why."
+        );
+    }
     wait_for_stop(pid)?;
-    recorder.observe(pid)?;
+    recorder.observe(pid, cgroup)?;
     resume(pid)?;
     confined.wait()
 }
@@ -333,7 +346,8 @@ pub fn run_unconfined(target: &Target) -> Result<(i32, Trace), BackendError> {
     let mut child = command.spawn().map_err(BackendError::Io)?;
     let pid = child.id();
     wait_for_stop(pid)?;
-    recorder.observe(pid)?;
+    // An unconfined run has no cgroup of its own to scope to.
+    recorder.observe(pid, NO_CGROUP)?;
     resume(pid)?;
     let status = child.wait().map_err(BackendError::Io)?;
     let trace = recorder.finish();

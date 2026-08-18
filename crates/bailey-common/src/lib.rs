@@ -15,13 +15,21 @@ use bytemuck::{Pod, Zeroable};
 /// Version of the helper protocol and record layout.
 ///
 /// Bump this whenever [`AccessRecord`] changes shape or the handshake changes.
-pub const PROTOCOL_VERSION: u8 = 1;
+pub const PROTOCOL_VERSION: u8 = 2;
+
+/// Cgroup id meaning "this run has no cgroup", so observation falls back to
+/// following the process tree.
+pub const NO_CGROUP: u64 = 0;
 
 /// First byte the helper writes once its programs are attached, followed by
 /// [`PROTOCOL_VERSION`].
 pub const HELLO: u8 = 0x01;
 /// Byte the helper writes once the observation scope is seeded, after which the
 /// target may be released.
+///
+/// The parent sends the scope as a PID (4 little-endian bytes) followed by a
+/// cgroup id (8 little-endian bytes). A cgroup id of [`NO_CGROUP`] means the
+/// helper should follow the process tree instead.
 pub const ACK: u8 = 0x02;
 /// Frame tag for an [`AccessRecord`].
 pub const FRAME_RECORD: u8 = 0x10;

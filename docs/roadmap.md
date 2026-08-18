@@ -59,7 +59,7 @@ Shipped, except the user-mode stack:
 
 ## Audit fidelity
 
-Shipped, except exact scoping:
+Shipped:
 
 - **Audit runs confined.** ✅ The resolved policy applies during an audit, widened
   only by read on the target's own directory, with `--unconfined` as an explicit
@@ -76,9 +76,10 @@ Shipped, except exact scoping:
 - **Architecture independence.** ✅ BTF-driven `fentry` attachment instead of
   hard-coded x86_64 offsets, which also removed the tracefs dependency and the
   extra capability it would have cost the privileged helper.
-- **Exact scoping.** Still open. Observation is scoped to the process tree by
-  polling `/proc`, so a child born and reaped within 200 microseconds is missed.
-  A delegated cgroup or a PID namespace would close it.
+- **Exact scoping.** ✅ Observation is scoped to the run's cgroup, whose
+  membership the kernel inherits at fork, so a short-lived child cannot be
+  missed. Where no cgroup is available it falls back to following the process
+  tree and says so.
 
 ## Operator experience
 

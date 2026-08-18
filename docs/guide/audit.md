@@ -101,6 +101,21 @@ The trace records what it lost. If the kernel could not deliver an event, or the
 event cap was reached, the count reaches the trace and `profile generate` refuses
 to turn it into a profile without `--accept-truncated`.
 
-What it can miss: a child process that is born and reaped within 200
-microseconds, before the recorder's process-tree scope catches up. See
-[known limitations](/security/limitations).
+## How observation is scoped
+
+Where a cgroup can be created for the run, observation is scoped to it. Cgroup
+membership is inherited at fork by the kernel, so every process the target
+creates is in scope from its first instruction, and nothing outside the run is
+recorded.
+
+Where no cgroup is available, the recorder follows the process tree instead,
+refreshing it from `/proc`, and the run says so:
+
+```
+bailey: warning: no cgroup for this run, so observation follows the process
+tree; a process that is born and reaped between passes can be missed.
+```
+
+That fallback is a race: a child that lives a couple of milliseconds usually has
+its file reads recorded and its `exec` missed. `bailey doctor` reports whether
+this host can give a run a cgroup.

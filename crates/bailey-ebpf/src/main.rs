@@ -19,7 +19,7 @@
 use aya_ebpf::{
     helpers::{
         bpf_get_current_pid_tgid, bpf_ktime_get_ns, bpf_probe_read_kernel,
-        bpf_probe_read_kernel_str_bytes,
+        bpf_probe_read_kernel_str_bytes, generated,
     },
     macros::{fentry, map},
     maps::{Array, HashMap, RingBuf},
@@ -27,10 +27,19 @@ use aya_ebpf::{
 };
 use bailey_common::{
     AccessRecord, FAMILY_INET, FAMILY_INET6, KIND_CONNECT, KIND_EXECUTE, KIND_READ, KIND_WRITE,
+    NO_CGROUP,
 };
 
+/// The audited run's cgroup id, or [`NO_CGROUP`] when the run has none.
+///
+/// Preferred over the PID set, because cgroup membership is inherited at fork by
+/// the kernel: a process is in scope from its first instruction, with no window
+/// in which userspace has not yet noticed it exists.
+#[map]
+static SCOPE: Array<u64> = Array::with_max_entries(1, 0);
+
 /// PIDs belonging to the audited process tree, seeded and maintained by the
-/// helper.
+/// helper. Used only where the run has no cgroup.
 #[map]
 static TRACKED: HashMap<u32, u8> = HashMap::with_max_entries(4096, 0);
 
@@ -68,7 +77,7 @@ pub fn open(ctx: FEntryContext) -> u32 {
 
 fn try_open(ctx: &FEntryContext) -> Result<(), i64> {
     let pid = current_pid();
-    if !is_tracked(pid) {
+    if !in_scope(pid) {
         return Ok(());
     }
 
@@ -113,7 +122,7 @@ pub fn exec(ctx: FEntryContext) -> u32 {
 
 fn try_exec(ctx: &FEntryContext) -> Result<(), i64> {
     let pid = current_pid();
-    if !is_tracked(pid) {
+    if !in_scope(pid) {
         return Ok(());
     }
 
@@ -148,7 +157,7 @@ pub fn connect(ctx: FEntryContext) -> u32 {
 
 fn try_connect(ctx: &FEntryContext) -> Result<(), i64> {
     let pid = current_pid();
-    if !is_tracked(pid) {
+    if !in_scope(pid) {
         return Ok(());
     }
 
@@ -221,8 +230,12 @@ fn current_pid() -> u32 {
     (bpf_get_current_pid_tgid() >> 32) as u32
 }
 
-fn is_tracked(pid: u32) -> bool {
-    unsafe { TRACKED.get(&pid).is_some() }
+/// Whether the current task belongs to the audited run.
+fn in_scope(pid: u32) -> bool {
+    match SCOPE.get(0).copied().unwrap_or(NO_CGROUP) {
+        NO_CGROUP => unsafe { TRACKED.get(&pid).is_some() },
+        cgroup => unsafe { generated::bpf_get_current_cgroup_id() == cgroup },
+    }
 }
 
 #[unsafe(link_section = "license")]

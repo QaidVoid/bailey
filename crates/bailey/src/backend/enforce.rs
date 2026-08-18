@@ -112,6 +112,9 @@ pub struct EnforceBackend {
     pub stop_before_exec: bool,
     /// How to report what the run enforced.
     pub summary: Summary,
+    /// Put the target in a cgroup of its own even when the policy sets no
+    /// limits, so something else can scope to it.
+    pub always_cgroup: bool,
 }
 
 /// How a run reports what it enforced.
@@ -209,7 +212,7 @@ impl EnforceBackend {
         // The cgroup is created before the fork so the target can join it from
         // `pre_exec`. Joining before exec is what makes the limits cover every
         // process the target goes on to create.
-        let cgroup = CgroupGuard::create(&policy.resources);
+        let cgroup = CgroupGuard::create(&policy.resources, self.always_cgroup);
         let procs = cgroup.procs_path();
         if policy.resources == ResourceLimits::default() {
             // The policy asked for none, so there is nothing to report.
@@ -301,6 +304,11 @@ impl Confined {
     /// The target's process id.
     pub fn pid(&self) -> u32 {
         self.child.id()
+    }
+
+    /// The id of the cgroup the target belongs to, when it has one of its own.
+    pub fn cgroup_id(&self) -> Option<u64> {
+        self.cgroup.id()
     }
 
     /// Wait for the target to exit and tear the run's world down.
@@ -644,8 +652,9 @@ struct CgroupGuard {
 }
 
 impl CgroupGuard {
-    fn create(limits: &ResourceLimits) -> Self {
-        if limits.memory_bytes.is_none()
+    fn create(limits: &ResourceLimits, even_without_limits: bool) -> Self {
+        if !even_without_limits
+            && limits.memory_bytes.is_none()
             && limits.pids_max.is_none()
             && limits.cpu_percent.is_none()
         {
@@ -671,6 +680,15 @@ impl CgroupGuard {
     /// The `cgroup.procs` path the target writes itself into before exec.
     fn procs_path(&self) -> Option<PathBuf> {
         self.dir.as_ref().map(|dir| dir.join("cgroup.procs"))
+    }
+
+    /// The kernel's id for this cgroup, which is what a BPF program comparing
+    /// `bpf_get_current_cgroup_id()` sees. On cgroup v2 it is the directory's
+    /// inode number.
+    fn id(&self) -> Option<u64> {
+        use std::os::unix::fs::MetadataExt;
+        let dir = self.dir.as_ref()?;
+        std::fs::metadata(dir).ok().map(|meta| meta.ino())
     }
 }
 

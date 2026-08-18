@@ -53,6 +53,9 @@ impl AuditBackend {
             // The audit output is the point of the run; a layer summary on top
             // of it would bury the findings.
             summary: enforce::Summary::Quiet,
+            // Scoping observation to a cgroup is race-free, so a run gets one
+            // whether or not the policy sets limits.
+            always_cgroup: true,
         };
         let confined = backend.spawn(&envelope, target)?;
         let code = audit_helper::record(&mut recorder, confined)?;
