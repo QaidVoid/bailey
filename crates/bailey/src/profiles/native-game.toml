@@ -1,8 +1,8 @@
 # Additive profile for native Linux games.
 #
-# Layers GPU, audio, display, and font access on top of the untrusted base.
-# It does not grant the game's own directory or save location: add those in
-# per-game config, and tighten the rest with an audit run.
+# Layers GPU, audio, display, controller, and font access on top of the
+# untrusted base. It does not grant the game's own directory or save location:
+# add those in per-game config, and tighten the rest with an audit run.
 
 [filesystem]
 read = [
@@ -12,8 +12,17 @@ read = [
     "~/.config/fontconfig",
     "~/.icons",
     "/usr/share/icons",
+    "/usr/share/vulkan",
+    "/usr/share/glvnd",
+    "/sys/dev/char",
+    "/sys/devices",
 ]
-write = ["/run/user"]
+write = [
+    # The session runtime directory holds the compositor and audio sockets.
+    # Scoped to this user: /run/user itself would cover every logged-in account.
+    "${XDG_RUNTIME_DIR}",
+    "~/.cache/mesa_shader_cache",
+]
 
 [[device]]
 path = "/dev/dri"
@@ -22,3 +31,27 @@ access = "rw"
 [[device]]
 path = "/dev/snd"
 access = "rw"
+
+# The proprietary NVIDIA driver does not use /dev/dri alone. A path that does
+# not exist is skipped, so these are harmless on other drivers.
+[[device]]
+path = "/dev/nvidiactl"
+access = "rw"
+
+[[device]]
+path = "/dev/nvidia0"
+access = "rw"
+
+[[device]]
+path = "/dev/nvidia-uvm"
+access = "rw"
+
+[[device]]
+path = "/dev/nvidia-uvm-tools"
+access = "rw"
+
+# Controllers. This covers every input device, including the keyboard, which is
+# a keylogging surface: grant the specific event node instead where you can.
+[[device]]
+path = "/dev/input"
+access = "r"

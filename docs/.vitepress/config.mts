@@ -46,6 +46,7 @@ export default defineConfig({
             { text: 'Profiles', link: '/guide/profiles' },
             { text: 'Auditing a program', link: '/guide/audit' },
             { text: 'Lifecycle hooks', link: '/guide/hooks' },
+            { text: 'Knowing what was enforced', link: '/guide/diagnostics' },
             { text: 'Troubleshooting', link: '/guide/troubleshooting' },
           ],
         },

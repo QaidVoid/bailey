@@ -1,0 +1,26 @@
+# Additive profile for a desktop application.
+#
+# Display, audio, fonts, and icons, with no device access beyond what the
+# compositor needs. Narrower than the game profile: no controllers, no direct
+# GPU nodes beyond rendering.
+
+[filesystem]
+write = ["${XDG_RUNTIME_DIR}"]
+read = [
+    "/usr/share/fonts",
+    "~/.fonts",
+    "~/.local/share/fonts",
+    "~/.config/fontconfig",
+    "~/.icons",
+    "/usr/share/icons",
+    "/usr/share/mime",
+    "/usr/share/applications",
+]
+
+[[device]]
+path = "/dev/dri"
+access = "rw"
+
+[[device]]
+path = "/dev/snd"
+access = "rw"

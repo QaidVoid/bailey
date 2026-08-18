@@ -585,7 +585,8 @@ fn parse_size(spec: &str) -> Result<u64, String> {
 }
 
 fn resolve_path(raw: &str, base: &Path) -> PathBuf {
-    let expanded = expand_tilde(raw);
+    let raw = expand_variables(raw);
+    let expanded = expand_tilde(&raw);
     let joined = if expanded.is_absolute() {
         expanded
     } else {
@@ -611,6 +612,32 @@ fn normalize_lexical(path: &Path) -> PathBuf {
             other => out.push(other),
         }
     }
+    out
+}
+
+/// Expand `${VAR}` references against the environment.
+///
+/// Paths such as the session runtime directory cannot be written literally in a
+/// shared profile, because they contain the user's own id. An unset variable
+/// expands to nothing, which leaves a path that matches nothing rather than one
+/// that matches something unintended.
+fn expand_variables(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let name = &after[..end];
+        if let Some(value) = std::env::var_os(name) {
+            out.push_str(&value.to_string_lossy());
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
     out
 }
 
@@ -811,6 +838,30 @@ mod tests {
                 port: Some(443),
             }])
         );
+    }
+
+    #[test]
+    fn variables_expand_in_paths() {
+        unsafe { std::env::set_var("BAILEY_TEST_DIR", "/run/user/4242") };
+        let layers = [layer(
+            "/base",
+            "[filesystem]\nread = [\"${BAILEY_TEST_DIR}/wayland-0\"]",
+        )];
+        let resolved = merge(&layers).unwrap();
+        assert_eq!(
+            resolved.policy.filesystem[0].path,
+            PathBuf::from("/run/user/4242/wayland-0")
+        );
+    }
+
+    #[test]
+    fn an_unset_variable_expands_to_nothing() {
+        let layers = [layer(
+            "/base",
+            "[filesystem]\nread = [\"${BAILEY_TEST_UNSET}/thing\"]",
+        )];
+        let resolved = merge(&layers).unwrap();
+        assert_eq!(resolved.policy.filesystem[0].path, PathBuf::from("/thing"));
     }
 
     #[test]

@@ -46,6 +46,60 @@ const DEFAULT_TMP_BYTES: u64 = 64 * 1024 * 1024;
 /// buffers, so it is more generous than `/tmp`.
 const DEFAULT_SHM_BYTES: u64 = 256 * 1024 * 1024;
 
+/// What a run actually enforced.
+///
+/// Every layer can be absent or partial on a given host, and each one degrades
+/// quietly by design so a program still runs. The summary is what keeps that
+/// from being indistinguishable from a run that enforced nothing.
+#[derive(Debug, Default, Clone)]
+pub struct RunReport {
+    /// Layers that were applied.
+    pub applied: Vec<String>,
+    /// Layers the host could not provide, with the reason.
+    ///
+    /// A layer the user chose not to use is not a gap and is not listed here:
+    /// the summary exists to surface what was taken away, not to restate the
+    /// command line.
+    pub skipped: Vec<(String, String)>,
+}
+
+impl RunReport {
+    fn applied(&mut self, layer: &str) {
+        self.applied.push(layer.to_owned());
+    }
+
+    fn skipped(&mut self, layer: &str, reason: &str) {
+        self.skipped.push((layer.to_owned(), reason.to_owned()));
+    }
+
+    /// Print the summary for a person.
+    pub fn print(&self, exit_code: i32) {
+        eprintln!("bailey: enforced: {}", self.applied.join(", "));
+        for (layer, reason) in &self.skipped {
+            eprintln!("bailey: not enforced, {layer}: {reason}");
+        }
+        if exit_code != 0 {
+            eprintln!("bailey: target exited with {exit_code}");
+        }
+    }
+
+    /// Render the summary as JSON, for a caller that is not a person.
+    pub fn to_json(&self, exit_code: i32) -> String {
+        let applied: Vec<String> = self.applied.iter().map(|l| format!("\"{l}\"")).collect();
+        let skipped: Vec<String> = self
+            .skipped
+            .iter()
+            .map(|(layer, reason)| format!("{{\"layer\":\"{layer}\",\"reason\":\"{reason}\"}}"))
+            .collect();
+        format!(
+            "{{\"applied\":[{}],\"skipped\":[{}],\"exit_code\":{}}}",
+            applied.join(","),
+            skipped.join(","),
+            exit_code
+        )
+    }
+}
+
 /// Deny-by-default enforcement backend.
 #[derive(Debug, Default)]
 pub struct EnforceBackend {
@@ -55,6 +109,20 @@ pub struct EnforceBackend {
     /// something to it before it runs. The caller is then responsible for
     /// continuing it.
     pub stop_before_exec: bool,
+    /// How to report what the run enforced.
+    pub summary: Summary,
+}
+
+/// How a run reports what it enforced.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum Summary {
+    /// A short block on stderr after the target exits.
+    #[default]
+    Text,
+    /// One line of JSON, for a caller that parses it.
+    Json,
+    /// Nothing.
+    Quiet,
 }
 
 impl Backend for EnforceBackend {
@@ -82,6 +150,20 @@ impl EnforceBackend {
         let mode = network::select(policy, userns);
         network::report(mode, policy);
 
+        let mut report = RunReport::default();
+        report.applied("landlock");
+        report.applied("seccomp");
+        match mode {
+            NetworkMode::Isolated => report.applied("network namespace"),
+            // A policy that allows egress cannot use an empty namespace, which
+            // is a consequence of the policy rather than a gap in the host.
+            NetworkMode::LandlockOnly if !userns => report.skipped(
+                "network namespace",
+                "unprivileged user namespaces unavailable, so only TCP is restricted",
+            ),
+            NetworkMode::LandlockOnly => {}
+        }
+
         let isolated = self.isolate && userns;
         let world = World::derive(&target.program, policy, isolated);
         world.prepare().map_err(BackendError::Io)?;
@@ -98,8 +180,13 @@ impl EnforceBackend {
 
         let isolation = if self.isolate {
             if userns {
+                report.applied("namespace isolation");
                 Some(build_isolation_plan(policy, mode, &world))
             } else {
+                report.skipped(
+                    "namespace isolation",
+                    "unprivileged user namespaces unavailable",
+                );
                 eprintln!(
                     "bailey: warning: unprivileged user namespaces unavailable; \
                      running without namespace isolation"
@@ -123,6 +210,19 @@ impl EnforceBackend {
         // process the target goes on to create.
         let cgroup = CgroupGuard::create(&policy.resources);
         let procs = cgroup.procs_path();
+        if policy.resources == ResourceLimits::default() {
+            // The policy asked for none, so there is nothing to report.
+        } else if procs.is_some() {
+            report.applied("resource limits");
+        } else {
+            report.skipped(
+                "resource limits",
+                cgroup
+                    .failure
+                    .as_deref()
+                    .unwrap_or("no writable delegated cgroup"),
+            );
+        }
 
         let mut command = Command::new(&target.program);
         command.args(&target.args);
@@ -181,6 +281,8 @@ impl EnforceBackend {
             child,
             cgroup,
             staging,
+            report,
+            summary: self.summary,
         })
     }
 }
@@ -190,6 +292,8 @@ pub struct Confined {
     child: std::process::Child,
     cgroup: CgroupGuard,
     staging: Option<PathBuf>,
+    report: RunReport,
+    summary: Summary,
 }
 
 impl Confined {
@@ -207,7 +311,13 @@ impl Confined {
         if let Some(staging) = self.staging {
             let _ = std::fs::remove_dir(&staging);
         }
-        Ok(status.code().unwrap_or(-1))
+        let code = status.code().unwrap_or(-1);
+        match self.summary {
+            Summary::Text => self.report.print(code),
+            Summary::Json => println!("{}", self.report.to_json(code)),
+            Summary::Quiet => {}
+        }
+        Ok(code)
     }
 }
 
@@ -529,6 +639,7 @@ fn target_arch() -> anyhow::Result<seccompiler::TargetArch> {
 /// itself from `pre_exec`, so membership is inherited by everything it forks.
 struct CgroupGuard {
     dir: Option<PathBuf>,
+    failure: Option<String>,
 }
 
 impl CgroupGuard {
@@ -537,14 +648,22 @@ impl CgroupGuard {
             && limits.pids_max.is_none()
             && limits.cpu_percent.is_none()
         {
-            return Self { dir: None };
+            return Self {
+                dir: None,
+                failure: None,
+            };
         }
         match try_create_cgroup(limits) {
-            Ok(dir) => Self { dir: Some(dir) },
-            Err(err) => {
-                eprintln!("bailey: warning: resource limits not applied: {err}");
-                Self { dir: None }
-            }
+            Ok(dir) => Self {
+                dir: Some(dir),
+                failure: None,
+            },
+            // Not reported here: the run summary carries it, so a single fact
+            // does not appear twice.
+            Err(err) => Self {
+                dir: None,
+                failure: Some(err.to_string()),
+            },
         }
     }
 

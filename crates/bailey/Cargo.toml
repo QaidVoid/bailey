@@ -12,6 +12,8 @@ toml = "0.8"
 thiserror = "2"
 bitflags = "2"
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+clap_mangen = "0.2"
 anyhow = "1"
 landlock = "0.4"
 seccompiler = "0.4"

@@ -154,6 +154,10 @@ Commands run through `sh -c` and accumulate across layers, running in layer orde
 
 - Relative paths resolve against the directory of the config file containing them.
 - `~` and `~/...` expand using `$HOME`.
+- `${VAR}` expands from the environment, which is how a shared profile can name
+  something like `${XDG_RUNTIME_DIR}`. An unset variable expands to nothing,
+  leaving a path that matches nothing rather than one that matches something
+  unintended.
 - `.` and `..` are collapsed lexically, so different spellings of one path merge
   into a single grant.
 

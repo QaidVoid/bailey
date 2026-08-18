@@ -9,9 +9,11 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
+use crate::backend::probe;
 use crate::backend::world::{self, World};
 use crate::backend::{
-    Backend, Target, audit::AuditBackend, enforce::EnforceBackend, isolation, network,
+    Backend, Target, audit::AuditBackend, enforce::EnforceBackend, enforce::Summary, isolation,
+    network,
 };
 use crate::config::{self, Resolved};
 use crate::event::Trace;
@@ -37,6 +39,15 @@ enum Command {
     Show(ShowArgs),
     /// Inspect bundled profiles and generate profiles from audit traces.
     Profile(ProfileArgs),
+    /// Report what this host can enforce, and what each gap costs.
+    Doctor,
+    /// Emit a shell completion script, generated from these commands.
+    Completions {
+        /// The shell to generate for.
+        shell: clap_complete::Shell,
+    },
+    /// Emit a man page, generated from these commands.
+    Man,
 }
 
 #[derive(Debug, clap::Args)]
@@ -50,6 +61,12 @@ struct RunArgs {
     /// Reconstruct the target's world with namespaces (defense in depth).
     #[arg(long)]
     isolate: bool,
+    /// Do not print what the run enforced.
+    #[arg(long, conflicts_with = "json")]
+    quiet: bool,
+    /// Print what the run enforced as JSON.
+    #[arg(long)]
+    json: bool,
     /// The target executable, followed by its own arguments.
     #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<String>,
@@ -100,6 +117,8 @@ struct ProfileArgs {
 enum ProfileCommand {
     /// List the bundled profiles.
     List,
+    /// Print a bundled profile, so it can be copied and edited.
+    Show { name: String },
     /// Generate a deny-by-default profile from a saved audit trace.
     Generate(GenerateArgs),
 }
@@ -144,13 +163,118 @@ fn dispatch(command: Command) -> anyhow::Result<i32> {
         Command::Audit(args) => cmd_audit(args),
         Command::Show(args) => cmd_show(args),
         Command::Profile(args) => cmd_profile(args),
+        Command::Doctor => cmd_doctor(),
+        Command::Completions { shell } => {
+            // Generated rather than maintained, so it cannot drift from the
+            // commands that actually exist.
+            let mut command = <Cli as clap::CommandFactory>::command();
+            clap_complete::generate(shell, &mut command, "bailey", &mut std::io::stdout());
+            Ok(0)
+        }
+        Command::Man => {
+            let command = <Cli as clap::CommandFactory>::command();
+            clap_mangen::Man::new(command).render(&mut std::io::stdout())?;
+            Ok(0)
+        }
     }
+}
+
+/// Report each mechanism bailey relies on, and what its absence means for a run.
+///
+/// Presence alone is not useful: "Landlock: yes" does not say whether network
+/// policy will be enforced, which needs ABI 4. The consequence is the part a
+/// user can act on.
+fn cmd_doctor() -> anyhow::Result<i32> {
+    let caps = probe::probe(true);
+    let mut degraded = false;
+
+    println!("kernel:");
+    match caps.landlock_abi {
+        Some(abi) => {
+            println!("  landlock: ABI {abi}");
+            if !caps.landlock_network() {
+                degraded = true;
+                println!("    network policy is NOT enforced (needs ABI 4, Linux 6.7)");
+            }
+            if !caps.landlock_scope() {
+                degraded = true;
+                println!(
+                    "    abstract sockets and signals are NOT scoped (needs ABI 6, Linux 6.12)"
+                );
+            }
+        }
+        None => {
+            degraded = true;
+            println!("  landlock: unavailable");
+            println!("    filesystem and network policy will NOT be enforced");
+        }
+    }
+
+    println!("  user namespaces: {}", yes_no(caps.unprivileged_userns));
+    if !caps.unprivileged_userns {
+        degraded = true;
+        println!("    `--isolate` will fall back to Landlock and seccomp");
+        println!("    denied egress will cover TCP only, not UDP or DNS");
+        println!("    a nested `deny` cannot be enforced");
+    }
+
+    println!("  cgroup delegation: {}", yes_no(caps.cgroup_delegated));
+    if !caps.cgroup_delegated {
+        degraded = true;
+        println!("    resource limits will be skipped");
+    }
+
+    println!("audit:");
+    println!("  kernel BTF: {}", yes_no(caps.btf));
+    match &caps.helper {
+        probe::HelperStatus::Ready(path) => {
+            println!("  helper: ready ({})", path.display());
+        }
+        probe::HelperStatus::NotPermitted(path) => {
+            degraded = true;
+            println!("  helper: found but cannot load ({})", path.display());
+            println!(
+                "    grant it capabilities: setcap cap_bpf,cap_perfmon+ep {}",
+                path.display()
+            );
+        }
+        probe::HelperStatus::Missing => {
+            degraded = true;
+            println!("  helper: not found");
+            println!("    `bailey audit` will not run; build it with -p bailey-bpf-helper");
+        }
+    }
+
+    println!("reporting:");
+    println!(
+        "  violation hooks: {}",
+        yes_no(caps.violation_hooks_possible())
+    );
+    if !caps.violation_hooks_possible() {
+        degraded = true;
+        if !caps.landlock_logs_denials() {
+            println!("    the kernel does not record Landlock denials (needs ABI 7, Linux 6.15)");
+        } else {
+            println!("    the kernel records denials but bailey cannot read them");
+            println!("    `on_violation` hooks will not fire");
+        }
+    }
+
+    if !degraded {
+        println!("\nEverything bailey uses is available on this host.");
+    }
+    Ok(0)
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
 }
 
 fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
     let (program, program_args) = split_command(args.command);
     let resolved = resolve(&args.profile, &program, args.config.as_deref())?;
     warn_if_target_denied(&resolved.policy, &program);
+    warn_if_violation_hooks_cannot_fire(&resolved.hooks);
     let target = Target {
         program,
         args: program_args,
@@ -161,6 +285,13 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
     let backend = EnforceBackend {
         isolate: args.isolate,
         stop_before_exec: false,
+        summary: if args.json {
+            Summary::Json
+        } else if args.quiet {
+            Summary::Quiet
+        } else {
+            Summary::Text
+        },
     };
     let code = backend.run(&resolved.policy, &target)?;
     if let Err(err) = resolved.hooks.run_post_exit(code) {
@@ -225,6 +356,12 @@ fn cmd_profile(args: ProfileArgs) -> anyhow::Result<i32> {
                 println!("{}{}", profile.name, marker);
                 println!("  {}", profile.description);
             }
+            Ok(0)
+        }
+        ProfileCommand::Show { name } => {
+            let profile =
+                profiles::get(&name).ok_or_else(|| anyhow::anyhow!("unknown profile `{name}`"))?;
+            print!("{}", profile.toml);
             Ok(0)
         }
         ProfileCommand::Generate(args) => cmd_profile_generate(args),
@@ -315,6 +452,23 @@ fn toml_string(path: &Path) -> String {
 
 fn absolute(path: &Path) -> PathBuf {
     std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Warn when a configured `on_violation` hook has no signal to fire on.
+///
+/// Landlock denies silently. The kernel records denials from ABI 7, but reading
+/// them needs access most systems do not give an ordinary user, so a hook can be
+/// perfectly valid config that never runs. Saying so is better than accepting it
+/// in silence.
+fn warn_if_violation_hooks_cannot_fire(hooks: &crate::hooks::Hooks) {
+    if hooks.on_violation.is_empty() || probe::violation_signal_available() {
+        return;
+    }
+    eprintln!(
+        "bailey: warning: an `on_violation` hook is configured but cannot fire on \
+         this host; bailey cannot read the kernel's record of denied access. \
+         Run `bailey doctor` for details."
+    );
 }
 
 /// Warn when the resolved policy denies the target itself, which would

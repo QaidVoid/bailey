@@ -1,0 +1,16 @@
+# Additive profile for a tool that should see one project and nothing else.
+#
+# A coding agent, a build script, or anything else that runs commands chosen at
+# run time. It gets the working directory and the system paths the untrusted
+# base already grants, and nothing more: no home directory, no network, no
+# devices.
+#
+# Grant the working directory in a `bailey.toml` next to the project, since the
+# profile cannot know where it is. Pair this with `--isolate` so a `deny` inside
+# the project is actually enforced.
+
+[filesystem]
+read = ["/usr/share/ca-certificates"]
+
+[network]
+egress = "deny"

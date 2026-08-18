@@ -82,17 +82,21 @@ Shipped, except exact scoping:
 
 ## Operator experience
 
-- **`bailey doctor`.** Reports which layers this host can enforce and what each
-  missing feature costs, before you run anything.
-- **Denial reporting.** Surface Landlock denials where the kernel provides them,
-  and drive `on_violation` hooks from that signal. Where it is unavailable, say so
-  instead of accepting config that never runs.
-- **A post-run summary.** What was enforced, what was skipped and why, what was
-  denied.
-- **Better profiles.** Fix `native-game` (NVIDIA nodes, `/dev/input`, `/dev/shm`,
-  a runtime directory scoped to your own uid), and add `desktop-app`, `ai-agent`,
-  and `network-client`.
-- **Generated shell completions and a man page.**
+Shipped, except reading denials:
+
+- **`bailey doctor`.** ✅ Reports which layers this host can enforce and what each
+  missing feature costs, including whether the audit helper can really load.
+- **A post-run summary.** ✅ What was enforced, and what the host took away, with
+  `--quiet` and `--json`.
+- **Better profiles.** ✅ `native-game` gains the NVIDIA nodes, `/dev/input`, and a
+  runtime directory scoped to your own uid; `desktop-app`, `ai-agent`, and
+  `network-client` are new, and `profile show` prints any of them for editing.
+- **Generated shell completions and a man page.** ✅
+- **Unusable violation hooks are reported.** ✅ A configured `on_violation` hook
+  that has no signal to fire on is called out rather than silently ignored.
+- **Reading denials.** Still open. Landlock records them from ABI 7, but reading
+  the record needs a readable kernel log or `CAP_AUDIT_READ`, so hooks cannot yet
+  be driven from it on a normal host.
 
 ## Not planned
 

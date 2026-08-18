@@ -1,0 +1,11 @@
+# Additive profile for a tool that fetches over the network and nothing more.
+#
+# Outbound HTTPS and the files needed to verify it. Note that egress rules are
+# enforced by TCP port, so this permits any host on 443; a policy that allows
+# egress at all also gives up the network namespace, leaving UDP unrestricted.
+
+[filesystem]
+read = ["/etc/ssl", "/usr/share/ca-certificates", "/etc/resolv.conf", "/etc/hosts"]
+
+[network]
+egress_allow = [{ host = "*", port = 443 }]

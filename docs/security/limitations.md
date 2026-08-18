@@ -106,10 +106,13 @@ have some reason to trust; it does not vet unknown code.
 
 ## Other
 
-### `on_violation` hooks never fire
+### `on_violation` hooks do not fire on most hosts
 
-Landlock denies silently and bailey has no denial signal, so the hook has no
-trigger. The config key is accepted anyway.
+Landlock denies silently. The kernel records denials from ABI 7 (Linux 6.15), but
+reading them needs a readable kernel log or `CAP_AUDIT_READ`, which most systems
+do not give an ordinary user. Bailey now reports a configured hook that cannot
+fire, and `bailey doctor` says whether this host can produce the signal, but the
+hook still does not run where the record is unreadable.
 
 ### The seccomp filter is a denylist
 

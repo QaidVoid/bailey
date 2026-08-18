@@ -12,7 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::backend::enforce::EnforceBackend;
+use crate::backend::enforce::{self, EnforceBackend};
 use crate::backend::{BackendError, Target, audit_helper};
 use crate::event::Trace;
 use crate::policy::{Access, FsRule, Policy};
@@ -50,6 +50,9 @@ impl AuditBackend {
         let backend = EnforceBackend {
             isolate: self.isolate,
             stop_before_exec: true,
+            // The audit output is the point of the run; a layer summary on top
+            // of it would bury the findings.
+            summary: enforce::Summary::Quiet,
         };
         let confined = backend.spawn(&envelope, target)?;
         let code = audit_helper::record(&mut recorder, confined)?;

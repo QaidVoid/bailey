@@ -25,6 +25,8 @@ exit status.
 | `-c, --config <FILE>` | Explicit config file, highest precedence |
 | `-p, --profile <NAME>` | Bundled profile used as the base. Default `untrusted` |
 | `--isolate` | Rebuild the target's world with user, mount, and PID namespaces |
+| `--quiet` | Do not print what the run enforced |
+| `--json` | Print what the run enforced as JSON |
 
 `ARGS` are passed to the target untouched. Bailey stops interpreting options at
 the target, so `bailey run ./tool -c ./tool.conf` gives `-c ./tool.conf` to
@@ -48,6 +50,8 @@ accesses the current policy does not grant, split into high-risk and routine.
 | `-c, --config <FILE>` | Explicit config file |
 | `-p, --profile <NAME>` | Bundled profile used as the base. Default `untrusted` |
 | `--save-trace <FILE>` | Write the recorded trace as JSON |
+| `--isolate` | Rebuild the target's world with namespaces during the audit |
+| `--unconfined` | Run with no confinement at all, reported when used |
 
 Requires the privileged audit helper. See [installation](/guide/installation).
 
@@ -65,9 +69,29 @@ and the merged policy. Exits 0.
 | `-c, --config <FILE>` | Explicit config file |
 | `-p, --profile <NAME>` | Bundled profile used as the base |
 
+## `bailey doctor`
+
+Reports what this host can enforce and what each gap costs: the Landlock ABI and
+which policy elements it covers, user namespaces, cgroup delegation, kernel BTF,
+whether the audit helper can load, and whether violation hooks can fire. See
+[knowing what was enforced](/guide/diagnostics).
+
+## `bailey completions <shell>` and `bailey man`
+
+Emit a shell completion script or a man page, generated from the command
+definitions.
+
 ## `bailey profile list`
 
 Lists the bundled profiles with their descriptions, marking the default base.
+
+## `bailey profile show`
+
+```
+bailey profile show <NAME>
+```
+
+Prints a bundled profile's TOML, so it can be copied and edited.
 
 ## `bailey profile generate`
 
@@ -85,6 +109,7 @@ writes a deny-by-default profile to stdout granting the routine findings.
 | `-c, --config <FILE>` | Explicit config file used when resolving the base policy |
 | `-p, --profile <NAME>` | Bundled profile used as the base when resolving |
 | `--include-high-risk` | Include network egress and credential access |
+| `--accept-truncated` | Generate from a trace known to be missing events |
 
 High-risk findings are excluded unless `--include-high-risk` is given, and the
 number excluded is reported on stderr.

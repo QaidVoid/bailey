@@ -12,7 +12,7 @@ fn bailey() -> &'static str {
 }
 
 fn landlock_available() -> bool {
-    bailey::backend::probe::probe().landlock
+    bailey::backend::probe::probe(false).landlock_abi.is_some()
 }
 
 fn write_config(dir: &Path, extra_read: &str) -> std::path::PathBuf {
