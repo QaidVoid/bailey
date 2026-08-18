@@ -1,181 +1,218 @@
 # bailey
 
-An ergonomic, layered sandbox for running untrusted games and binaries on Linux.
+A layered, deny-by-default sandbox for running untrusted programs on Linux.
 
-Bailey confines a program to a deny-by-default policy using Landlock for
-filesystem and network access, seccomp to trim the syscall surface, and cgroups
-for resource limits. It reads a cascading, mise-style config (global, then
-per-directory, then per-game), ships safe bundled profiles, and has a
-first-class audit mode that records what a program actually touches so you can
-tighten a profile from evidence instead of guesswork.
+Bailey puts a wall around a program and gives you the tools to see and shrink
+what it can reach. It confines with Landlock, seccomp, cgroups, and namespaces,
+reads a cascading config that layers global defaults under per-directory and
+per-program rules, and can record what a program actually touches so you can
+tighten its policy from evidence instead of guesswork.
+
+Everything except the audit recorder is unprivileged. No setuid binary, no
+daemon, no container runtime.
 
 ## Why
 
-Running an unknown Steam title, an itch.io download, or a mod gives that code the
-full authority of your user account. Bailey puts a cheap, unprivileged wall
-around it and gives you the tools to see and shrink what it can reach.
+Most code you run was written by someone you have never met. A game from a store
+page, a release binary from a repository you skimmed, a build script from a
+dependency, a coding agent with shell access. All of it runs with the full
+authority of your user account: your SSH keys, your browser profile, your
+documents, your network.
 
-## Status
+The usual answers are awkward. A VM is heavy. A container is built for shipping
+services, not for running a desktop program. `firejail` and `bubblejail` carry
+flat, hand-maintained profiles with no way to observe what a program actually
+needs. `landrun` is a thin one-shot Landlock wrapper with no config model.
 
-Implemented and verified: the policy model, cascading config, the enforcement
-backend (Landlock filesystem and network, seccomp, cgroups), namespace isolation
-(`--isolate`: user, mount, and PID namespaces with a reconstructed root),
-reconciliation, the CLI, and bundled profiles. The audit backend records access
-with eBPF loaded by a minimal privileged helper, keeping the main tool
-unprivileged; it is compile-verified and needs a privileged environment to run
-(see below).
+Bailey is the middle path: a launcher with a real policy model, layered kernel
+enforcement underneath it, and an audit mode that turns "I have no idea what this
+needs" into a profile you can read.
 
-Deferred: the exec (`bprm`) audit tracepoint, and the namespace fallback path's
-runtime test (needs a host with user namespaces disabled).
+## How it works
 
-## Build
+| Layer | Mechanism | What it does |
+| --- | --- | --- |
+| Filesystem and network | Landlock | Deny-by-default access rules on paths and TCP ports |
+| Syscalls | seccomp | Removes syscalls a normal program never needs |
+| Resources | cgroup v2 | Caps memory, process count, and CPU |
+| World | user, mount, PID namespaces | Rebuilds the root from the policy, so ungranted paths are absent rather than merely denied, and host processes are invisible |
+| Observation | eBPF, via a privileged helper | Records what the program opens and connects to, without blocking it |
 
-Default build (enforcement, config, profiles, reconciliation). No special
-toolchain required:
+One policy drives all of it. Config resolves into a single mechanism-independent
+`Policy` that both the enforcement backend and the audit backend consume, so a
+profile built by watching a program is directly usable for confining it.
 
-```
+## Install
+
+Enforcement, config, profiles, and reconciliation build with a stable toolchain
+and no system dependencies:
+
+```sh
 cargo build --release
 ```
 
-The audit backend records access with eBPF, which is loaded by a separate,
-minimal privileged helper (`bailey-bpf-helper`). Only that helper touches eBPF,
-so the main tool carries no eBPF code and needs no privilege. Building the helper
-needs a nightly toolchain and `bpf-linker`:
+The audit recorder is a separate, minimal binary that loads the eBPF programs.
+Building it needs nightly and `bpf-linker`:
 
-```
+```sh
 rustup toolchain install nightly
 rustup component add rust-src --toolchain nightly
 cargo install bpf-linker
 cargo build --release -p bailey-bpf-helper
 ```
 
-The main tool finds the helper via the `BAILEY_BPF_HELPER` environment variable,
-then next to its own executable, then on `PATH`.
+It is the only component that needs privilege. Grant it capabilities once:
+
+```sh
+sudo setcap cap_bpf,cap_perfmon+ep ./target/release/bailey-bpf-helper
+```
+
+The main tool finds the helper through `BAILEY_BPF_HELPER`, then next to its own
+executable, then on `PATH`.
 
 ## Quick start
 
-```
-# Run a binary under the default deny-by-default profile.
-bailey run ./game
+```sh
+# Run a program under the deny-by-default floor.
+bailey run ./program
 
-# See the effective policy for a target, with the config layers that shaped it.
-bailey show ./game
+# Add namespace isolation: ungranted paths are absent, host processes invisible.
+bailey run --isolate ./program
+
+# Start from a profile shaped for native Linux games.
+bailey run --profile native-game ./game
+
+# See the effective policy and the config layers that produced it.
+bailey show ./program
 
 # List the bundled profiles.
 bailey profile list
-
-# Use the native-game profile as the base (adds GPU, audio, display, fonts).
-bailey run --profile native-game ./game
-
-# Add namespace isolation: ungranted paths are absent, host processes invisible.
-bailey run --isolate ./game
 ```
 
-The enforcement backend is unprivileged. If a program will not start, its policy
-is missing something it needs (often a system path); widen the profile or add a
-per-game config.
+If a program will not start, its policy is missing something it needs, usually a
+system path or a device. Widen the profile, add a `bailey.toml` next to the
+program, or record a session with `bailey audit` and let the trace tell you.
 
 ## Configuration
 
-Config is TOML, merged from three layers of increasing precedence:
+Config is TOML, merged from layers of increasing precedence:
 
-1. Global: `$XDG_CONFIG_HOME/bailey/config.toml` (or `~/.config/bailey/config.toml`).
-2. Per-directory: `bailey.toml` files discovered by walking up from the target,
+1. A bundled profile (`--profile`, default `untrusted`), the safe floor.
+2. Global config: `$XDG_CONFIG_HOME/bailey/config.toml`.
+3. Per-directory `bailey.toml` files, discovered by walking up from the target,
    outermost first.
-3. Explicit: a file passed with `--config`.
+4. An explicit file passed with `--config`.
 
-A bundled profile (`--profile`, default `untrusted`) is applied beneath all of
-these as the safe floor. Filesystem and device grants accumulate across layers;
-scalar settings from a later layer override earlier ones.
+Filesystem and device grants accumulate across layers. Scalar settings from a
+later layer replace earlier ones. Relative paths resolve against the config
+file's own directory, and `~` expands to your home.
 
 ```toml
 [filesystem]
-# reset = true clears filesystem grants accumulated by lower-precedence layers.
-read = ["~/.config/mygame", "./assets"]
+read = ["~/.config/myapp", "./assets"]
 write = ["./saves"]
-execute = ["./game"]
-# deny removes a path granted by a lower layer.
-deny = ["~/.config/mygame/secrets"]
+execute = ["./program"]
+deny = ["~/.config/myapp/secrets"]  # removes a grant from a lower layer
+# reset = true                      # clears everything lower layers granted
 
 [network]
-egress = "deny"          # "deny" (default) or "allow"
-# Or allow specific TCP ports (host is advisory; Landlock enforces the port):
+egress = "deny"                     # "deny" (default) or "allow"
 egress_allow = [{ host = "*", port = 443 }]
 bind_ports = [27015]
 
 [[device]]
 path = "/dev/dri"
-access = "rw"            # any of r, w, x
+access = "rw"                       # any of r, w, x
 
 [resources]
-memory = "2GiB"          # bytes, or a suffix: KiB/MiB/GiB or KB/MB/GB
+memory = "2GiB"                     # bytes, or KiB/MiB/GiB, or KB/MB/GB
 pids_max = 512
-cpu_percent = 150        # percent of one core (100 = one full core)
+cpu_percent = 150                   # percent of one core
 
 [hooks]
-pre_launch = ["./setup.sh"]     # a failure here aborts the run
-post_exit = ["./cleanup.sh"]    # gets BAILEY_EXIT_CODE
-on_violation = ["./log.sh"]     # gets BAILEY_VIOLATION
+pre_launch = ["./setup.sh"]         # a non-zero exit aborts the run
+post_exit = ["./cleanup.sh"]        # receives BAILEY_EXIT_CODE
+on_violation = ["./log.sh"]         # receives BAILEY_VIOLATION
 ```
 
-Relative paths resolve against the config file's directory. A `~` prefix expands
-to your home directory.
+`bailey show <target>` prints the merged result and every file that contributed
+to it. When something is unexpectedly denied, start there.
 
 ## Audit workflow
 
-Audit mode runs the target permissively while recording the filesystem and
-network access of its process tree, then compares that trace to the current
-policy and flags anything ungranted, calling out high-risk access (network
-egress, credential reads, access outside the target directory).
+Audit mode runs a program while recording the filesystem and network access of
+its process tree, then compares that trace against the current policy and flags
+everything ungranted, calling out high-risk access separately: network egress,
+credential and dotfile reads, and anything outside the program's own directory.
 
-```
-# Record a session and review it. The helper supplies the privilege (see below).
-bailey audit --save-trace trace.json ./game
+```sh
+# Record a session and review what it touched.
+bailey audit --save-trace trace.json ./program
 
 # Turn the reviewed trace into a deny-by-default profile.
 # High-risk access is excluded unless you pass --include-high-risk.
-bailey profile generate --trace trace.json --target ./game > bailey.toml
+bailey profile generate --trace trace.json --target ./program > bailey.toml
 ```
 
-Audit-generated profiles are for tightening software you already trust. Auditing
-genuinely untrusted code and blindly accepting the result would grant whatever
-that code did, including a credential read or a call home. That is why high-risk
-access is flagged and never included without an explicit opt-in.
+Audit is for tightening software you have some reason to trust. Auditing
+genuinely hostile code and accepting the result would grant exactly what that
+code did, including its call home and its look through your keys. That is why
+high-risk findings are separated and never included without an explicit opt-in.
 
-## Kernel and privilege requirements
+## Requirements
 
-- Enforcement needs Landlock (Linux 5.13+; network rules need 6.7+). It is
-  unprivileged and requires no setuid binary or daemon. Bailey negotiates the
-  Landlock ABI best-effort and reports restrictions the kernel cannot enforce.
-- Cgroup limits are best-effort. Without a writable delegated cgroup they are
-  skipped with a warning rather than failing the run.
-- Audit records with eBPF, which needs `CAP_BPF` and `CAP_PERFMON`. Those
-  capabilities live only on the small `bailey-bpf-helper` binary, never on the
-  main tool. Grant them to the helper once:
+- Linux 5.13 or newer for Landlock. Network rules need 6.7. Bailey negotiates the
+  ABI best-effort and reports what the kernel cannot enforce.
+- Unprivileged user namespaces for `--isolate`. Without them, enforcement falls
+  back to Landlock and seccomp with a warning.
+- Cgroup v2 with a writable delegated cgroup for resource limits. Without one,
+  limits are skipped with a warning rather than failing the run.
+- Kernel BTF and the privileged helper for `bailey audit`.
 
-  ```
-  sudo setcap cap_bpf,cap_perfmon+ep ./target/release/bailey-bpf-helper
-  ```
+## What bailey does not do yet
 
-  Then `bailey audit ...` runs unprivileged and drives the helper. Or skip the
-  capabilities and run the audit under `sudo` instead. The helper never spawns
-  the target; the unprivileged main tool runs it and only tells the helper which
-  PID to observe, so the game itself never runs with elevated privileges.
+Being clear about the edges matters more than sounding complete.
 
-## Security notes and limits
+- **`egress = "deny"` currently blocks TCP only.** Landlock's network rules cover
+  TCP connect and bind, so UDP, QUIC, and DNS are not blocked today. Closing this
+  needs a network namespace, which is planned.
+- **The target inherits your environment.** Variables such as `SSH_AUTH_SOCK` and
+  API tokens are passed through. An environment policy is planned.
+- **`deny` only retracts a grant of the same path.** Denying a subdirectory of a
+  granted directory does not currently restrict it.
+- **`bailey audit` runs the target unconfined.** Use it on software you already
+  have reason to trust.
+- **`on_violation` hooks never fire,** because Landlock denies silently and
+  bailey has no denial signal yet.
+- **Under `--isolate` the working directory is not carried in,** so relative
+  paths do not resolve, and there is no private `/tmp`.
+- **The seccomp filter is a denylist,** covering module loading, `ptrace`, `bpf`,
+  namespace and mount operations, and similar. It is a hardening layer, not a
+  complete allowlist.
+- **Host and CIDR egress rules are advisory.** Landlock matches on TCP port; the
+  host field is not enforced and bailey warns when you use it.
+- **X11 is not sandboxable at the protocol level.** Prefer Wayland.
 
-- Landlock alone denies access to ungranted paths but does not hide them: a path
-  still exists, opening it just fails. Add `--isolate` for namespace-based world
-  reconstruction, where ungranted paths are absent from the target's mount table
-  and host processes are invisible. Isolation needs unprivileged user namespaces
-  and falls back to Landlock-only with a warning when they are unavailable.
-- Landlock network rules are TCP-port based. Host or CIDR restrictions in
-  `egress_allow` are advisory: bailey enforces the port and warns that the host
-  is not enforced.
-- The seccomp filter denies a set of dangerous syscalls (module loading,
-  `ptrace`, `bpf`, namespace and mount operations, and similar). It is a
-  hardening layer, not a complete allowlist.
-- X11 is not sandboxable at the display-protocol level; prefer Wayland.
+## Status
+
+Working and verified: the policy model, cascading config, the enforcement backend
+(Landlock filesystem and network rules, seccomp, cgroups), namespace isolation
+under `--isolate`, reconciliation, the CLI, and the bundled profiles.
+
+The audit backend records through the privileged helper and is compile-verified;
+its integration tests need a host where the helper has its capabilities.
+
+Planned work is listed in the documentation's roadmap.
+
+## Documentation
+
+Full documentation lives in `docs/`, built with VitePress:
+
+```sh
+cd docs
+bun install
+bun run dev
+```
 
 ## License
 
