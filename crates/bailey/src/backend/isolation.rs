@@ -43,6 +43,22 @@ pub struct IsolationPlan {
     pub conceal: Vec<Conceal>,
     /// Whether to also take the target out of the host's network namespace.
     pub network: bool,
+    /// The private home: where it lives on the host, and where it appears
+    /// inside.
+    pub home: Option<(PathBuf, PathBuf)>,
+    /// Whether to give the target a private `/tmp`.
+    pub private_tmp: bool,
+    /// Size of the private `/tmp`, in bytes.
+    pub tmp_bytes: u64,
+    /// Whether to give the target a private `/dev/shm`.
+    pub private_shm: bool,
+    /// Size of the private `/dev/shm`, in bytes.
+    pub shm_bytes: u64,
+    /// Directory to start the target in, once the new root is in place.
+    pub cwd: PathBuf,
+    /// Host directory the new root is staged in, removed by the parent after the
+    /// run.
+    pub staging: PathBuf,
 }
 
 /// Whether namespace isolation actually works on this host.
@@ -157,7 +173,9 @@ fn setup_root(plan: &IsolationPlan) -> io::Result<()> {
     )
     .map_err(errno)?;
 
-    let new_root = PathBuf::from(format!("/tmp/.bailey-root.{}", unsafe { libc::getpid() }));
+    // Staged at a path the parent chose, since the PID here is 1 in the new
+    // namespace and would collide between concurrent runs.
+    let new_root = plan.staging.clone();
     fs::create_dir_all(&new_root)?;
     mount(
         Some("tmpfs"),
@@ -168,9 +186,38 @@ fn setup_root(plan: &IsolationPlan) -> io::Result<()> {
     )
     .map_err(errno)?;
 
+    // The private /tmp goes first: a shared /tmp is a channel between every
+    // program on the machine, so the target gets its own, discarded with the
+    // namespace. It must precede the binds, because a granted path *under* /tmp
+    // has to land inside this tmpfs rather than be covered by it.
+    if plan.private_tmp {
+        mount_tmpfs(&new_root.join("tmp"), plan.tmp_bytes, "mode=1777")?;
+    }
+
     for bind in &plan.binds {
         bind_into(&new_root, bind)?;
     }
+
+    // After the binds, so that a bind covering /dev does not hide it.
+    if plan.private_shm {
+        mount_tmpfs(&new_root.join("dev/shm"), plan.shm_bytes, "mode=1777")?;
+    }
+
+    // The private home is bound at the path the real home would have, so a
+    // program that hard-codes its home still writes inside the sandbox.
+    if let Some((host, inside)) = &plan.home {
+        let target = new_root.join(inside.strip_prefix("/").unwrap_or(inside));
+        fs::create_dir_all(&target)?;
+        mount(
+            Some(host),
+            &target,
+            None::<&str>,
+            MsFlags::MS_BIND | MsFlags::MS_REC,
+            None::<&str>,
+        )
+        .map_err(errno)?;
+    }
+
     conceal_all(&new_root, &plan.conceal)?;
 
     // A fresh /proc, meaningful because we are in a new PID namespace.
@@ -191,7 +238,26 @@ fn setup_root(plan: &IsolationPlan) -> io::Result<()> {
     chdir("/").map_err(errno)?;
     umount2("/.oldroot", MntFlags::MNT_DETACH).map_err(errno)?;
     let _ = fs::remove_dir("/.oldroot");
+
+    // Back into the directory the target was invoked from, so relative paths
+    // resolve the way they do outside the sandbox.
+    if chdir(&plan.cwd).is_err() {
+        chdir("/").map_err(errno)?;
+    }
     Ok(())
+}
+
+/// Mount a fresh tmpfs, creating the mountpoint first.
+fn mount_tmpfs(target: &Path, size_bytes: u64, mode: &str) -> io::Result<()> {
+    fs::create_dir_all(target)?;
+    mount(
+        Some("tmpfs"),
+        target,
+        Some("tmpfs"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+        Some(format!("size={size_bytes},{mode}").as_str()),
+    )
+    .map_err(errno)
 }
 
 /// Cover each denied path that survived into the new root.

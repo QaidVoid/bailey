@@ -26,6 +26,7 @@ use landlock::{
 
 use crate::backend::isolation::{self, BindMount, Conceal, IsolationPlan};
 use crate::backend::network::{self, NetworkMode};
+use crate::backend::world::{self, World};
 use crate::backend::{Backend, BackendError, Target};
 use crate::policy::{self, Egress, Policy, ResourceLimits};
 
@@ -38,6 +39,13 @@ use crate::policy::{self, Egress, Policy, ResourceLimits};
 /// change how a policy's grants are interpreted.
 const TARGET_ABI: ABI = ABI::V6;
 
+/// Default size of the private `/tmp` when the policy does not set one.
+const DEFAULT_TMP_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Default size of the private `/dev/shm`. Graphics and audio stacks use it for
+/// buffers, so it is more generous than `/tmp`.
+const DEFAULT_SHM_BYTES: u64 = 256 * 1024 * 1024;
+
 /// Deny-by-default enforcement backend.
 #[derive(Debug, Default)]
 pub struct EnforceBackend {
@@ -49,7 +57,6 @@ impl Backend for EnforceBackend {
     fn run(&self, policy: &Policy, target: &Target) -> Result<i32, BackendError> {
         report_degradation(policy);
 
-        let plan = LandlockPlan::from_policy(policy);
         let seccomp = build_seccomp_filter()
             .map_err(|err| BackendError::Unsupported(format!("seccomp: {err}")))?;
 
@@ -59,9 +66,23 @@ impl Backend for EnforceBackend {
         let mode = network::select(policy, userns);
         network::report(mode, policy);
 
+        let isolated = self.isolate && userns;
+        let world = World::derive(&target.program, policy, isolated);
+        world.prepare().map_err(BackendError::Io)?;
+        if isolated && !world.kept_invocation_dir {
+            eprintln!(
+                "bailey: warning: the working directory is not granted, so it is \
+                 absent under isolation; starting in {} instead",
+                world.cwd.display()
+            );
+        }
+
+        let mut plan = LandlockPlan::from_policy(policy);
+        plan.add_world_grants(&world);
+
         let isolation = if self.isolate {
             if userns {
-                Some(build_isolation_plan(policy, mode))
+                Some(build_isolation_plan(policy, mode, &world))
             } else {
                 eprintln!(
                     "bailey: warning: unprivileged user namespaces unavailable; \
@@ -89,9 +110,17 @@ impl Backend for EnforceBackend {
 
         let mut command = Command::new(&target.program);
         command.args(&target.args);
+        // The environment is built rather than inherited, so a caller's
+        // credentials do not cross into the sandbox.
+        command.env_clear();
+        command.envs(world::environment(policy, &world));
+        // Under isolation the working directory is entered after the pivot,
+        // since the path only exists in the reconstructed root. Outside it, the
+        // caller's directory is simply inherited.
         if let Some(cwd) = &target.cwd {
             command.current_dir(cwd);
         }
+        let staging = isolation.as_ref().map(|plan| plan.staging.clone());
 
         // Safety: the closure runs in the forked child before exec. Bailey is
         // single-threaded at this point, so the usual fork-safety hazard of
@@ -121,6 +150,11 @@ impl Backend for EnforceBackend {
         let mut child = command.spawn().map_err(BackendError::Io)?;
         let status = child.wait().map_err(BackendError::Io)?;
         drop(cgroup);
+        // The staging directory was only ever a mountpoint in the target's own
+        // namespace; on the host it is an empty directory to clean up.
+        if let Some(staging) = staging {
+            let _ = std::fs::remove_dir(&staging);
+        }
         Ok(status.code().unwrap_or(-1))
     }
 }
@@ -162,6 +196,26 @@ impl LandlockPlan {
             handle_bind,
             connect_ports,
             bind_ports: policy.network.bind_ports.clone(),
+        }
+    }
+
+    /// Grant the writable areas the sandbox itself provides.
+    ///
+    /// These are not in the policy, because they are decided when the world is
+    /// built: a private home the target may write to, and, under isolation, the
+    /// private `/tmp` and `/dev/shm` that replace the host's shared ones.
+    fn add_world_grants(&mut self, world: &World) {
+        let read_write = AccessFs::from_read(TARGET_ABI) | AccessFs::from_write(TARGET_ABI);
+        if world.home_host.is_some() {
+            self.filesystem
+                .push((world.home_inside.clone(), read_write));
+        }
+        if world.private_tmp {
+            self.filesystem.push((PathBuf::from("/tmp"), read_write));
+        }
+        if world.private_shm {
+            self.filesystem
+                .push((PathBuf::from("/dev/shm"), read_write));
         }
     }
 
@@ -229,7 +283,7 @@ impl LandlockPlan {
 /// A denied path is never bound. Where a denial sits beneath a path that is
 /// bound, it arrives with its parent and is covered over instead, which is what
 /// makes a nested denial enforceable: Landlock rules can only add access.
-fn build_isolation_plan(policy: &Policy, mode: NetworkMode) -> IsolationPlan {
+fn build_isolation_plan(policy: &Policy, mode: NetworkMode, world: &World) -> IsolationPlan {
     let denied = |path: &Path| policy.denied.iter().any(|deny| path.starts_with(deny));
 
     let mut paths: Vec<PathBuf> = policy
@@ -281,6 +335,16 @@ fn build_isolation_plan(policy: &Policy, mode: NetworkMode) -> IsolationPlan {
         binds,
         conceal,
         network: mode == NetworkMode::Isolated,
+        home: world
+            .home_host
+            .as_ref()
+            .map(|host| (host.clone(), world.home_inside.clone())),
+        private_tmp: world.private_tmp,
+        tmp_bytes: policy.resources.tmp_bytes.unwrap_or(DEFAULT_TMP_BYTES),
+        private_shm: world.private_shm,
+        shm_bytes: policy.resources.shm_bytes.unwrap_or(DEFAULT_SHM_BYTES),
+        cwd: world.cwd.clone(),
+        staging: PathBuf::from(format!("/tmp/.bailey-root.{}", std::process::id())),
     }
 }
 

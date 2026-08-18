@@ -52,7 +52,7 @@ sandbox helps.
 | Cannot send UDP, QUIC, or DNS | Network namespace | Enforced when egress is denied |
 | Cannot load kernel modules, trace processes, or manipulate namespaces | seccomp | Enforced |
 | Cannot exceed memory, process, or CPU limits | cgroup v2 | Best-effort, and see the caveat below |
-| Cannot read your environment variables | none | **Not enforced** |
+| Cannot read your environment variables | Built environment | Enforced; only named variables cross |
 
 ## Where the guarantees end
 
@@ -60,8 +60,8 @@ sandbox helps.
 network namespace, leaving only TCP port rules. There is no mode that allows some
 UDP and denies the rest.
 
-**Environment variables.** The target inherits your whole environment, including
-`SSH_AUTH_SOCK` and any token your shell exports.
+**Variables you pass.** `pass` forwards a variable verbatim, so passing one that
+holds a credential puts that credential in the sandbox.
 
 **Nested denials without isolation.** Denying a path inside a granted directory
 is enforced only under `--isolate`, where the path can be covered over.

@@ -11,6 +11,7 @@ pub mod enforce;
 pub mod isolation;
 pub mod network;
 pub mod probe;
+pub mod world;
 
 use std::path::PathBuf;
 

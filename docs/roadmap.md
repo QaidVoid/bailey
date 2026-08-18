@@ -25,18 +25,20 @@ Making the policy mean what it says. Most of this has shipped:
 
 ## The world the target sees
 
-- **Environment policy.** Deny-by-default environment with a reconstructed safe
-  base, plus explicit `pass` and `set` directives. Display and audio variables
-  follow their grants. Ends the wholesale inheritance of your credentials.
-- **Private `/tmp` and `/dev/shm`.** tmpfs per run, invisible to the host and to
-  other sandboxes, discarded at exit.
-- **A private home per target.** Persistent, mounted at the real home's path under
-  isolation, so programs that insist on writing to `$HOME` work without reaching
-  yours.
-- **Working directory preserved.** Bound into the reconstructed root and chdir'd
-  back into, so relative paths resolve under `--isolate`.
-- **Isolation root hygiene.** A unique staging directory, removed after the pivot,
-  so concurrent isolated runs do not collide.
+Shipped:
+
+- **Environment policy.** ✅ Deny-by-default environment with a reconstructed base,
+  plus `pass`, `set`, and `deny` directives. Display and audio variables follow
+  their grants. Your credentials no longer cross by default.
+- **Private `/tmp` and `/dev/shm`.** ✅ tmpfs per run under `--isolate`, invisible
+  to the host and to other sandboxes, discarded at exit.
+- **A private home per target.** ✅ Persistent, and mounted at the real home's path
+  under isolation, so programs that insist on writing to `$HOME` work without
+  reaching yours.
+- **Working directory preserved.** ✅ Kept outside isolation, and bound and entered
+  under it.
+- **Isolation root hygiene.** ✅ A per-run staging directory, removed by the parent
+  after the run.
 
 ## Network confinement
 

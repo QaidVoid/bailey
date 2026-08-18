@@ -181,8 +181,6 @@ Being clear about the edges matters more than sounding complete.
   binding a port, keeps the target in the host's network namespace where only
   Landlock's TCP port rules apply. The run warns that UDP, QUIC, and DNS are not
   restricted. A full `egress = "deny"`, the default, has no such gap.
-- **The target inherits your environment.** Variables such as `SSH_AUTH_SOCK` and
-  API tokens are passed through. An environment policy is planned.
 - **A nested `deny` needs `--isolate`.** Denying a subdirectory of a granted
   directory is enforced by covering it with an empty read-only filesystem, which
   only the isolation layer can do, since Landlock rules add access and never

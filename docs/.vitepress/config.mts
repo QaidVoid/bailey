@@ -36,6 +36,7 @@ export default defineConfig({
             { text: 'Enforcement layers', link: '/guide/enforcement' },
             { text: 'Namespace isolation', link: '/guide/isolation' },
             { text: 'Network confinement', link: '/guide/network' },
+            { text: 'Environment and storage', link: '/guide/environment' },
           ],
         },
         {

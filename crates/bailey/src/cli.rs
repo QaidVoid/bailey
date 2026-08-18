@@ -9,6 +9,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
+use crate::backend::world::{self, World};
 use crate::backend::{
     Backend, Target, audit::AuditBackend, enforce::EnforceBackend, isolation, network,
 };
@@ -186,7 +187,7 @@ fn cmd_audit(args: AuditArgs) -> anyhow::Result<i32> {
 fn cmd_show(args: ShowArgs) -> anyhow::Result<i32> {
     let resolved = resolve(&args.profile, &args.target, args.config.as_deref())?;
     print_sources(&args.profile, &args.target, args.config.as_deref());
-    print_policy(&resolved);
+    print_policy(&resolved, &args.target);
     Ok(0)
 }
 
@@ -306,7 +307,7 @@ fn print_sources(profile: &str, target: &Path, explicit: Option<&Path>) {
     println!();
 }
 
-fn print_policy(resolved: &Resolved) {
+fn print_policy(resolved: &Resolved, target: &Path) {
     let policy = &resolved.policy;
 
     println!("filesystem:");
@@ -345,6 +346,24 @@ fn print_policy(resolved: &Resolved) {
     }
 
     println!("resources: {:?}", policy.resources);
+
+    let world = World::derive(target, policy, false);
+    println!("home: {}", world.home_inside.display());
+    if world.home_host.is_some() {
+        println!("  (private; the real home is not granted)");
+    }
+
+    println!("environment:");
+    for (name, value) in world::environment(policy, &world) {
+        let origin = if policy.env.set.contains_key(&name) {
+            "set"
+        } else if policy.env.passes(&name) {
+            "passed"
+        } else {
+            "base"
+        };
+        println!("  {name}={value}  ({origin})");
+    }
 }
 
 fn print_findings(findings: &[Finding]) {

@@ -92,6 +92,8 @@ filesystem grants.
 | `memory` | string | Maximum memory. Bytes, or a suffix |
 | `pids_max` | integer | Maximum processes and threads |
 | `cpu_percent` | integer | CPU quota as a percentage of one core |
+| `tmp_size` | string | Size of the private `/tmp`. Default 64MiB |
+| `shm_size` | string | Size of the private `/dev/shm`. Default 256MiB |
 
 Accepted size suffixes, case-insensitive: `b`, `k`/`kb` (1000), `kib` (1024),
 `m`/`mb`, `mib`, `g`/`gb`, `gib`, `t`/`tb`, `tib`.
@@ -105,6 +107,38 @@ cpu_percent = 150
 
 Each key is replaced by the nearest layer that sets it. Applied through cgroup v2,
 best-effort.
+
+## `[env]`
+
+| Key | Type | Description |
+| --- | --- | --- |
+| `pass` | list of names | Forward these caller variables. A trailing `*` matches by prefix |
+| `set` | table | Define variables outright |
+| `deny` | list of names | Remove these from the final environment, including the base set |
+| `reset` | bool | Discard everything lower layers passed or set |
+
+```toml
+[env]
+pass = ["MANGOHUD*"]
+set = { RUST_LOG = "debug" }
+deny = ["TERM"]
+```
+
+The target's environment is built, not inherited: it starts empty, gets a base
+set of `PATH`, `HOME`, `TMPDIR`, `TERM`, `LANG`, `LC_*`, `USER`, `LOGNAME`,
+`SHELL`, and `TZ`, and takes nothing else from the caller unless named here. See
+[environment and storage](/guide/environment).
+
+## `home`
+
+A top-level key giving the host directory to use as the target's private home,
+overriding the derived `$XDG_DATA_HOME/bailey/<target>/home`.
+
+```toml
+home = "~/games/thegame/home"
+```
+
+Granting your real home in `[filesystem]` turns the private home off entirely.
 
 ## `[hooks]`
 

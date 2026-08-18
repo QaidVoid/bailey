@@ -71,20 +71,14 @@ If the probe fails, the run continues with Landlock and seccomp only, and says s
 bailey: warning: unprivileged user namespaces unavailable; running without namespace isolation
 ```
 
-## Current limitations
+## What else the new root contains
 
-Isolation is the newest layer and the roughest.
+Beyond the granted paths, isolation provides the writable areas a normal program
+expects, described in [environment and storage](/guide/environment):
 
-- **The working directory is not carried in.** The program starts at `/` in the
-  new root, so relative paths do not resolve. Use absolute paths under
-  `--isolate`.
-- **There is no `/tmp` or `/dev/shm`** unless the policy grants them. Many
-  programs require both.
-- **`HOME` still names the host's home directory**, which is not mounted, so
-  programs that write to their home directory fail confusingly.
-- **The staging directory leaks.** The new root is built at a fixed path under the
-  host's `/tmp` and is not removed afterwards, so concurrent isolated runs collide.
-- **The network namespace is not used**, so isolation does not currently affect
-  network reachability.
+- A private `/tmp` and `/dev/shm`, on tmpfs, discarded when the run ends.
+- The target's private home, mounted where your real home would be.
+- The directory you invoked the program from, so relative paths resolve.
 
-All of these are on the [roadmap](/roadmap).
+The network namespace is part of the same layer; see
+[network confinement](/guide/network).

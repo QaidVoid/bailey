@@ -134,16 +134,17 @@ fn ungranted_path_is_absent_under_isolation() {
         eprintln!("skipping: isolation unavailable on this host");
         return;
     }
+    // `/var` is not granted, and unlike `/home` it is not a parent of anything
+    // the sandbox provides, so it is absent from the reconstructed root.
     let output = Command::new(bailey())
-        .args(["run", "--isolate", "/bin/sh", "-c", "ls /home"])
+        .args(["run", "--isolate", "/bin/sh", "-c", "ls /var"])
         .output()
         .unwrap();
-    // /home is not granted, so it is absent from the reconstructed root.
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("No such file") || stderr.contains("cannot access"),
-        "expected /home to be absent, got: {stderr}"
+        "expected /var to be absent, got: {stderr}"
     );
 }
 

@@ -24,7 +24,8 @@ use serde::Deserialize;
 
 use crate::hooks::Hooks;
 use crate::policy::{
-    Access, DeviceRule, Egress, EgressRule, FsRule, NetworkPolicy, Policy, ResourceLimits,
+    Access, DeviceRule, Egress, EgressRule, EnvPolicy, FsRule, NetworkPolicy, Policy,
+    ResourceLimits,
 };
 
 /// Filename of a per-directory config layer.
@@ -168,6 +169,21 @@ struct RawLayer {
     device: Vec<RawDevice>,
     resources: Option<RawResources>,
     hooks: Option<RawHooks>,
+    env: Option<RawEnv>,
+    home: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawEnv {
+    #[serde(default)]
+    reset: bool,
+    #[serde(default)]
+    pass: Vec<String>,
+    #[serde(default)]
+    deny: Vec<String>,
+    #[serde(default)]
+    set: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -215,6 +231,8 @@ struct RawResources {
     memory: Option<String>,
     pids_max: Option<u64>,
     cpu_percent: Option<u32>,
+    tmp_size: Option<String>,
+    shm_size: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -237,6 +255,8 @@ struct Accumulator {
     devices: BTreeMap<PathBuf, Access>,
     resources: ResourceLimits,
     hooks: Hooks,
+    env: EnvPolicy,
+    home: Option<PathBuf>,
 }
 
 /// Discover the config layers for `target`, lowest precedence first.
@@ -379,6 +399,37 @@ fn apply_layer(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> 
         if let Some(cpu) = resources.cpu_percent {
             acc.resources.cpu_percent = Some(cpu);
         }
+        if let Some(size) = &resources.tmp_size {
+            acc.resources.tmp_bytes = Some(size_value(size, &layer.path)?);
+        }
+        if let Some(size) = &resources.shm_size {
+            acc.resources.shm_bytes = Some(size_value(size, &layer.path)?);
+        }
+    }
+
+    if let Some(env) = &layer.raw.env {
+        if env.reset {
+            acc.env = EnvPolicy::default();
+        }
+        for name in &env.pass {
+            if !acc.env.pass.contains(name) {
+                acc.env.pass.push(name.clone());
+            }
+        }
+        for (name, value) in &env.set {
+            acc.env.set.insert(name.clone(), value.clone());
+        }
+        for name in &env.deny {
+            acc.env.pass.retain(|passed| passed != name);
+            acc.env.set.remove(name);
+            if !acc.env.deny.contains(name) {
+                acc.env.deny.push(name.clone());
+            }
+        }
+    }
+
+    if let Some(home) = &layer.raw.home {
+        acc.home = Some(resolve_path(home, &layer.base));
     }
 
     if let Some(hooks) = &layer.raw.hooks {
@@ -416,6 +467,8 @@ fn finalize(acc: Accumulator) -> Resolved {
             },
             devices,
             resources: acc.resources,
+            env: acc.env,
+            home: acc.home,
         },
         hooks: acc.hooks,
     }
@@ -497,6 +550,13 @@ fn parse_access(spec: &str) -> Result<Access, String> {
         return Err(format!("empty access specifier `{spec}`"));
     }
     Ok(access)
+}
+
+fn size_value(spec: &str, path: &Path) -> Result<u64, ConfigError> {
+    parse_size(spec).map_err(|reason| ConfigError::Invalid {
+        path: path.to_path_buf(),
+        reason,
+    })
 }
 
 fn parse_size(spec: &str) -> Result<u64, String> {

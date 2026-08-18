@@ -46,26 +46,14 @@ filesystem view.
 Be honest about the boundary, because an agent is the workload most likely to walk
 into all of these.
 
-**Your environment goes through.** Every variable in your shell is passed to the
-target, including `SSH_AUTH_SOCK`, `GITHUB_TOKEN`, `AWS_*`, and anything else your
-profile exports. An agent that reads its own environment has your credentials. Run
-it from a shell that does not have them:
-
-```sh
-env -i HOME="$HOME" PATH=/usr/bin:/bin TERM="$TERM" bailey run --isolate /usr/bin/agent-cli
-```
+**A variable you pass is passed in full.** The environment is deny-by-default,
+so `SSH_AUTH_SOCK` and `GITHUB_TOKEN` do not reach the agent unless you name
+them. If the agent genuinely needs a token, remember that passing it hands it
+over.
 
 **`deny` inside a granted directory only works under `--isolate`.** The
 `deny = ["./secrets"]` above is enforced when you pass `--isolate`, and is
 reported as unenforced when you do not. The command below uses it.
-
-**`egress = "deny"` blocks TCP only.** An agent can still send UDP and DNS traffic,
-which is enough to exfiltrate anything it can read. If that matters, run it with
-no network route at all by other means until the network namespace work lands.
-
-**Relative paths break under `--isolate`.** The working directory is not carried
-in, so the agent starts at `/`. For now, either pass absolute paths or run without
-`--isolate` and accept that ungranted paths are denied but visible.
 
 See the [roadmap](/roadmap) for the proposals that close each of these, and
 [known limitations](/security/limitations) for the full list.

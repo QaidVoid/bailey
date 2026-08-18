@@ -5,6 +5,7 @@
 //! limits apply. It is deliberately independent of any enforcement mechanism so
 //! that the enforcement and audit backends can each interpret the same value.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use bitflags::bitflags;
@@ -87,6 +88,47 @@ pub struct ResourceLimits {
     pub pids_max: Option<u64>,
     /// CPU quota as a percentage of a single core (100 = one full core).
     pub cpu_percent: Option<u32>,
+    /// Size of the private `/tmp`, in bytes.
+    pub tmp_bytes: Option<u64>,
+    /// Size of the private `/dev/shm`, in bytes.
+    pub shm_bytes: Option<u64>,
+}
+
+/// Which environment variables reach the target.
+///
+/// The target's environment is built rather than inherited: it starts empty, a
+/// reconstructed base set is added, and only the variables named here cross from
+/// the caller. Anything a shell exports, including credentials such as
+/// `SSH_AUTH_SOCK` or an API token, stays behind unless it is named.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EnvPolicy {
+    /// Names to forward from the caller. A trailing `*` matches by prefix.
+    pub pass: Vec<String>,
+    /// Variables set to a literal value, overriding anything passed.
+    pub set: BTreeMap<String, String>,
+    /// Names to remove from the final environment, including the base set. A
+    /// trailing `*` matches by prefix.
+    pub deny: Vec<String>,
+}
+
+impl EnvPolicy {
+    /// Whether `name` is forwarded from the caller.
+    pub fn passes(&self, name: &str) -> bool {
+        self.pass.iter().any(|pattern| matches_name(pattern, name))
+    }
+
+    /// Whether `name` is denied outright.
+    pub fn denies(&self, name: &str) -> bool {
+        self.deny.iter().any(|pattern| matches_name(pattern, name))
+    }
+}
+
+/// Match a variable name against a pattern, where a trailing `*` is a prefix.
+fn matches_name(pattern: &str, name: &str) -> bool {
+    match pattern.strip_suffix('*') {
+        Some(prefix) => name.starts_with(prefix),
+        None => pattern == name,
+    }
 }
 
 /// A fully resolved, deny-by-default sandbox policy.
@@ -110,6 +152,11 @@ pub struct Policy {
     pub devices: Vec<DeviceRule>,
     /// Resource limits.
     pub resources: ResourceLimits,
+    /// Which environment variables reach the target.
+    pub env: EnvPolicy,
+    /// Host directory to use as the target's private home, overriding the
+    /// derived one.
+    pub home: Option<PathBuf>,
 }
 
 impl Policy {

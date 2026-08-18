@@ -56,38 +56,20 @@ granting the parent and carving out exceptions.
 
 ## Environment
 
-### The whole environment is inherited
+### A passed variable is passed in full
 
-Every variable in your shell reaches the target, including `SSH_AUTH_SOCK`,
-`GITHUB_TOKEN`, `AWS_SECRET_ACCESS_KEY`, and `HOME`. Verified. Until an
-environment policy lands, clear it yourself:
-
-```sh
-env -i HOME="$HOME" PATH=/usr/bin:/bin TERM="$TERM" bailey run ./program
-```
+The environment is deny-by-default, but `pass` forwards a variable verbatim. If
+you pass a variable that holds a credential, that credential is in the sandbox.
+Bailey does not inspect values.
 
 ## Isolation
 
-### The working directory is not carried in
+### A private /tmp is skipped when the policy grants anything under /tmp
 
-Under `--isolate` the target starts at `/` in the reconstructed root, so relative
-paths do not resolve. Verified. Use absolute paths.
-
-### No `/tmp` or `/dev/shm`
-
-Neither is mounted in the reconstructed root unless the policy grants them. Many
-programs require both.
-
-### `HOME` points at an unmounted path
-
-`HOME` still names the host's home directory, which is not in the new root, so
-programs that write to their home directory fail in confusing ways.
-
-### The staging directory leaks and collides
-
-The new root is built at a fixed path under the host's `/tmp`, named by the PID
-inside the new namespace, which is always 1. It is not removed after the run.
-Concurrent isolated runs collide.
+Using the private `/tmp` means granting it read-write, and Landlock rights only
+add, so that grant would widen a narrower grant on a path that happens to live
+under `/tmp`. Bailey leaves `/tmp` alone in that case rather than silently
+widening access.
 
 ### Isolation depends on user namespaces
 
