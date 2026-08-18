@@ -139,6 +139,13 @@ fn matches_name(pattern: &str, name: &str) -> bool {
 pub struct Policy {
     /// Filesystem grants, sorted by path.
     pub filesystem: Vec<FsRule>,
+    /// Paths made read-only inside a writable parent, sorted by path.
+    ///
+    /// Landlock rules only add rights, so a read-only island in a granted
+    /// hierarchy cannot be expressed as a rule. It is enforced by mounting the
+    /// path over itself read-only, which the VFS honours regardless of Landlock,
+    /// and therefore only works under the isolation layer.
+    pub read_only: Vec<PathBuf>,
     /// Paths denied outright, sorted by path.
     ///
     /// A denial is total: no access is permitted to the path or anything under
@@ -160,6 +167,15 @@ pub struct Policy {
 }
 
 impl Policy {
+    /// Read-only paths that sit beneath a grant allowing writes.
+    pub fn nested_read_only(&self) -> impl Iterator<Item = &PathBuf> {
+        self.read_only.iter().filter(|path| {
+            self.filesystem
+                .iter()
+                .any(|rule| rule.access.contains(Access::WRITE) && path.starts_with(&rule.path))
+        })
+    }
+
     /// Denials that sit beneath a grant which still covers them.
     ///
     /// These need a mechanism that can take access away, which Landlock rules

@@ -151,9 +151,16 @@ pub fn for_target(target: &Path) -> Result<Option<String>, String> {
         };
         let declared: Claims = match toml::from_str(&text) {
             Ok(claims) => claims,
-            // A profile that does not parse is reported when it is selected, not
-            // while deciding whether it applies.
-            Err(_) => continue,
+            Err(err) => {
+                // Silence here would be the worst outcome: the profile simply
+                // stops applying, and the run is confined by something other
+                // than what the user thinks they wrote.
+                eprintln!(
+                    "bailey: warning: ignoring profile `{}`: {err}",
+                    path.display()
+                );
+                continue;
+            }
         };
         let matches = declared.applies_to.iter().any(|claim| {
             if claim.contains('/') {

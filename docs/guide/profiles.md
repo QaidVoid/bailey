@@ -150,6 +150,30 @@ bailey: using profile `claude`, which claims this target
 An entry with no `/` matches the program's file name, so it works wherever the
 binary is installed. An entry with a `/` must match the resolved path exactly.
 
+A profile that fails to parse is reported and ignored, rather than quietly
+ceasing to apply.
+
+## Granting the directory you are in
+
+A profile cannot name your project, but it can name *wherever you launched from*:
+
+```toml
+# ~/.config/bailey/profiles/agent.toml
+applies_to = ["my-agent"]
+
+[filesystem]
+read = ["${PWD}"]
+write = ["${PWD}"]
+```
+
+That is the answer to "must I write a `bailey.toml` in every project": no, if the
+rule belongs to the program rather than to the place. Put it in the profile and
+launch the program from the directory you want it to have.
+
+Keep in mind what it means literally. Launch from your home directory and you
+have granted your home; the sandbox will not save you from a `cd` you did not
+think about.
+
 Two rules keep this from becoming surprising: an explicit `--profile` always
 wins, and a run says which profile was chosen for it. If two profiles claim the
 same program, the run stops and names both rather than picking one.

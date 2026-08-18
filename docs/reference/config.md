@@ -25,6 +25,7 @@ Lowest precedence first:
 | `write` | list of paths | Grant write on each path hierarchy |
 | `execute` | list of paths | Grant execute on each path hierarchy |
 | `deny` | list of paths | Retract a grant of the same path and record the path as denied |
+| `read_only` | list of paths | Make a path read-only inside a writable grant. Needs `--isolate` |
 | `reset` | bool | Clear all filesystem grants from lower layers before applying this one |
 
 Rights for the same path combine across layers. A grant on a directory covers
@@ -39,6 +40,21 @@ deny = ["~/.config/app/token"]
 ```
 
 Granting and denying the same path within one layer is an error.
+
+### A read-only island
+
+`read_only` is how you keep part of a writable hierarchy from being written:
+
+```toml
+[filesystem]
+write = ["~/.local/share/thing"]
+read_only = ["~/.local/share/thing/versions"]
+```
+
+Unlike `deny`, the contents stay readable; only writes are refused. It is
+enforced by mounting the path over itself read-only, which the VFS honours
+whatever Landlock says, so it needs `--isolate`. Without it, the run warns and
+the path stays writable.
 
 ::: warning A nested `deny` needs `--isolate`
 A denial of a path inside a granted directory is enforced by covering the path
@@ -177,6 +193,11 @@ Commands run through `sh -c` and accumulate across layers, running in layer orde
   something like `${XDG_RUNTIME_DIR}`. An unset variable expands to nothing,
   leaving a path that matches nothing rather than one that matches something
   unintended.
+- `${PWD}` is the directory the run was launched from, asked of the kernel when
+  the shell has not exported it. A profile uses it to grant "wherever I am",
+  which is what lets a per-program policy work without a config file in every
+  project. Launch from a directory you actually want granted: from your home, it
+  grants your home.
 - `.` and `..` are collapsed lexically, so different spellings of one path merge
   into a single grant.
 

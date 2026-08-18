@@ -41,6 +41,9 @@ pub struct IsolationPlan {
     pub binds: Vec<BindMount>,
     /// Paths to cover over after binding.
     pub conceal: Vec<Conceal>,
+    /// Paths to re-mount read-only after binding, so a writable hierarchy can
+    /// still have read-only islands in it.
+    pub read_only: Vec<PathBuf>,
     /// Whether to also take the target out of the host's network namespace.
     pub network: bool,
     /// The private home: where it lives on the host, and where it appears
@@ -219,6 +222,7 @@ fn setup_root(plan: &IsolationPlan) -> io::Result<()> {
     }
 
     conceal_all(&new_root, &plan.conceal)?;
+    remount_read_only(&new_root, &plan.read_only)?;
 
     // A fresh /proc, meaningful because we are in a new PID namespace.
     let proc_dir = new_root.join("proc");
@@ -258,6 +262,39 @@ fn mount_tmpfs(target: &Path, size_bytes: u64, mode: &str) -> io::Result<()> {
         Some(format!("size={size_bytes},{mode}").as_str()),
     )
     .map_err(errno)
+}
+
+/// Re-mount each read-only path over itself, read-only.
+///
+/// This is the one way to take write access away from part of a granted
+/// hierarchy: Landlock rules only ever add rights, but a read-only mount is
+/// enforced by the VFS whatever the ruleset says. The contents stay readable,
+/// which is what distinguishes this from concealment.
+fn remount_read_only(new_root: &Path, paths: &[PathBuf]) -> io::Result<()> {
+    for path in paths {
+        let relative = path.strip_prefix("/").unwrap_or(path);
+        let target = new_root.join(relative);
+        if !target.exists() {
+            continue;
+        }
+        mount(
+            Some(&target),
+            &target,
+            None::<&str>,
+            MsFlags::MS_BIND | MsFlags::MS_REC,
+            None::<&str>,
+        )
+        .map_err(errno)?;
+        mount(
+            None::<&str>,
+            &target,
+            None::<&str>,
+            MsFlags::MS_REMOUNT | MsFlags::MS_BIND | MsFlags::MS_REC | MsFlags::MS_RDONLY,
+            None::<&str>,
+        )
+        .map_err(errno)?;
+    }
+    Ok(())
 }
 
 /// Cover each denied path that survived into the new root.

@@ -190,3 +190,66 @@ fn landlock_still_denies_writes_under_isolation() {
         "write to a read-only grant must be denied under isolation"
     );
 }
+
+#[test]
+fn a_read_only_island_survives_inside_a_writable_grant() {
+    if !isolation_active() {
+        eprintln!("skipping: isolation unavailable on this host");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    fs::create_dir_all(work.join("protected")).unwrap();
+    fs::write(work.join("protected/binary"), "original").unwrap();
+    fs::write(work.join("data.txt"), "data").unwrap();
+
+    let config = dir.path().join("bailey.toml");
+    fs::write(
+        &config,
+        format!(
+            "[filesystem]\n             read = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\", \"/etc\", \"{work}\"]\n             execute = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\"]\n             write = [\"{work}\"]\n             read_only = [\"{work}/protected\"]\n",
+            work = work.display()
+        ),
+    )
+    .unwrap();
+
+    let run = |script: String| {
+        Command::new(bailey())
+            .args(["run", "--isolate", "-c"])
+            .arg(&config)
+            .args(["/bin/sh", "-c"])
+            .arg(script)
+            .output()
+            .unwrap()
+    };
+
+    // Readable, unlike a denial, which empties the path.
+    let read = run(format!("cat {}/protected/binary", work.display()));
+    assert_eq!(
+        String::from_utf8_lossy(&read.stdout).trim(),
+        "original",
+        "a read-only island must stay readable"
+    );
+
+    // The parent is still writable.
+    let write_parent = run(format!("echo new > {}/added.txt", work.display()));
+    assert!(
+        write_parent.status.success(),
+        "the grant must stay writable"
+    );
+
+    // The island is not.
+    let write_island = run(format!(
+        "echo tampered > {}/protected/binary",
+        work.display()
+    ));
+    assert!(
+        !write_island.status.success(),
+        "a read-only island must refuse writes"
+    );
+    assert_eq!(
+        fs::read_to_string(work.join("protected/binary")).unwrap(),
+        "original",
+        "and nothing must reach the host"
+    );
+}

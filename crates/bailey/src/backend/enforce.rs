@@ -514,6 +514,7 @@ fn build_isolation_plan(policy: &Policy, mode: NetworkMode, world: &World) -> Is
     IsolationPlan {
         binds,
         conceal,
+        read_only: policy.read_only.clone(),
         network: mode == NetworkMode::Isolated,
         home: world
             .home_host
@@ -553,6 +554,13 @@ fn landlock_err(err: impl std::fmt::Display) -> io::Error {
 /// so the run says so rather than leaving the policy quietly weaker than it
 /// reads.
 fn report_unenforceable_denials(policy: &Policy) {
+    for path in policy.nested_read_only() {
+        eprintln!(
+            "bailey: warning: `{}` is marked read-only inside a writable grant, \
+             which needs `--isolate`; it stays writable here.",
+            path.display()
+        );
+    }
     for path in policy.nested_denials() {
         eprintln!(
             "bailey: warning: `{}` is denied but nested under a granted path, \

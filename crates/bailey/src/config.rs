@@ -205,6 +205,8 @@ struct RawFs {
     execute: Vec<String>,
     #[serde(default)]
     deny: Vec<String>,
+    #[serde(default)]
+    read_only: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -258,6 +260,7 @@ struct RawHooks {
 struct Accumulator {
     filesystem: BTreeMap<PathBuf, Access>,
     denied: BTreeSet<PathBuf>,
+    read_only: BTreeSet<PathBuf>,
     egress: Option<Egress>,
     bind_ports: Vec<u16>,
     devices: BTreeMap<PathBuf, Access>,
@@ -360,6 +363,7 @@ fn apply_layer(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> 
     if fs.reset {
         acc.filesystem.clear();
         acc.denied.clear();
+        acc.read_only.clear();
     }
     for (path, access) in granted {
         // A grant in this layer overrides a denial from a lower one.
@@ -370,6 +374,9 @@ fn apply_layer(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> 
         let path = resolve_path(raw, &layer.base);
         acc.filesystem.remove(&path);
         acc.denied.insert(path);
+    }
+    for raw in &fs.read_only {
+        acc.read_only.insert(resolve_path(raw, &layer.base));
     }
 
     if let Some(network) = &layer.raw.network {
@@ -475,6 +482,7 @@ fn finalize(acc: Accumulator) -> Resolved {
         policy: Policy {
             filesystem,
             denied: acc.denied.into_iter().collect(),
+            read_only: acc.read_only.into_iter().collect(),
             network: NetworkPolicy {
                 egress: acc.egress.unwrap_or(Egress::DenyAll),
                 bind_ports: acc.bind_ports,
@@ -646,8 +654,18 @@ fn expand_variables(raw: &str) -> String {
             return out;
         };
         let name = &after[..end];
-        if let Some(value) = std::env::var_os(name) {
-            out.push_str(&value.to_string_lossy());
+        match std::env::var_os(name) {
+            Some(value) => out.push_str(&value.to_string_lossy()),
+            // `${PWD}` names the directory the run was launched from, which is
+            // how a profile grants "wherever I am" without a file in every
+            // project. The shell usually exports it; fall back to asking the
+            // kernel so it works when something else invoked bailey.
+            None if name == "PWD" => {
+                if let Ok(cwd) = std::env::current_dir() {
+                    out.push_str(&cwd.to_string_lossy());
+                }
+            }
+            None => {}
         }
         rest = &after[end + 1..];
     }
@@ -866,6 +884,30 @@ mod tests {
             resolved.policy.filesystem[0].path,
             PathBuf::from("/run/user/4242/wayland-0")
         );
+    }
+
+    #[test]
+    fn pwd_expands_to_the_invocation_directory() {
+        // A profile grants "wherever I am" with ${PWD}, which is what lets a
+        // per-program policy work without a config file in every project.
+        unsafe { std::env::remove_var("PWD") };
+        let layers = [layer("/base", "[filesystem]\nread = [\"${PWD}\"]")];
+        let resolved = merge(&layers).unwrap();
+        assert_eq!(
+            resolved.policy.filesystem[0].path,
+            std::env::current_dir().unwrap()
+        );
+    }
+
+    #[test]
+    fn a_read_only_path_is_carried_into_the_policy() {
+        let layers = [layer(
+            "/base",
+            "[filesystem]\nwrite = [\"/work\"]\nread_only = [\"/work/keep\"]",
+        )];
+        let resolved = merge(&layers).unwrap();
+        assert_eq!(resolved.policy.read_only, vec![PathBuf::from("/work/keep")]);
+        assert_eq!(resolved.policy.nested_read_only().count(), 1);
     }
 
     #[test]

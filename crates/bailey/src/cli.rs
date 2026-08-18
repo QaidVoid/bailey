@@ -553,6 +553,19 @@ fn print_policy(resolved: &Resolved, target: &Path) {
         println!("  {} {}", access_flags(rule.access), rule.path.display());
     }
 
+    if !policy.read_only.is_empty() {
+        let nested: Vec<_> = policy.nested_read_only().collect();
+        println!("read-only:");
+        for path in &policy.read_only {
+            let note = if nested.contains(&path) {
+                "  (inside a writable grant: needs --isolate)"
+            } else {
+                ""
+            };
+            println!("  r-- {}{note}", path.display());
+        }
+    }
+
     if !policy.denied.is_empty() {
         let nested: Vec<_> = policy.nested_denials().collect();
         println!("denied:");
