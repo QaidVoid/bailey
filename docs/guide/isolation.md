@@ -1,11 +1,14 @@
 # Namespace isolation
 
 ```sh
-bailey run --isolate ./program
+bailey run ./program              # isolated
+bailey run --no-isolate ./program # Landlock and seccomp only
 ```
 
 Landlock denies access to ungranted paths. Isolation goes further: it rebuilds the
-world so those paths are not there.
+world so those paths are not there. It is the default, because four things stop
+being enforceable without it: a nested `deny`, a `read_only` island, the private
+`/tmp`, and the private home at your real home's path.
 
 ## What changes
 

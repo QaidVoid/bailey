@@ -249,7 +249,9 @@ impl EnforceBackend {
         if let Some(cwd) = &target.cwd {
             command.current_dir(cwd);
         }
-        let staging = isolation.as_ref().map(|plan| plan.staging.clone());
+        let staging = StagingGuard {
+            dir: isolation.as_ref().map(|plan| plan.staging.clone()),
+        };
         let stop_before_exec = self.stop_before_exec;
 
         // Safety: the closure runs in the forked child before exec. Bailey is
@@ -300,11 +302,29 @@ impl EnforceBackend {
     }
 }
 
+/// Removes the host-visible staging directory a reconstructed root was built
+/// in, however the run ends.
+///
+/// Cleanup used to happen only on the success path, so a `pre_exec` that failed
+/// after creating the directory, or a caller that dropped the run without
+/// waiting, left one behind for every attempt.
+struct StagingGuard {
+    dir: Option<PathBuf>,
+}
+
+impl Drop for StagingGuard {
+    fn drop(&mut self) {
+        if let Some(dir) = &self.dir {
+            let _ = std::fs::remove_dir(dir);
+        }
+    }
+}
+
 /// A target running under enforcement, not yet waited on.
 pub struct Confined {
     child: std::process::Child,
     cgroup: CgroupGuard,
-    staging: Option<PathBuf>,
+    staging: StagingGuard,
     report: RunReport,
     summary: Summary,
 }
@@ -325,10 +345,9 @@ impl Confined {
         let status = self.child.wait().map_err(BackendError::Io)?;
         drop(self.cgroup);
         // The staging directory was only ever a mountpoint in the target's own
-        // namespace; on the host it is an empty directory to clean up.
-        if let Some(staging) = self.staging {
-            let _ = std::fs::remove_dir(&staging);
-        }
+        // namespace; on the host it is an empty directory, removed when the
+        // guard drops.
+        drop(self.staging);
         let code = status.code().unwrap_or(-1);
         match self.summary {
             Summary::Text => self.report.print(code),
@@ -557,15 +576,17 @@ fn report_unenforceable_denials(policy: &Policy) {
     for path in policy.nested_read_only() {
         eprintln!(
             "bailey: warning: `{}` is marked read-only inside a writable grant, \
-             which needs `--isolate`; it stays writable here.",
+             which a mount namespace enforces; this run has none, so it stays \
+             writable. Drop `--no-isolate` to enforce it.",
             path.display()
         );
     }
     for path in policy.nested_denials() {
         eprintln!(
             "bailey: warning: `{}` is denied but nested under a granted path, \
-             and is not enforced without `--isolate`. Grant the specific \
-             subdirectories you need instead of granting the parent.",
+             and is not enforced without namespace isolation. Drop \
+             `--no-isolate`, or grant the specific subdirectories you need \
+             instead of granting the parent.",
             path.display()
         );
     }

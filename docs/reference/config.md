@@ -25,7 +25,7 @@ Lowest precedence first:
 | `write` | list of paths | Grant write on each path hierarchy |
 | `execute` | list of paths | Grant execute on each path hierarchy |
 | `deny` | list of paths | Retract a grant of the same path and record the path as denied |
-| `read_only` | list of paths | Make a path read-only inside a writable grant. Needs `--isolate` |
+| `read_only` | list of paths | Make a path read-only inside a writable grant. Needs the isolation layer |
 | `reset` | bool | Clear all filesystem grants from lower layers before applying this one |
 
 Rights for the same path combine across layers. A grant on a directory covers
@@ -53,13 +53,14 @@ read_only = ["~/.local/share/thing/versions"]
 
 Unlike `deny`, the contents stay readable; only writes are refused. It is
 enforced by mounting the path over itself read-only, which the VFS honours
-whatever Landlock says, so it needs `--isolate`. Without it, the run warns and
-the path stays writable.
+whatever Landlock says, so it needs the isolation layer. That is the default;
+under `--no-isolate` the run warns and the path stays writable.
 
-::: warning A nested `deny` needs `--isolate`
+::: warning A nested `deny` needs the isolation layer
 A denial of a path inside a granted directory is enforced by covering the path
-with an empty read-only filesystem, which only the isolation layer can do.
-Without `--isolate` the denial is reported as unenforced before the run starts.
+with an empty read-only filesystem, which only the isolation layer can do. That
+layer is on by default; under `--no-isolate` the denial is reported as unenforced
+before the run starts.
 :::
 
 ## `[network]`

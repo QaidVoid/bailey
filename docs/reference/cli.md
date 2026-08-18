@@ -24,7 +24,8 @@ exit status.
 | --- | --- |
 | `-c, --config <FILE>` | Explicit config file, highest precedence |
 | `-p, --profile <NAME>` | Profile used as the base, bundled or your own. Defaults to one that claims the target, else `untrusted` |
-| `--isolate` | Rebuild the target's world with user, mount, and PID namespaces |
+| `--no-isolate` | Run without namespace isolation, leaving Landlock and seccomp |
+| `--isolate` | Accepted and redundant: isolation is the default |
 | `--quiet` | Do not print what the run enforced |
 | `--json` | Print what the run enforced as JSON |
 

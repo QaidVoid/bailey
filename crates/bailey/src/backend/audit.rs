@@ -24,6 +24,10 @@ pub struct AuditBackend {
     /// software the user already trusts.
     pub unconfined: bool,
     /// Reconstruct the target's world with namespaces during the audit.
+    ///
+    /// Not usable yet: the recorder holds the target at its exec trap, and
+    /// `PTRACE_TRACEME` is not inherited across the fork the isolation layer
+    /// performs to make the target PID 1, so the stop never reaches bailey.
     pub isolate: bool,
 }
 

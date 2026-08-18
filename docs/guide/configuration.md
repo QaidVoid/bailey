@@ -43,10 +43,10 @@ contributes once. At equal depth, the working directory wins.
 - **Granting and denying the same path within one layer is an error**, naming the
   file and the path.
 
-::: warning A nested `deny` needs `--isolate`
+::: warning A nested `deny` needs the isolation layer
 Denying a path inside a directory another layer granted is enforced by covering
 that path with an empty read-only filesystem, which only the isolation layer can
-do. `bailey run --isolate` enforces it; a plain `bailey run` reports it as
+do. That layer is on by default; under `--no-isolate` the denial is reported as
 unenforced and the path stays readable.
 
 Landlock rules cannot express this: access resolution walks up from the file, so

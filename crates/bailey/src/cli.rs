@@ -59,9 +59,16 @@ struct RunArgs {
     /// target, or to the untrusted floor.
     #[arg(short, long)]
     profile: Option<String>,
-    /// Reconstruct the target's world with namespaces (defense in depth).
-    #[arg(long)]
+    /// Explicitly ask for namespace isolation. It is the default; the flag is
+    /// accepted so existing invocations keep working.
+    #[arg(long, conflicts_with = "no_isolate")]
     isolate: bool,
+    /// Run without namespace isolation, leaving only Landlock and seccomp.
+    ///
+    /// Several things stop being enforceable: a nested `deny`, a `read_only`
+    /// island, the private `/tmp`, and the private home at the real home's path.
+    #[arg(long)]
+    no_isolate: bool,
     /// Do not print what the run enforced.
     #[arg(long, conflicts_with = "json")]
     quiet: bool,
@@ -85,7 +92,7 @@ struct AuditArgs {
     /// Write the recorded access trace to this file as JSON.
     #[arg(long)]
     save_trace: Option<PathBuf>,
-    /// Reconstruct the target's world with namespaces during the audit.
+    /// Namespace isolation, which audit cannot use yet and rejects.
     #[arg(long)]
     isolate: bool,
     /// Run the target with no confinement at all. It will have your full
@@ -273,7 +280,9 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
 
     resolved.hooks.run_pre_launch()?;
     let backend = EnforceBackend {
-        isolate: args.isolate,
+        // Isolation is the default: without it a nested `deny`, a `read_only`
+        // island and the private `/tmp` all silently stop being enforceable.
+        isolate: !args.no_isolate,
         stop_before_exec: false,
         summary: if args.json {
             Summary::Json
@@ -303,9 +312,18 @@ fn cmd_audit(args: AuditArgs) -> anyhow::Result<i32> {
     };
 
     resolved.hooks.run_pre_launch()?;
+    if args.isolate {
+        anyhow::bail!(
+            "`audit` cannot use namespace isolation yet: the recorder needs the \
+             target stopped at exec, and that stop is not inherited across the \
+             fork that puts it in a PID namespace. Audit without `--isolate`, or \
+             enforce with `bailey run`."
+        );
+    }
     let backend = AuditBackend {
         unconfined: args.unconfined,
-        isolate: args.isolate,
+        // Not defaulted on, unlike `run`: see the check above.
+        isolate: false,
     };
     let (code, trace) = backend.run_and_record(&resolved.policy, &target)?;
     if let Err(err) = resolved.hooks.run_post_exit(code) {
@@ -558,7 +576,7 @@ fn print_policy(resolved: &Resolved, target: &Path) {
         println!("read-only:");
         for path in &policy.read_only {
             let note = if nested.contains(&path) {
-                "  (inside a writable grant: needs --isolate)"
+                "  (inside a writable grant: needs isolation)"
             } else {
                 ""
             };
@@ -571,7 +589,7 @@ fn print_policy(resolved: &Resolved, target: &Path) {
         println!("denied:");
         for path in &policy.denied {
             let note = if nested.contains(&path) {
-                "  (nested under a grant: needs --isolate)"
+                "  (nested under a grant: needs isolation)"
             } else {
                 ""
             };

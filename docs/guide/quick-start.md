@@ -85,7 +85,7 @@ By default, ungranted paths are denied but still visible: the program can see th
 those paths are not there at all, and host processes are invisible:
 
 ```sh
-bailey run --isolate ./program
+bailey run ./program
 ```
 
 This needs unprivileged user namespaces. Where they are unavailable, bailey warns

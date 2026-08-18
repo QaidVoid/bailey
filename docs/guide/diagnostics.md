@@ -45,9 +45,8 @@ The summary lists the layers that applied, and any the host took away:
 bailey: not enforced, resource limits: Permission denied (os error 13)
 ```
 
-A layer you simply did not ask for is not listed. `--isolate` being off is a
-choice, not a gap, and restating your command line would bury the things that
-are.
+A layer you turned off is not listed. `--no-isolate` is a choice, not a gap, and
+restating your command line would bury the things that are.
 
 For scripts:
 

@@ -79,7 +79,7 @@ executable, then on `PATH`.
 bailey run ./program
 
 # Add namespace isolation: ungranted paths are absent, host processes invisible.
-bailey run --isolate ./program
+bailey run ./program
 
 # Start from a profile shaped for native Linux games.
 bailey run --profile native-game ./game
@@ -165,7 +165,8 @@ high-risk findings are separated and never included without an explicit opt-in.
 - Linux 5.13 or newer for Landlock. Network rules need 6.7, and scoping needs
   6.12. Bailey negotiates the ABI best-effort and reports what the kernel cannot
   enforce.
-- Unprivileged user namespaces for `--isolate` and for the network namespace.
+- Unprivileged user namespaces for the isolation layer and the network
+  namespace.
   Without them, enforcement falls back to Landlock and seccomp with a warning,
   and egress is restricted by TCP port only.
 - Cgroup v2 with a writable delegated cgroup for resource limits. Without one,
@@ -180,18 +181,17 @@ Being clear about the edges matters more than sounding complete.
   binding a port, keeps the target in the host's network namespace where only
   Landlock's TCP port rules apply. The run warns that UDP, QUIC, and DNS are not
   restricted. A full `egress = "deny"`, the default, has no such gap.
-- **A nested `deny` needs `--isolate`.** Denying a subdirectory of a granted
-  directory is enforced by covering it with an empty read-only filesystem, which
-  only the isolation layer can do, since Landlock rules add access and never
-  subtract it. Without `--isolate` the run reports the denial as unenforced.
+- **Taking access away needs the isolation layer**, which is on by default. A
+  nested `deny` is enforced by covering the path, and a `read_only` island by a
+  read-only mount, because Landlock rules add rights and never subtract them.
+  Under `--no-isolate` both are reported as unenforced rather than silently
+  ignored.
 - **Audit falls back to process-tree scoping without a cgroup.** Where a run can
   be given a cgroup, scoping is exact; otherwise a very short-lived child can be
   missed, and the run says so.
 - **A denied access is not reported.** Landlock denies silently, and seeing a
   denial needs the kernel's audit subsystem enabled at boot plus permission to
   read its records. Use `bailey audit` to find out what a program wanted.
-- **Under `--isolate` the working directory is not carried in,** so relative
-  paths do not resolve, and there is no private `/tmp`.
 - **The seccomp filter is a denylist,** covering module loading, `ptrace`, `bpf`,
   namespace and mount operations, and similar. It is a hardening layer, not a
   complete allowlist.
