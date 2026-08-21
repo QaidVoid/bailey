@@ -86,9 +86,31 @@ test -e /sys/kernel/btf/vmlinux && echo "btf: yes"
 See [kernel requirements](/reference/kernel) for what each feature affects and
 which kernel version introduced it.
 
-## Building the whole workspace
+## Building and testing the workspace
 
-`cargo build` acts on the default members, which are the main tool and the shared
-crate. The eBPF program crate and the privileged helper are excluded, because they
-need the nightly toolchain and `bpf-linker`. Build them explicitly with
-`-p bailey-bpf-helper`.
+```sh
+cargo build              # the main tool and the shared crate
+cargo test               # and their tests
+```
+
+Both act on the default members, so a stable toolchain and no system
+dependencies are enough.
+
+```sh
+cargo build --workspace
+cargo test --workspace
+```
+
+These add the privileged helper, which needs nightly and `bpf-linker`. Without
+them the build stops with a message naming what to install; nothing else in the
+workspace depends on that toolchain.
+
+The eBPF programs themselves sit behind a `bpf` feature that only the helper's
+build script enables. They compile for the BPF target and nothing else, so
+without the gate every `--workspace` command would try to link them for your
+machine and fail.
+
+Some tests need more than a toolchain: a delegated cgroup, unprivileged user
+namespaces, or the audit helper with its capabilities. Each of those self-skips
+with a note rather than failing, so a passing run on a restricted host is not
+proof that everything was exercised.

@@ -9,9 +9,17 @@ description = "eBPF observation programs for the bailey audit backend"
 aya-ebpf = "0.2.1"
 bailey-common = { path = "../bailey-common" }
 
+# Enabled only by the helper's build script, which compiles this crate for the
+# BPF target. Nothing on the host enables it, so `cargo build --workspace` and
+# `cargo test --workspace` skip the program below instead of trying to link a
+# `no_std`, no_main BPF binary for your machine.
+[features]
+bpf = []
+
 [[bin]]
 name = "bailey-ebpf"
 path = "src/main.rs"
+required-features = ["bpf"]
 
 # aya-build compiles this crate with --release; the workspace release profile
 # (opt-level 3) is what the BPF verifier needs.

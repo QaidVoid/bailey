@@ -6,10 +6,14 @@ members = [
     "crates/bailey-ebpf",
     "crates/bailey-bpf-helper",
 ]
-# Only the unprivileged main tool and the shared crate build by default. The BPF
-# program crate and the privileged helper need a nightly toolchain and
-# bpf-linker, so bare host builds and tests skip them; build the helper with
-# `cargo build -p bailey-bpf-helper`.
+# Only the unprivileged main tool and the shared crate build by default. The
+# privileged helper needs a nightly toolchain and bpf-linker, so bare host builds
+# and tests skip it; build it with `cargo build -p bailey-bpf-helper`.
+#
+# `bailey-ebpf` stays a member because the helper's build script builds it by
+# package name, but its program is behind a `bpf` feature that nothing on the
+# host enables, so `--workspace` commands skip it rather than trying to link a
+# BPF binary for your machine.
 default-members = ["crates/bailey", "crates/bailey-common"]
 
 [workspace.package]
