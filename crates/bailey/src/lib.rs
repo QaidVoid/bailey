@@ -16,3 +16,4 @@ pub mod hooks;
 pub mod policy;
 pub mod profiles;
 pub mod reconcile;
+pub mod trust;

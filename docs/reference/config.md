@@ -14,8 +14,13 @@ Lowest precedence first:
 3. `$XDG_CONFIG_HOME/bailey/config.toml`, or `~/.config/bailey/config.toml`.
 4. Every `bailey.toml` found walking up from the target's directory and from the
    working directory, ordered by path depth, shallowest first. A file found by
-   both walks contributes once; at equal depth the working directory wins.
+   both walks contributes once; at equal depth the working directory wins. Each
+   applies only once trusted with `bailey trust <file>`; see
+   [trusting a config](/guide/trusting-a-config).
 5. The file given to `--config`.
+
+Layers 1 to 3 and layer 5 need no trust record: each is a file you wrote or a
+path you typed. Only the discovered files in layer 4 are gated.
 
 ## `[filesystem]`
 

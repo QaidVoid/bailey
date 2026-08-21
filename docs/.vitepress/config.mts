@@ -43,6 +43,7 @@ export default defineConfig({
           text: 'Using bailey',
           items: [
             { text: 'Configuration', link: '/guide/configuration' },
+            { text: 'Trusting a config', link: '/guide/trusting-a-config' },
             { text: 'Profiles', link: '/guide/profiles' },
             { text: 'Auditing a program', link: '/guide/audit' },
             { text: 'Lifecycle hooks', link: '/guide/hooks' },

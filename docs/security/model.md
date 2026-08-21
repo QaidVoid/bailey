@@ -35,7 +35,9 @@ sandbox helps.
 - **The host is not already compromised.** Bailey confines what it starts. It does
   not clean up what was there before.
 - **The policy is what the user meant.** A policy granting the home directory
-  confines nothing interesting.
+  confines nothing interesting. A config found in a directory is not part of the
+  policy until the user accepts it, so a repository cannot ship the policy that
+  is meant to contain it.
 - **The user reads the audit output.** Generating a profile from a hostile
   program's trace and accepting it grants exactly what the hostile program did.
 
@@ -53,6 +55,7 @@ sandbox helps.
 | Cannot load kernel modules, trace processes, or manipulate namespaces | seccomp | Enforced |
 | Cannot exceed memory, process, or CPU limits | cgroup v2 | Best-effort, and see the caveat below |
 | Cannot read your environment variables | Built environment | Enforced; only named variables cross |
+| Cannot supply its own policy | Trust store | Enforced; a discovered config applies only once accepted |
 
 ## Where the guarantees end
 

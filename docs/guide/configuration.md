@@ -13,11 +13,24 @@ From lowest precedence to highest:
    `~/.config/bailey/config.toml`.
 3. **Per-directory config.** Every `bailey.toml` found by walking up from the
    target's directory *and* from your working directory, ordered by path depth so
-   a closer file wins.
+   a closer file wins. A discovered file applies only after you have trusted it.
 4. **Explicit config.** A file passed with `--config`.
 
 Missing files are skipped. `bailey show <target>` lists the ones that were
-actually found, in order, and says which walk found each.
+actually found, in order, says which walk found each, and marks any that did not
+apply.
+
+::: warning A discovered config is inert until you accept it
+A `bailey.toml` can arrive with the code you are confining, so bailey applies one
+found by an upward walk only after `bailey trust <file>`. A run that meets an
+untrusted file proceeds with the narrower policy and reports the file rather than
+failing or prompting.
+
+This is a change in behaviour: a per-directory config that worked before stops
+applying until it is trusted once. The global config, your own profiles, and a
+file passed with `--config` are unaffected. See
+[trusting a config](/guide/trusting-a-config).
+:::
 
 ::: tip Both walks matter
 The target walk covers a program that lives with its config. The working

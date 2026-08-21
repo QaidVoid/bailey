@@ -15,6 +15,9 @@
 //! same path and records a denial, so that a path nested beneath a surviving
 //! grant is still refused. Scalar settings from a later layer override earlier
 //! ones.
+//!
+//! A per-directory file contributes only once the user has trusted it, since it
+//! may have arrived with the code being confined. See [`crate::trust`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -27,6 +30,7 @@ use crate::policy::{
     Access, DeviceRule, Egress, EgressRule, EnvPolicy, FsRule, NetworkPolicy, Policy,
     ResourceLimits,
 };
+use crate::trust::{Rejected, Store};
 
 /// Filename of a per-directory config layer.
 const CONFIG_NAME: &str = "bailey.toml";
@@ -106,6 +110,9 @@ pub fn resolve_with_bases(
         layers.push(parse_layer(label, text, &base_dir)?);
     }
     for source in discover(target, explicit) {
+        if !source.applies() {
+            continue;
+        }
         layers.push(load_layer(&source.path)?);
     }
     merge(&layers)
@@ -149,6 +156,17 @@ pub struct Source {
     pub path: PathBuf,
     /// How it was found.
     pub origin: Origin,
+    /// Why this layer does not contribute, when it does not. A file the user
+    /// supplied is never rejected; one found by an upward walk is, until it has
+    /// been trusted.
+    pub rejected: Option<Rejected>,
+}
+
+impl Source {
+    /// Whether this layer contributes to the resolved policy.
+    pub fn applies(&self) -> bool {
+        self.rejected.is_none()
+    }
 }
 
 /// A parsed config layer paired with the directory its relative paths resolve
@@ -277,6 +295,11 @@ struct Accumulator {
 /// useless when the target is an interpreter under a system path. The union is
 /// ordered by path depth so that a more specific directory always wins, and a
 /// file found by both walks contributes once.
+///
+/// A file found by a walk arrived with whatever is in that directory, so it
+/// carries the trust decision the user made about it, and contributes nothing
+/// until they have made one. The global config and an explicit `--config` are
+/// the user's own, and need no record.
 fn discover(target: &Path, explicit: Option<&Path>) -> Vec<Source> {
     let mut sources = Vec::new();
 
@@ -286,6 +309,7 @@ fn discover(target: &Path, explicit: Option<&Path>) -> Vec<Source> {
         sources.push(Source {
             path: global,
             origin: Origin::Global,
+            rejected: None,
         });
     }
 
@@ -307,9 +331,16 @@ fn discover(target: &Path, explicit: Option<&Path>) -> Vec<Source> {
     walked.sort_by_key(|entry| (entry.0, entry.1));
 
     let mut seen = BTreeSet::new();
+    let mut store = None;
     for (_, _, path, origin) in walked {
         if seen.insert(path.clone()) {
-            sources.push(Source { path, origin });
+            let store = store.get_or_insert_with(Store::load);
+            let rejected = store.check(&path);
+            sources.push(Source {
+                path,
+                origin,
+                rejected,
+            });
         }
     }
 
@@ -317,6 +348,7 @@ fn discover(target: &Path, explicit: Option<&Path>) -> Vec<Source> {
         sources.push(Source {
             path: absolute(explicit),
             origin: Origin::Explicit,
+            rejected: None,
         });
     }
 

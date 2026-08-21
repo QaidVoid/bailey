@@ -102,7 +102,7 @@ Config is TOML, merged from layers of increasing precedence:
 1. A bundled profile (`--profile`, default `untrusted`), the safe floor.
 2. Global config: `$XDG_CONFIG_HOME/bailey/config.toml`.
 3. Per-directory `bailey.toml` files, discovered by walking up from the target,
-   outermost first.
+   outermost first, and applied only once you have trusted them.
 4. An explicit file passed with `--config`.
 
 Filesystem and device grants accumulate across layers. Scalar settings from a
@@ -138,6 +138,20 @@ post_exit = ["./cleanup.sh"]        # receives BAILEY_EXIT_CODE
 
 `bailey show <target>` prints the merged result and every file that contributed
 to it. When something is unexpectedly denied, start there.
+
+A `bailey.toml` found by walking a directory can have arrived with the code you
+are confining, so it contributes nothing until you accept it once:
+
+```sh
+bailey trust ./bailey.toml     # accept it as it currently reads
+bailey trust --list            # what has been accepted, and whether it still applies
+bailey untrust ./bailey.toml   # withdraw
+```
+
+Acceptance is recorded against the file's contents, so an edit revokes it. A run
+that meets an untrusted file proceeds with the narrower policy and reports the
+file rather than prompting. Your global config, your own profiles, and a file you
+pass with `--config` need no record.
 
 ## Audit workflow
 

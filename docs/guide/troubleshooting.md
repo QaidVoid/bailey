@@ -35,6 +35,19 @@ bailey audit --save-trace trace.json ./program
 Without the audit helper installed, `strace -f -e trace=file ./program` outside the
 sandbox gives you a rougher version of the same answer.
 
+## A `bailey.toml` next to the program is ignored
+
+```
+bailey: not applying `/home/you/src/thing/bailey.toml`: you have not trusted it
+bailey:   bailey trust /home/you/src/thing/bailey.toml
+```
+
+A discovered config applies only once accepted, because a file found by walking a
+directory can have arrived with the code being confined. Run the command in the
+second line. If it says the file changed instead, it was edited since you
+accepted it: read the change and accept it again. See
+[trusting a config](/guide/trusting-a-config).
+
 ## Landlock is not enforcing
 
 ```

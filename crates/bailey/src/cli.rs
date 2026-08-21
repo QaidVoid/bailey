@@ -1,8 +1,8 @@
 //! Command-line interface.
 //!
 //! Ties config resolution, bundled profiles, hook execution, backend selection,
-//! and reconciliation together behind the `run`, `audit`, `show`, and `profile`
-//! subcommands.
+//! and reconciliation together behind the `run`, `audit`, `show`, `profile`,
+//! and `trust` subcommands.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -20,6 +20,7 @@ use crate::event::Trace;
 use crate::policy::Access;
 use crate::profiles;
 use crate::reconcile::{self, Finding, Risk};
+use crate::trust;
 
 /// Layered, deny-by-default sandbox for running untrusted programs on Linux.
 #[derive(Debug, Parser)]
@@ -39,6 +40,13 @@ enum Command {
     Show(ShowArgs),
     /// Inspect bundled profiles and generate profiles from audit traces.
     Profile(ProfileArgs),
+    /// Accept a discovered config file, or list what has been accepted.
+    Trust(TrustArgs),
+    /// Withdraw a config file's acceptance.
+    Untrust {
+        /// The config file to stop applying.
+        path: PathBuf,
+    },
     /// Report what this host can enforce, and what each gap costs.
     Doctor,
     /// Emit a shell completion script, generated from these commands.
@@ -118,6 +126,16 @@ struct ShowArgs {
 }
 
 #[derive(Debug, clap::Args)]
+struct TrustArgs {
+    /// The config file to accept, recording it as it currently reads.
+    #[arg(required_unless_present = "list")]
+    path: Option<PathBuf>,
+    /// List accepted config files and whether each still applies.
+    #[arg(long, conflicts_with = "path")]
+    list: bool,
+}
+
+#[derive(Debug, clap::Args)]
 struct ProfileArgs {
     #[command(subcommand)]
     command: ProfileCommand,
@@ -173,6 +191,8 @@ fn dispatch(command: Command) -> anyhow::Result<i32> {
         Command::Audit(args) => cmd_audit(args),
         Command::Show(args) => cmd_show(args),
         Command::Profile(args) => cmd_profile(args),
+        Command::Trust(args) => cmd_trust(args),
+        Command::Untrust { path } => cmd_untrust(&path),
         Command::Doctor => cmd_doctor(),
         Command::Completions { shell } => {
             // Generated rather than maintained, so it cannot drift from the
@@ -271,6 +291,7 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
     let (program, program_args) = split_command(args.command)?;
     let profile = select_profile(args.profile.as_deref(), &program)?;
     let resolved = resolve(&profile, &program, args.config.as_deref())?;
+    report_untrusted(&program, args.config.as_deref());
     warn_if_target_denied(&resolved.policy, &program);
     let target = Target {
         program,
@@ -304,6 +325,7 @@ fn cmd_audit(args: AuditArgs) -> anyhow::Result<i32> {
     let (program, program_args) = split_command(args.command)?;
     let profile = select_profile(args.profile.as_deref(), &program)?;
     let resolved = resolve(&profile, &program, args.config.as_deref())?;
+    report_untrusted(&program, args.config.as_deref());
     let target_dir = target_dir(&program);
     let target = Target {
         program,
@@ -384,6 +406,70 @@ fn cmd_profile(args: ProfileArgs) -> anyhow::Result<i32> {
             Ok(0)
         }
         ProfileCommand::Generate(args) => cmd_profile_generate(args),
+    }
+}
+
+/// Accept a config file, so that discovery may apply it.
+///
+/// Acceptance is a command rather than a prompt during a run. A question asked
+/// while someone is trying to get on with something else is answered
+/// reflexively, and a run has to work where nobody is present to answer at all.
+fn cmd_trust(args: TrustArgs) -> anyhow::Result<i32> {
+    let mut store = trust::Store::load();
+
+    if args.list {
+        let entries = store.listing();
+        if entries.is_empty() {
+            println!("no config files have been trusted");
+            return Ok(0);
+        }
+        for (path, rejected) in entries {
+            match rejected {
+                None => println!("  {:<10} {}", "ok", path.display()),
+                Some(reason) => println!("  {:<10} {}", reason.word(), path.display()),
+            }
+        }
+        return Ok(0);
+    }
+
+    let path = args
+        .path
+        .expect("clap requires a path unless --list is given");
+    let recorded = store.record(&path).map_err(|err| anyhow::anyhow!(err))?;
+    store.save().map_err(|err| anyhow::anyhow!(err))?;
+    println!("trusted {}", recorded.display());
+    Ok(0)
+}
+
+fn cmd_untrust(path: &Path) -> anyhow::Result<i32> {
+    let mut store = trust::Store::load();
+    let path = absolute(path);
+    if !store.forget(&path) {
+        anyhow::bail!("`{}` was not trusted", path.display());
+    }
+    store.save().map_err(|err| anyhow::anyhow!(err))?;
+    println!("no longer trusting {}", path.display());
+    Ok(0)
+}
+
+/// Report every discovered config that was found but did not apply.
+///
+/// A run proceeds with the narrower policy rather than failing, so this report
+/// is the only thing that connects "the program cannot read its own directory"
+/// to the file that would have granted it.
+fn report_untrusted(target: &Path, explicit: Option<&Path>) {
+    for source in config::sources(target, explicit) {
+        let Some(rejected) = &source.rejected else {
+            continue;
+        };
+        eprintln!(
+            "bailey: not applying `{}`: {}",
+            source.path.display(),
+            rejected.reason()
+        );
+        if let Some(remedy) = rejected.remedy(&source.path) {
+            eprintln!("bailey:   {remedy}");
+        }
     }
 }
 
@@ -551,10 +637,38 @@ fn print_sources(profile: &str, target: &Path, explicit: Option<&Path>) {
     let sources = config::sources(target, explicit);
     if sources.is_empty() {
         println!("config layers: (none)");
-    } else {
-        println!("config layers (low to high precedence):");
-        for source in sources {
-            println!("  {} ({})", source.path.display(), source.origin.label());
+        println!();
+        return;
+    }
+
+    println!("config layers (low to high precedence):");
+    for source in &sources {
+        match &source.rejected {
+            None => println!("  {} ({})", source.path.display(), source.origin.label()),
+            Some(rejected) => println!(
+                "  {} ({}) [not applied: {}]",
+                source.path.display(),
+                source.origin.label(),
+                rejected.reason()
+            ),
+        }
+    }
+
+    // The policy below is the one that will apply, so the layers missing from
+    // it have to be visible here or the gap looks like a bug in the resolver.
+    let remedies: Vec<String> = sources
+        .iter()
+        .filter_map(|source| {
+            source
+                .rejected
+                .as_ref()
+                .and_then(|rejected| rejected.remedy(&source.path))
+        })
+        .collect();
+    if !remedies.is_empty() {
+        println!("\nto apply what was skipped:");
+        for remedy in remedies {
+            println!("  {remedy}");
         }
     }
     println!();

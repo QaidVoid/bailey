@@ -8,6 +8,8 @@ Commands:
   audit    Run a target under audit, recording its access and reconciling it
   show     Resolve and print the effective policy for a target
   profile  Inspect bundled profiles and generate profiles from audit traces
+  trust    Accept a discovered config file, or list what has been accepted
+  untrust  Withdraw a config file's acceptance
 ```
 
 ## `bailey run`
@@ -66,13 +68,40 @@ Requires the privileged audit helper. See [installation](/guide/installation).
 bailey show [OPTIONS] <TARGET>
 ```
 
-Prints the profile base, every config file that contributed in precedence order,
+Prints the profile base, every config file that was found in precedence order,
 and the merged policy. Exits 0.
 
 | Option | Description |
 | --- | --- |
 | `-c, --config <FILE>` | Explicit config file |
 | `-p, --profile <NAME>` | Bundled profile used as the base |
+
+A discovered file that did not apply is listed with the reason, followed by the
+command that would accept it, so the policy explains its own gaps.
+
+## `bailey trust`
+
+```
+bailey trust <PATH>
+bailey trust --list
+```
+
+Accepts a discovered config file, recording it as it currently reads, so that
+discovery may apply it. With `--list`, prints each accepted path and whether it
+still applies: `ok`, `changed`, `not yours`, `writable`, or `unreadable`.
+
+A file owned by another user, or writable by group or by everyone, is refused.
+
+## `bailey untrust`
+
+```
+bailey untrust <PATH>
+```
+
+Withdraws acceptance, so the file stops contributing. Exits non-zero if the path
+was not accepted in the first place.
+
+See [trusting a config](/guide/trusting-a-config).
 
 ## `bailey doctor`
 
@@ -127,6 +156,7 @@ number excluded is reported on stderr.
 | `BAILEY_BPF_HELPER` | Path to the privileged audit helper |
 | `BAILEY_CGROUP_ROOT` | Cgroup to create runs in, when the search finds the wrong one |
 | `XDG_CONFIG_HOME` | Location of the global config, `$XDG_CONFIG_HOME/bailey/config.toml` |
+| `XDG_DATA_HOME` | Location of the trust store, `$XDG_DATA_HOME/bailey/trusted.toml`, and of private homes |
 | `HOME` | Used for `~` expansion in config, and for the global config fallback |
 
 Set for hook commands:

@@ -10,19 +10,31 @@ fn bailey() -> &'static str {
 #[test]
 fn working_directory_config_applies_to_a_system_interpreter() {
     let dir = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap();
     let marker = dir.path().join("marker-dir");
     fs::create_dir(&marker).unwrap();
+    let config = dir.path().join("bailey.toml");
     fs::write(
-        dir.path().join("bailey.toml"),
+        &config,
         format!("[filesystem]\nread = [\"{}\"]\n", marker.display()),
     )
     .unwrap();
+
+    // A discovered config is inert until accepted, so this test accepts it and
+    // then asks what the walk found.
+    Command::new(bailey())
+        .arg("trust")
+        .arg(&config)
+        .env("XDG_DATA_HOME", store.path())
+        .output()
+        .unwrap();
 
     // The target lives under a system path, so the upward walk from the target
     // finds nothing; only the working directory walk can find this config.
     let output = Command::new(bailey())
         .args(["show", "/usr/bin/true"])
         .current_dir(dir.path())
+        .env("XDG_DATA_HOME", store.path())
         .output()
         .unwrap();
 
