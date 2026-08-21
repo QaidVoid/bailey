@@ -11,6 +11,8 @@ Commands:
   profile  Inspect bundled profiles and generate profiles from audit traces
   trust    Accept a discovered config file, or list what has been accepted
   untrust  Withdraw a config file's acceptance
+  hook     Emit shell integration, so a directory's policy announces itself
+  doctor   Report what this host can enforce, and what each gap costs
 ```
 
 ## `bailey run`
@@ -135,6 +137,30 @@ Withdraws acceptance, so the file stops contributing. Exits non-zero if the path
 was not accepted in the first place.
 
 See [trusting a config](/guide/trusting-a-config).
+
+## `bailey hook`
+
+```
+bailey hook fish [--ask] [--wrap]
+bailey hook bash [--ask] [--wrap]
+bailey hook status [--porcelain]
+bailey hook list-wrapped
+```
+
+Emits shell integration code to evaluate from your shell config. Entering a
+directory that contains a `bailey.toml` then announces it, once.
+
+| Option | Description |
+| --- | --- |
+| `--ask` | Offer to enter a confined shell rather than only mentioning one. Never offers to trust a config |
+| `--wrap` | Define a function for each program your own profiles claim with `applies_to` |
+
+`bailey hook status` prints what the hook would say about the current directory,
+and is what the emitted code calls; `--porcelain` prefixes a state and a tab.
+`bailey hook list-wrapped` names the programs `--wrap` shadows.
+
+A shell with no integration is refused rather than given untested code. See
+[shell integration](/guide/hook).
 
 ## `bailey doctor`
 

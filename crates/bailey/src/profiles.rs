@@ -185,6 +185,24 @@ pub fn for_target(target: &Path) -> Result<Option<String>, String> {
     }
 }
 
+/// Every program name claimed by a user profile, sorted and without repeats.
+///
+/// Only bare names are returned. A claim written as a path names one executable,
+/// and a shell function of that name would apply to every program with the same
+/// file name, which is the opposite of what the path was for.
+pub fn claimed_names() -> Vec<String> {
+    let mut names: Vec<String> = user_profiles()
+        .into_iter()
+        .filter_map(|(_, path)| std::fs::read_to_string(&path).ok())
+        .filter_map(|text| toml::from_str::<Claims>(&text).ok())
+        .flat_map(|claims| claims.applies_to)
+        .filter(|claim| !claim.contains('/'))
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
 #[derive(serde::Deserialize)]
 struct Claims {
     #[serde(default)]

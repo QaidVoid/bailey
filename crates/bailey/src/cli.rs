@@ -17,6 +17,7 @@ use crate::backend::{
 };
 use crate::config::{self, Resolved};
 use crate::event::Trace;
+use crate::hook::{self, Shell};
 use crate::policy::Access;
 use crate::profiles;
 use crate::reconcile::{self, Finding, Risk};
@@ -49,6 +50,8 @@ enum Command {
         /// The config file to stop applying.
         path: PathBuf,
     },
+    /// Emit shell integration, so a directory's policy announces itself.
+    Hook(HookArgs),
     /// Report what this host can enforce, and what each gap costs.
     Doctor,
     /// Emit a shell completion script, generated from these commands.
@@ -155,6 +158,42 @@ struct TrustArgs {
 }
 
 #[derive(Debug, clap::Args)]
+struct HookArgs {
+    #[command(subcommand)]
+    command: HookCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum HookCommand {
+    /// Emit integration for fish: `bailey hook fish | source`.
+    Fish(HookOptions),
+    /// Emit integration for bash: `eval "$(bailey hook bash)"`.
+    Bash(HookOptions),
+    /// Print what the hook should say about the current directory.
+    Status {
+        /// Print a state and the message, tab separated, for the snippets.
+        #[arg(long)]
+        porcelain: bool,
+    },
+    /// List the programs `--wrap` defines functions for.
+    ListWrapped,
+}
+
+#[derive(Debug, clap::Args)]
+struct HookOptions {
+    /// Offer to enter a confined shell rather than only mentioning one.
+    ///
+    /// Never offers to trust a config: accepting one stays a deliberate act,
+    /// away from whatever you were in the middle of.
+    #[arg(long)]
+    ask: bool,
+    /// Define a function for each program your own profiles claim, so running
+    /// it by name runs it under bailey.
+    #[arg(long)]
+    wrap: bool,
+}
+
+#[derive(Debug, clap::Args)]
 struct ProfileArgs {
     #[command(subcommand)]
     command: ProfileCommand,
@@ -213,6 +252,7 @@ fn dispatch(command: Command) -> anyhow::Result<i32> {
         Command::Profile(args) => cmd_profile(args),
         Command::Trust(args) => cmd_trust(args),
         Command::Untrust { path } => cmd_untrust(&path),
+        Command::Hook(args) => cmd_hook(args),
         Command::Doctor => cmd_doctor(),
         Command::Completions { shell } => {
             // Generated rather than maintained, so it cannot drift from the
@@ -234,6 +274,39 @@ fn dispatch(command: Command) -> anyhow::Result<i32> {
 /// Presence alone is not useful: "Landlock: yes" does not say whether network
 /// policy will be enforced, which needs ABI 4. The consequence is the part a
 /// user can act on.
+/// Emit shell integration, or answer the question it asks.
+fn cmd_hook(args: HookArgs) -> anyhow::Result<i32> {
+    match args.command {
+        HookCommand::Fish(options) => {
+            print!("{}", hook::snippet(Shell::Fish, options.ask, options.wrap));
+        }
+        HookCommand::Bash(options) => {
+            print!("{}", hook::snippet(Shell::Bash, options.ask, options.wrap));
+        }
+        HookCommand::Status { porcelain } => {
+            let notice = hook::notice();
+            if porcelain {
+                let line = notice.porcelain();
+                if !line.is_empty() {
+                    println!("{line}");
+                }
+            } else if let Some(message) = notice.message() {
+                println!("{message}");
+            }
+        }
+        HookCommand::ListWrapped => {
+            let names = profiles::claimed_names();
+            if names.is_empty() {
+                println!("no programs are claimed by your profiles; add `applies_to` to one");
+            }
+            for name in names {
+                println!("{name}");
+            }
+        }
+    }
+    Ok(0)
+}
+
 fn cmd_doctor() -> anyhow::Result<i32> {
     let caps = probe::probe(true);
     let mut degraded = false;

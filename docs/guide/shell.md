@@ -80,6 +80,11 @@ sits inside a home the shell can otherwise write. The same holds for a read gran
 on something inside the launch directory. See
 [the policy model](/guide/policy-model#grants-bailey-adds-for-you).
 
+## Being told a directory has a policy
+
+`bailey shell` still has to be typed. [Shell integration](/guide/hook) announces
+a directory's policy when you enter it, and can offer to start the shell for you.
+
 ## Knowing you are in one
 
 Bailey sets `BAILEY_SANDBOX`, `BAILEY_SANDBOX_NET`, and `BAILEY_SANDBOX_DIR`, and

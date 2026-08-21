@@ -84,6 +84,9 @@ bailey run ./program
 # covered by the directory's policy, prefix or no prefix.
 bailey shell
 
+# Have a directory's policy announce itself when you enter it.
+bailey hook fish | source     # or: eval "$(bailey hook bash)"
+
 # Start from a profile shaped for native Linux games.
 bailey run --profile native-game ./game
 
