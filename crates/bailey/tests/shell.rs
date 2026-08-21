@@ -257,8 +257,16 @@ fn the_marker_variables_reach_a_command_inside() {
     let shown = stdout(&output);
 
     assert!(shown.contains("marker=1"), "{shown}");
+    // Which network the run got depends on the host: without user namespaces
+    // there is no namespace to build. What matters is that the marker says which
+    // one, since a nested run reads it rather than guessing.
+    let network = if isolation_active() {
+        "net=isolated"
+    } else {
+        "net=host"
+    };
     assert!(
-        shown.contains("net=isolated"),
+        shown.contains(network),
         "the network the sandbox built is published, so a nested run can report \
          what it inherited rather than guess: {shown}"
     );
