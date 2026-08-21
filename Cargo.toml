@@ -19,3 +19,4 @@ default-members = ["crates/bailey", "crates/bailey-common"]
 [workspace.package]
 edition = "2024"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/QaidVoid/bailey"

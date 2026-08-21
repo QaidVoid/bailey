@@ -1,0 +1,61 @@
+name: release-plz
+
+# Two halves. `release-pr` keeps a pull request open that bumps the version and
+# writes the changelog from the commits since the last release; merging it is
+# what decides to release. `release` then tags that merge and creates the GitHub
+# release, which is what `release.yml` attaches binaries to.
+#
+# Needs a RELEASE_PLZ_TOKEN secret, a fine-grained PAT with contents and
+# pull-requests write. The default GITHUB_TOKEN would work for tagging but a pull
+# request opened with it does not trigger CI, so the release PR would never be
+# checked by the thing that checks everything else.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+
+  release-pr:
+    name: release pr
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PLZ_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
