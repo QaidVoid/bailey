@@ -76,12 +76,15 @@ bailey shell --profile shell
 
 A read grant stays a read grant: the path is remounted read-only inside the
 sandbox, so a program in there cannot rewrite your editor config even though it
-sits inside a home the shell can otherwise write.
+sits inside a home the shell can otherwise write. The same holds for a read grant
+on something inside the launch directory. See
+[the policy model](/guide/policy-model#grants-bailey-adds-for-you).
 
 ## Knowing you are in one
 
-Bailey sets `BAILEY_SANDBOX` and `BAILEY_SANDBOX_DIR` and leaves your prompt
-alone, since every shell spells its own and the prompt is yours.
+Bailey sets `BAILEY_SANDBOX`, `BAILEY_SANDBOX_NET`, and `BAILEY_SANDBOX_DIR`, and
+leaves your prompt alone, since every shell spells its own and the prompt is
+yours.
 
 ```fish
 # fish
@@ -116,13 +119,27 @@ is the whole mechanism.
 **Add isolation to a shell inside a shell.** Nesting works and the policies
 intersect, so the inner shell is never wider than the outer one. But the seccomp
 filter denies `unshare` and `mount`, so the inner run cannot build a second
-world. It says so and continues with Landlock:
+world. It does not need to: the outer one is inherited and cannot be left.
 
 ```
 bailey: note: already inside a sandbox for `/home/you/projects/thing`. Its policy
 still applies and this one can only narrow it further; the isolation layer cannot
 be entered a second time.
+bailey: enforced: landlock, seccomp, network namespace (inherited), namespace isolation (inherited)
 ```
+
+Two things follow from that, and are worth knowing before they confuse you:
+
+- **A nested run cannot see your trust store.** `$HOME` inside the sandbox is the
+  private home, so the store is not there and cannot be. Discovered configs
+  therefore do not apply inside, and the run says the store is unreachable rather
+  than claiming you never trusted the file. `bailey trust` from inside is refused
+  for the same reason: the record would go into a home that is discarded.
+- **Editing a config from inside changes nothing you can use.** The shell you are
+  in resolved its policy when it started. A shell you start after the edit
+  intersects with the one you are in, so a config edited to grant *more* grants
+  nothing. This is the property that makes the launch directory safe to hand to a
+  program: it can rewrite the policy file, and rewriting it cannot help it.
 
 **Stop you from leaving.** Exit the shell and you are back to your ordinary
 authority. This is a tool for scoping work, not a jail.

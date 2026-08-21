@@ -333,6 +333,7 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
             Summary::Text
         },
         always_cgroup: false,
+        implicit_write: Vec::new(),
     };
     let code = backend.run(&resolved.policy, &target)?;
     if let Err(err) = resolved.hooks.run_post_exit(code) {
@@ -363,14 +364,10 @@ fn cmd_shell(args: ShellArgs) -> anyhow::Result<i32> {
     if resolved.policy.home.is_none() {
         resolved.policy.home = Some(world::directory_home(&dir));
     }
-    // A marker rather than a modified prompt: every shell spells its prompt
-    // differently, and the prompt belongs to the user. `env.deny` still removes
-    // these, since denials are applied last.
-    resolved
-        .policy
-        .env
-        .set
-        .insert("BAILEY_SANDBOX".into(), "1".into());
+    // `BAILEY_SANDBOX` comes with any confined run. This names the directory the
+    // policy was resolved for, which is the part a prompt wants to show, and it
+    // is a marker rather than a modified prompt because every shell spells its
+    // own and the prompt belongs to the user.
     resolved
         .policy
         .env
@@ -390,6 +387,9 @@ fn cmd_shell(args: ShellArgs) -> anyhow::Result<i32> {
         // Before the shell takes the terminal, rather than as the user leaves.
         summary: Summary::Established,
         always_cgroup: false,
+        // The launch directory is granted for writing on the user's behalf, so
+        // a narrower grant their config makes beneath it is kept narrow.
+        implicit_write: vec![dir.clone()],
     };
     let code = backend.run(&resolved.policy, &target)?;
     if let Err(err) = resolved.hooks.run_post_exit(code) {
@@ -589,6 +589,8 @@ fn cmd_trust(args: TrustArgs) -> anyhow::Result<i32> {
     let path = args
         .path
         .expect("clap requires a path unless --list is given");
+    // `record` refuses when the store is unreachable, which is what keeps a
+    // trust command run from inside a sandbox from looking like it worked.
     let recorded = store.record(&path).map_err(|err| anyhow::anyhow!(err))?;
     store.save().map_err(|err| anyhow::anyhow!(err))?;
     println!("trusted {}", recorded.display());
@@ -888,7 +890,7 @@ fn print_policy(resolved: &Resolved, target: &Path) {
     }
 
     println!("environment:");
-    for (name, value) in world::environment(policy, &world) {
+    for (name, value) in world::environment(policy, &world, mode) {
         let origin = if policy.env.set.contains_key(&name) {
             "set"
         } else if policy.env.passes(&name) {

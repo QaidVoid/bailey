@@ -34,6 +34,9 @@ pub enum Rejected {
     Writable(String),
     /// The file could not be read in order to check it.
     Unreadable(String),
+    /// The trust store itself cannot be read from where this run is standing,
+    /// so nothing can be said about whether the file was accepted.
+    StoreUnreachable,
 }
 
 impl Rejected {
@@ -45,6 +48,7 @@ impl Rejected {
             Rejected::Owned(_) => "not yours",
             Rejected::Writable(_) => "writable",
             Rejected::Unreadable(_) => "unreadable",
+            Rejected::StoreUnreachable => "unknown",
         }
     }
 
@@ -56,6 +60,9 @@ impl Rejected {
             Rejected::Owned(owner) => format!("it is owned by {owner}, not by you"),
             Rejected::Writable(who) => format!("it is writable by {who}"),
             Rejected::Unreadable(err) => format!("it could not be read: {err}"),
+            Rejected::StoreUnreachable => "the trust store is not reachable from \
+                 inside a sandbox, so nothing here is known to be trusted"
+                .into(),
         }
     }
 
@@ -68,15 +75,32 @@ impl Rejected {
                 path.display()
             )),
             Rejected::Writable(_) => Some(format!("chmod go-w {}", path.display())),
-            Rejected::Owned(_) | Rejected::Unreadable(_) => None,
+            // Deliberately no remedy: `bailey trust` from in here would write a
+            // record into a private home that is discarded when the run ends,
+            // which would look like it worked.
+            Rejected::Owned(_) | Rejected::Unreadable(_) | Rejected::StoreUnreachable => None,
         }
     }
 }
 
 /// The set of config files the user has accepted.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Store {
     entries: BTreeMap<PathBuf, String>,
+    /// Whether the store could be read at all. A store that is simply absent is
+    /// reachable and empty; one that cannot be reached from inside a sandbox is
+    /// a different answer, and saying "you have not trusted this" there would be
+    /// a claim bailey cannot support.
+    reachable: bool,
+}
+
+impl Default for Store {
+    fn default() -> Self {
+        Store {
+            entries: BTreeMap::new(),
+            reachable: true,
+        }
+    }
 }
 
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -91,8 +115,15 @@ impl Store {
     /// A missing store is an empty one, so a first run needs no setup.
     pub fn load() -> Store {
         match store_path() {
-            Some(path) => Store::load_from(&path),
-            None => Store::default(),
+            Some(path) if path.exists() => Store::load_from(&path),
+            // Inside a sandbox the data directory is the private home, so the
+            // user's store is not there and cannot be. Reading that as "nothing
+            // is trusted" would report every discovered config as unaccepted.
+            _ if crate::backend::world::inside_sandbox() => Store {
+                reachable: false,
+                ..Store::default()
+            },
+            _ => Store::default(),
         }
     }
 
@@ -108,6 +139,7 @@ impl Store {
                     .into_iter()
                     .map(|(path, digest)| (PathBuf::from(path), digest))
                     .collect(),
+                reachable: true,
             },
             Err(err) => {
                 // Reading an unparseable store as empty would quietly drop
@@ -153,6 +185,9 @@ impl Store {
 
     /// Whether `path` may contribute to a policy, and why not when it may not.
     pub fn check(&self, path: &Path) -> Option<Rejected> {
+        if !self.reachable {
+            return Some(Rejected::StoreUnreachable);
+        }
         let path = absolute(path);
         let meta = match fs::metadata(&path) {
             Ok(meta) => meta,
@@ -177,6 +212,14 @@ impl Store {
 
     /// Record trust in `path` as it currently reads.
     pub fn record(&mut self, path: &Path) -> Result<PathBuf, String> {
+        if !self.reachable {
+            return Err(
+                "the trust store is not reachable from inside a sandbox: a record \
+                 written here would go into a private home that is discarded when \
+                 the run ends. Trust the file from outside the sandbox."
+                    .into(),
+            );
+        }
         let path = absolute(path);
         let meta = fs::metadata(&path)
             .map_err(|err| format!("could not read `{}`: {err}", path.display()))?;

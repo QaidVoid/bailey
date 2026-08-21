@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::backend::network::{Inherited, NetworkMode};
 use crate::policy::Policy;
 
 /// The `PATH` handed to a target, rather than the caller's, which commonly
@@ -44,6 +45,10 @@ const RUNTIME_DIR_VARS: &[&str] = &[
 
 /// Variables that only make sense when the X11 socket directory is granted.
 const X11_VARS: &[&str] = &["DISPLAY", "XAUTHORITY"];
+
+/// Set in every confined environment, so a bailey run from inside a sandbox can
+/// tell that one is already in force.
+const SANDBOX_MARKER: &str = "BAILEY_SANDBOX";
 
 /// Where the target's home, temporary storage, and working directory are.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,27 +125,57 @@ impl World {
 
     /// Create the private home on the host if it is not there yet, reporting the
     /// path the first time so the user can find what the target writes.
-    pub fn prepare(&self) -> std::io::Result<()> {
+    ///
+    /// `nested` says this run is itself inside a sandbox, in which case the path
+    /// is one inside that sandbox rather than one on the host, and saying so
+    /// keeps it from reading as though the real home was touched.
+    pub fn prepare(&self, nested: bool) -> std::io::Result<()> {
         let Some(home) = &self.home_host else {
             return Ok(());
         };
         if !home.exists() {
             std::fs::create_dir_all(home)?;
-            eprintln!("bailey: created private home at {}", home.display());
+            let where_ = if nested {
+                " (inside the sandbox this run is in)"
+            } else {
+                ""
+            };
+            eprintln!("bailey: created private home at {}{where_}", home.display());
         }
         Ok(())
     }
+}
+
+/// Whether this process is already confined by an outer bailey run.
+///
+/// There is no way to ask the kernel "am I restricted by Landlock", and a
+/// seccomp filter in `/proc/self/status` does not say whose it is, so the marker
+/// bailey puts in every confined environment is what answers this.
+pub fn inside_sandbox() -> bool {
+    std::env::var_os(SANDBOX_MARKER).is_some()
 }
 
 /// Build the environment the target will receive.
 ///
 /// The result is the whole environment: it is applied to a cleared environment,
 /// so anything absent here does not reach the target.
-pub fn environment(policy: &Policy, world: &World) -> Vec<(String, String)> {
+pub fn environment(policy: &Policy, world: &World, network: NetworkMode) -> Vec<(String, String)> {
     let mut env: BTreeMap<String, String> = BTreeMap::new();
 
     env.insert("PATH".into(), SANDBOX_PATH.into());
     env.insert("HOME".into(), world.home_inside.display().to_string());
+    // So that a bailey run from inside a sandbox knows one is already in force,
+    // and can report what it inherited rather than what it could not build. A
+    // program can tell it is confined by the shape of the world around it
+    // anyway, so saying it plainly gives nothing away.
+    env.insert(SANDBOX_MARKER.into(), "1".into());
+    // Which network the inner run will inherit. A nested run cannot build its
+    // own, so this is the difference between correctly saying nothing and
+    // wrongly warning that UDP is unrestricted.
+    env.insert(
+        "BAILEY_SANDBOX_NET".into(),
+        Inherited::publish(network).into(),
+    );
     if world.private_tmp {
         env.insert("TMPDIR".into(), "/tmp".into());
     }
@@ -328,7 +363,7 @@ mod tests {
         unsafe { std::env::set_var("BAILEY_TEST_SECRET", "hunter2") };
         let policy = policy_granting(&["/usr"]);
         let world = World::derive(Path::new("/opt/game/game"), &policy, false);
-        let env = environment(&policy, &world);
+        let env = environment(&policy, &world, NetworkMode::Isolated);
         assert!(!env.iter().any(|(name, _)| name == "BAILEY_TEST_SECRET"));
         assert!(env.iter().any(|(name, _)| name == "PATH"));
         assert!(env.iter().any(|(name, _)| name == "HOME"));
@@ -344,7 +379,9 @@ mod tests {
         policy.env.deny = vec!["TERM".into()];
 
         let world = World::derive(Path::new("/opt/game/game"), &policy, false);
-        let env: BTreeMap<_, _> = environment(&policy, &world).into_iter().collect();
+        let env: BTreeMap<_, _> = environment(&policy, &world, NetworkMode::Isolated)
+            .into_iter()
+            .collect();
 
         assert_eq!(
             env.get("BAILEY_TEST_PASSED").map(String::as_str),
@@ -359,18 +396,56 @@ mod tests {
     }
 
     #[test]
+    fn the_sandbox_marker_is_in_the_base_set_and_can_be_denied() {
+        let policy = policy_granting(&["/usr"]);
+        let world = World::derive(Path::new("/opt/game/game"), &policy, false);
+
+        let env: BTreeMap<_, _> = environment(&policy, &world, NetworkMode::Isolated)
+            .into_iter()
+            .collect();
+        assert_eq!(env.get(SANDBOX_MARKER).map(String::as_str), Some("1"));
+        assert_eq!(
+            env.get("BAILEY_SANDBOX_NET").map(String::as_str),
+            Some("isolated"),
+            "a nested run reads this rather than guessing what it inherited"
+        );
+
+        let host: BTreeMap<_, _> = environment(&policy, &world, NetworkMode::LandlockOnly)
+            .into_iter()
+            .collect();
+        assert_eq!(
+            host.get("BAILEY_SANDBOX_NET").map(String::as_str),
+            Some("host")
+        );
+
+        let mut denied = policy.clone();
+        denied.env.deny = vec![SANDBOX_MARKER.into()];
+        let env: BTreeMap<_, _> = environment(&denied, &world, NetworkMode::Isolated)
+            .into_iter()
+            .collect();
+        assert!(
+            !env.contains_key(SANDBOX_MARKER),
+            "it is an ordinary variable, removable like any other"
+        );
+    }
+
+    #[test]
     fn display_variables_follow_their_grant() {
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", "/run/user/4242") };
         unsafe { std::env::set_var("WAYLAND_DISPLAY", "wayland-0") };
 
         let without = policy_granting(&["/usr"]);
         let world = World::derive(Path::new("/opt/game/game"), &without, false);
-        let env: BTreeMap<_, _> = environment(&without, &world).into_iter().collect();
+        let env: BTreeMap<_, _> = environment(&without, &world, NetworkMode::Isolated)
+            .into_iter()
+            .collect();
         assert!(!env.contains_key("WAYLAND_DISPLAY"));
 
         let with = policy_granting(&["/usr", "/run/user/4242"]);
         let world = World::derive(Path::new("/opt/game/game"), &with, false);
-        let env: BTreeMap<_, _> = environment(&with, &world).into_iter().collect();
+        let env: BTreeMap<_, _> = environment(&with, &world, NetworkMode::Isolated)
+            .into_iter()
+            .collect();
         assert_eq!(
             env.get("WAYLAND_DISPLAY").map(String::as_str),
             Some("wayland-0")

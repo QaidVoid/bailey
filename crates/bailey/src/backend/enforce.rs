@@ -120,6 +120,14 @@ pub struct EnforceBackend {
     /// Put the target in a cgroup of its own even when the policy sets no
     /// limits, so something else can scope to it.
     pub always_cgroup: bool,
+    /// Writable paths granted on the user's behalf rather than by their config.
+    ///
+    /// A grant beneath one of these that the user wrote without write access is
+    /// kept unwritable, since they never asked for the wider grant that would
+    /// otherwise swallow it. The private home and private temporary storage are
+    /// found from the world; this is for the ones a command adds, such as a
+    /// confined shell's launch directory.
+    pub implicit_write: Vec<PathBuf>,
 }
 
 /// How a run reports what it enforced.
@@ -164,14 +172,29 @@ impl EnforceBackend {
         // User namespaces gate both the isolation layer and the network
         // namespace, so the host is probed once for both.
         let userns = isolation::available();
+        // Inside a sandbox the probe fails because our own seccomp filter denies
+        // `unshare`, not because the host lacks anything. The namespaces of the
+        // outer sandbox are still in force: they are properties of the process,
+        // inherited and impossible to drop.
+        let nested = world::inside_sandbox();
+        let inherited = network::Inherited::detect();
         let mode = network::select(policy, userns);
-        network::report(mode, policy);
+        network::report(mode, policy, inherited);
 
         let mut report = RunReport::default();
         report.applied("landlock");
         report.applied("seccomp");
         match mode {
             NetworkMode::Isolated => report.applied("network namespace"),
+            NetworkMode::LandlockOnly
+                if !userns && inherited == network::Inherited::IsolatedNamespace =>
+            {
+                report.applied("network namespace (inherited)")
+            }
+            NetworkMode::LandlockOnly if !userns && nested => report.skipped(
+                "network namespace",
+                "inside a sandbox that did not create one, so only TCP is restricted",
+            ),
             // A policy that allows egress cannot use an empty namespace, which
             // is a consequence of the policy rather than a gap in the host.
             NetworkMode::LandlockOnly if !userns => report.skipped(
@@ -183,7 +206,7 @@ impl EnforceBackend {
 
         let isolated = self.isolate && userns;
         let world = World::derive(&target.program, policy, isolated);
-        world.prepare().map_err(BackendError::Io)?;
+        world.prepare(nested).map_err(BackendError::Io)?;
         if isolated && !world.kept_invocation_dir {
             // Naming the host path matters: inside the sandbox the private home
             // sits at the real home's path, so printing that would read as
@@ -207,7 +230,17 @@ impl EnforceBackend {
         let isolation = if self.isolate {
             if userns {
                 report.applied("namespace isolation");
-                Some(build_isolation_plan(policy, mode, &world))
+                Some(build_isolation_plan(
+                    policy,
+                    mode,
+                    &world,
+                    &self.implicit_write,
+                ))
+            } else if nested {
+                // A second world cannot be built, and does not need to be: this
+                // process is already inside one that it cannot leave.
+                report.applied("namespace isolation (inherited)");
+                None
             } else {
                 report.skipped(
                     "namespace isolation",
@@ -224,7 +257,7 @@ impl EnforceBackend {
         };
 
         if isolation.is_none() {
-            report_unenforceable_denials(policy);
+            report_unenforceable_denials(policy, nested);
         }
 
         // Without the isolation layer, the network namespace is entered on its
@@ -255,7 +288,7 @@ impl EnforceBackend {
         // The environment is built rather than inherited, so a caller's
         // credentials do not cross into the sandbox.
         command.env_clear();
-        command.envs(world::environment(policy, &world));
+        command.envs(world::environment(policy, &world, mode));
         // Under isolation the working directory is entered after the pivot,
         // since the path only exists in the reconstructed root. Outside it, the
         // caller's directory is simply inherited.
@@ -500,7 +533,12 @@ impl LandlockPlan {
 /// A denied path is never bound. Where a denial sits beneath a path that is
 /// bound, it arrives with its parent and is covered over instead, which is what
 /// makes a nested denial enforceable: Landlock rules can only add access.
-fn build_isolation_plan(policy: &Policy, mode: NetworkMode, world: &World) -> IsolationPlan {
+fn build_isolation_plan(
+    policy: &Policy,
+    mode: NetworkMode,
+    world: &World,
+    implicit_write: &[PathBuf],
+) -> IsolationPlan {
     let denied = |path: &Path| policy.denied.iter().any(|deny| path.starts_with(deny));
 
     let mut paths: Vec<PathBuf> = policy
@@ -549,7 +587,7 @@ fn build_isolation_plan(policy: &Policy, mode: NetworkMode, world: &World) -> Is
         .collect();
 
     let mut read_only = policy.read_only.clone();
-    read_only.extend(unwritable_inside_home(policy, world));
+    read_only.extend(unwritable_beneath_implicit(policy, world, implicit_write));
 
     IsolationPlan {
         binds,
@@ -569,28 +607,46 @@ fn build_isolation_plan(policy: &Policy, mode: NetworkMode, world: &World) -> Is
     }
 }
 
-/// Granted paths that live inside the private home and were not granted write.
+/// Granted paths that sit beneath something bailey granted for writing on the
+/// user's behalf, and that the user did not grant for writing.
 ///
-/// Under isolation the private home is mounted at the real home's path and
-/// granted read-write, because a program has to be able to write its own home. A
-/// path granted read-only beneath the real home is bind-mounted at that real
-/// path, which puts it inside that hierarchy, and Landlock rights only add: the
-/// home's write right covers it and the narrower grant cannot take it back. The
-/// write would then land on the host file through the bind.
+/// Bailey adds grants nobody wrote, because a policy that cannot reach the thing
+/// it is about is not a policy: the private home, private temporary storage, and
+/// a confined shell's launch directory. Landlock rights only add, so a writable
+/// implicit grant covers every narrower grant beneath it and the narrower one
+/// cannot take the right back. A user who wrote `read` would get write, and the
+/// write would reach the host file through the bind mount.
 ///
 /// Remounting those paths read-only is what holds the grant the user actually
 /// wrote. It is the same mechanism a `read_only` island uses, and the VFS
 /// enforces it whatever Landlock says.
-fn unwritable_inside_home(policy: &Policy, world: &World) -> Vec<PathBuf> {
-    if world.home_host.is_none() {
+///
+/// This deliberately does not apply to two grants the *user* wrote. Granting
+/// write on a directory and read on something beneath it resolves to a writable
+/// path, which is the documented merge rule and is what they asked for.
+fn unwritable_beneath_implicit(
+    policy: &Policy,
+    world: &World,
+    implicit: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut roots: Vec<&Path> = implicit.iter().map(PathBuf::as_path).collect();
+    if world.home_host.is_some() {
+        roots.push(&world.home_inside);
+    }
+    if roots.is_empty() {
         return Vec::new();
     }
+
     policy
         .filesystem
         .iter()
         .filter(|rule| !rule.access.contains(policy::Access::WRITE))
         .map(|rule| &rule.path)
-        .filter(|path| *path != &world.home_inside && path.starts_with(&world.home_inside))
+        .filter(|path| {
+            roots
+                .iter()
+                .any(|root| path.as_path() != *root && path.starts_with(root))
+        })
         .cloned()
         .collect()
 }
@@ -619,21 +675,29 @@ fn landlock_err(err: impl std::fmt::Display) -> io::Error {
 /// inside the mount namespace. With isolation off there is no mechanism for it,
 /// so the run says so rather than leaving the policy quietly weaker than it
 /// reads.
-fn report_unenforceable_denials(policy: &Policy) {
+fn report_unenforceable_denials(policy: &Policy, nested: bool) {
+    // Inside a sandbox there is no `--no-isolate` to drop: the mount namespace
+    // cannot be rebuilt at all, so pointing at the flag would send someone after
+    // a fix that does not exist. What the outer sandbox itself denied is still
+    // denied; it is this run's own additions that have nowhere to go.
+    let remedy = if nested {
+        "this run is inside another sandbox, which cannot build a second world; \
+         the outer sandbox's own denials still apply"
+    } else {
+        "drop `--no-isolate` to enforce it"
+    };
     for path in policy.nested_read_only() {
         eprintln!(
             "bailey: warning: `{}` is marked read-only inside a writable grant, \
              which a mount namespace enforces; this run has none, so it stays \
-             writable. Drop `--no-isolate` to enforce it.",
+             writable. {remedy}.",
             path.display()
         );
     }
     for path in policy.nested_denials() {
         eprintln!(
             "bailey: warning: `{}` is denied but nested under a granted path, \
-             and is not enforced without namespace isolation. Drop \
-             `--no-isolate`, or grant the specific subdirectories you need \
-             instead of granting the parent.",
+             and is not enforced without namespace isolation. {remedy}.",
             path.display()
         );
     }

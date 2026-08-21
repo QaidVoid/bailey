@@ -150,7 +150,8 @@ deny = ["TERM"]
 
 The target's environment is built, not inherited: it starts empty, gets a base
 set of `PATH`, `HOME`, `TMPDIR`, `TERM`, `LANG`, `LC_*`, `USER`, `LOGNAME`,
-`SHELL`, and `TZ`, and takes nothing else from the caller unless named here. See
+`SHELL`, `TZ`, `BAILEY_SANDBOX`, and `BAILEY_SANDBOX_NET`, and takes nothing else
+from the caller unless named here. See
 [environment and storage](/guide/environment).
 
 ## `applies_to`

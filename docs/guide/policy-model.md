@@ -57,6 +57,35 @@ linker and the shared libraries it loads, and those are filesystem access like a
 other. The `untrusted` floor profile exists to supply that baseline, and it is
 applied beneath every run.
 
+## Grants bailey adds for you
+
+A resolved policy contains a few grants nobody wrote, because a policy that
+cannot reach the thing it is about is not a policy:
+
+| Grant | Rights | When |
+| --- | --- | --- |
+| The target executable | read, execute | Every `bailey run`, as the lowest layer |
+| The launch directory | read, write, execute | `bailey shell`, as the lowest layer |
+| The private home | read, write | Whenever a private home is in use |
+| The private `/tmp` and `/dev/shm` | read, write | Under isolation, unless the policy names anything beneath them |
+
+Each sits beneath your config, so `deny` or `reset` retracts it, and each is
+printed by `bailey show`.
+
+::: tip An implicit grant never widens one you wrote
+Landlock rights only add: a writable grant covers everything beneath it, and a
+narrower rule cannot take the right back. That would mean writing
+`read = ["~/.config/nvim"]` and getting write, because the private home around it
+is writable.
+
+So a path you granted without write is remounted read-only when it sits beneath
+one of the grants above. The VFS enforces that whatever Landlock says.
+
+This applies only to the grants in this table. Two grants *you* wrote still
+accumulate: `write = ["/work"]` with `read = ["/work/vendor"]` leaves `vendor`
+writable, because you asked for both halves.
+:::
+
 ## Resolution is deterministic
 
 Given the same config files and the same target, resolution produces the same

@@ -163,6 +163,53 @@ fn a_config_layer_can_retract_the_implicit_grant() {
     );
 }
 
+/// The launch directory is granted read-write on the user's behalf. A grant the
+/// user wrote for read beneath it must not inherit that write right, or writing
+/// `read` in a config would quietly mean `write` on their own files.
+#[test]
+fn a_read_only_grant_beneath_the_launch_directory_is_honoured() {
+    let store = tempfile::tempdir().unwrap();
+    let (_root, project, _private) = workspace();
+    let vendor = project.join("vendor");
+    fs::create_dir(&vendor).unwrap();
+    fs::write(vendor.join("lib.txt"), "original").unwrap();
+
+    let config = project.join("bailey.toml");
+    fs::write(
+        &config,
+        format!("[filesystem]\nread = [\"{}\"]\n", vendor.display()),
+    )
+    .unwrap();
+    Command::new(bailey())
+        .arg("trust")
+        .arg(&config)
+        .env("XDG_DATA_HOME", store.path())
+        .output()
+        .unwrap();
+
+    let output = shell(
+        store.path(),
+        &project,
+        "cat vendor/lib.txt\necho tampered > vendor/lib.txt && echo WROTE\n",
+        &[],
+    );
+    let shown = stdout(&output);
+
+    assert!(
+        shown.contains("original"),
+        "the read grant must still be readable: {shown}"
+    );
+    assert!(
+        !shown.contains("WROTE"),
+        "read was granted, not write: {shown}"
+    );
+    assert_eq!(
+        fs::read_to_string(vendor.join("lib.txt")).unwrap(),
+        "original",
+        "and nothing must reach the host file"
+    );
+}
+
 #[test]
 fn the_marker_variables_reach_a_command_inside() {
     let store = tempfile::tempdir().unwrap();
@@ -171,12 +218,17 @@ fn the_marker_variables_reach_a_command_inside() {
     let output = shell(
         store.path(),
         &project,
-        "echo \"marker=$BAILEY_SANDBOX dir=$BAILEY_SANDBOX_DIR\"\n",
+        "echo \"marker=$BAILEY_SANDBOX dir=$BAILEY_SANDBOX_DIR net=$BAILEY_SANDBOX_NET\"\n",
         &[],
     );
     let shown = stdout(&output);
 
     assert!(shown.contains("marker=1"), "{shown}");
+    assert!(
+        shown.contains("net=isolated"),
+        "the network the sandbox built is published, so a nested run can report \
+         what it inherited rather than guess: {shown}"
+    );
     assert!(
         shown.contains(&format!("dir={}", project.display())),
         "the marker names the directory the policy was resolved for: {shown}"

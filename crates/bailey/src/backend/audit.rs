@@ -60,6 +60,7 @@ impl AuditBackend {
             // Scoping observation to a cgroup is race-free, so a run gets one
             // whether or not the policy sets limits.
             always_cgroup: true,
+            implicit_write: Vec::new(),
         };
         let confined = backend.spawn(&envelope, target)?;
         let code = audit_helper::record(&mut recorder, confined)?;

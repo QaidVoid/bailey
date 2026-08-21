@@ -192,6 +192,14 @@ number excluded is reported on stderr.
 | `XDG_DATA_HOME` | Location of the trust store, `$XDG_DATA_HOME/bailey/trusted.toml`, and of private homes |
 | `HOME` | Used for `~` expansion in config, and for the global config fallback |
 
+Set by bailey, inside the sandbox:
+
+| Variable | Meaning |
+| --- | --- |
+| `BAILEY_SANDBOX` | `1` in every confined run |
+| `BAILEY_SANDBOX_NET` | `isolated` or `host`, the network the run was given |
+| `BAILEY_SANDBOX_DIR` | The directory a confined shell resolved its policy for |
+
 Set for hook commands:
 
 | Variable | Where |

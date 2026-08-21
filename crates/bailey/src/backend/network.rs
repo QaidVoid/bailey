@@ -61,10 +61,62 @@ pub fn select(policy: &Policy, userns_available: bool) -> NetworkMode {
 /// Report the confinement that is actually in force, when it is weaker than the
 /// policy reads.
 ///
+/// What network an outer bailey run has already put this process in.
+///
+/// A run inside a sandbox cannot create a namespace of its own, because the
+/// outer seccomp filter denies `unshare`, so what it has is whatever it
+/// inherited. Guessing is not good enough in either direction: claiming UDP is
+/// unrestricted when there is no route to send it on is as wrong as staying
+/// silent when there is one. The outer run says which it built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Inherited {
+    /// Not inside another sandbox.
+    None,
+    /// Inside one with a namespace of its own and no route off the host.
+    IsolatedNamespace,
+    /// Inside one that shares the host's network namespace.
+    HostNamespace,
+}
+
+impl Inherited {
+    /// Read what the outer run published in this process's environment.
+    pub fn detect() -> Self {
+        match std::env::var("BAILEY_SANDBOX_NET").as_deref() {
+            Ok("isolated") => Inherited::IsolatedNamespace,
+            Ok(_) => Inherited::HostNamespace,
+            Err(_) => Inherited::None,
+        }
+    }
+
+    /// The value an outer run publishes for the mode it established.
+    pub fn publish(mode: NetworkMode) -> &'static str {
+        match mode {
+            NetworkMode::Isolated => "isolated",
+            NetworkMode::LandlockOnly => "host",
+        }
+    }
+}
+
+/// Report the confinement that is actually in force, when it differs from what
+/// the policy reads.
+///
 /// A run that fully denies the network says nothing, in keeping with the rest of
 /// the tool: output means something needs attention.
-pub fn report(mode: NetworkMode, policy: &Policy) {
+pub fn report(mode: NetworkMode, policy: &Policy, inherited: Inherited) {
     if mode == NetworkMode::Isolated {
+        return;
+    }
+    if inherited == Inherited::IsolatedNamespace {
+        // The inherited namespace has no route, so this policy cannot be weaker
+        // than it reads. It can be stronger than it reads, which is worth
+        // saying: an outbound connection that the policy allows will still fail.
+        if !matches!(policy.network.egress, Egress::DenyAll) {
+            eprintln!(
+                "bailey: note: this policy allows outbound access, but the \
+                 sandbox this run is inside has no route off the host, so \
+                 nothing will connect"
+            );
+        }
         return;
     }
     match &policy.network.egress {

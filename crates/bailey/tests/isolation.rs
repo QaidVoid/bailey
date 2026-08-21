@@ -254,6 +254,46 @@ fn a_read_only_island_survives_inside_a_writable_grant() {
     );
 }
 
+/// The read-only remount applies to grants bailey added, not to two grants the
+/// user wrote. Granting write on a directory and read on something beneath it
+/// still resolves to a writable path: that is the documented merge rule, and
+/// changing it would be a different tool.
+#[test]
+fn two_grants_the_user_wrote_still_accumulate() {
+    if !isolation_active() {
+        eprintln!("skipping: isolation unavailable on this host");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    fs::create_dir_all(work.join("inner")).unwrap();
+    fs::write(work.join("inner/file"), "original").unwrap();
+
+    let config = dir.path().join("bailey.toml");
+    fs::write(
+        &config,
+        format!(
+            "[filesystem]\nwrite = [\"{work}\"]\nread = [\"{work}\", \"{work}/inner\"]\n",
+            work = work.display()
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(bailey())
+        .args(["run", "-c"])
+        .arg(&config)
+        .args(["/bin/sh", "-c"])
+        .arg(format!("echo changed > {}/inner/file", work.display()))
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "a user's own write grant on the parent still covers the child: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// A read-only grant beneath the home is the shape of "let it read my dotfiles".
 /// The private home is mounted at the real home's path and granted read-write,
 /// so without a read-only remount the home's write right covers the narrower

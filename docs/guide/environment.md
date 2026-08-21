@@ -25,8 +25,18 @@ USER=you
 ```
 
 The base set is `PATH` (a sandbox-appropriate one, not yours), `HOME`, `TMPDIR`
-where a private `/tmp` applies, and the locale and terminal variables `TERM`,
-`LANG`, `LC_*`, `USER`, `LOGNAME`, `SHELL`, and `TZ`.
+where a private `/tmp` applies, the locale and terminal variables `TERM`, `LANG`,
+`LC_*`, `USER`, `LOGNAME`, `SHELL`, and `TZ`, and two variables naming the
+sandbox itself:
+
+| Variable | Meaning |
+| --- | --- |
+| `BAILEY_SANDBOX` | `1`, in every confined run |
+| `BAILEY_SANDBOX_NET` | `isolated` when the run has a network namespace of its own with no route off the host, `host` when it shares yours |
+
+These are what let a bailey run *inside* a sandbox report what it inherited
+rather than guess, and what lets your prompt show that a shell is confined. They
+are ordinary variables: `deny` removes them like any other.
 
 `bailey show <target>` prints the exact environment a target will receive, and
 where each variable came from.
