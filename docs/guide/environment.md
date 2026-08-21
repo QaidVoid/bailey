@@ -95,6 +95,17 @@ private home in place, and under isolation that granted path appears within it.
 Most programs live under your home, and the target is granted implicitly, so the
 narrower rule is what keeps the private home from switching itself off.
 
+A grant inside the home keeps the rights it was written with. The private home is
+granted read-write, because a program has to be able to write its own home, and
+Landlock rights only add, so a path granted read-only beneath it would inherit
+that write right. Bailey remounts those paths read-only inside the sandbox, which
+the VFS enforces whatever Landlock says:
+
+```toml
+[filesystem]
+read = ["~/.config/nvim"]   # readable in the sandbox, and not writable
+```
+
 ## Private temporary storage
 
 Under isolation, `/tmp` and `/dev/shm` are fresh tmpfs mounts private to the run.

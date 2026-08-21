@@ -39,6 +39,7 @@ needs" into a profile you can read.
 | World | user, mount, PID namespaces | Rebuilds the root from the policy, so ungranted paths are absent rather than merely denied, and host processes are invisible |
 | Reachability | Landlock scoping | Host abstract UNIX sockets and processes outside the sandbox are out of reach |
 | Observation | eBPF, via a privileged helper | Records what the program opens and connects to, without blocking it |
+| Coverage | Inheritance | `bailey shell` confines a shell, and a Landlock ruleset cannot be dropped, so everything started from it is confined too |
 
 One policy drives all of it. Config resolves into a single mechanism-independent
 `Policy` that both the enforcement backend and the audit backend consume, so a
@@ -75,11 +76,13 @@ executable, then on `PATH`.
 ## Quick start
 
 ```sh
-# Run a program under the deny-by-default floor.
+# Run a program under the deny-by-default floor, with namespace isolation:
+# ungranted paths are absent and host processes are invisible.
 bailey run ./program
 
-# Add namespace isolation: ungranted paths are absent, host processes invisible.
-bailey run ./program
+# Confine a whole session instead. Everything started from this shell is
+# covered by the directory's policy, prefix or no prefix.
+bailey shell
 
 # Start from a profile shaped for native Linux games.
 bailey run --profile native-game ./game

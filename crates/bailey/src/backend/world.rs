@@ -223,6 +223,38 @@ fn default_home(target: &Path) -> PathBuf {
     data_home().join("bailey").join(name).join("home")
 }
 
+/// The private home for a shell confined to `dir`.
+///
+/// Keyed on the directory rather than on the shell's file name, which would
+/// collapse every project into one home called `bash`. The name is kept
+/// navigable and disambiguated with a digest of the full path, since two
+/// projects are often both called `app`.
+pub fn directory_home(dir: &Path) -> PathBuf {
+    let name = dir
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "root".into());
+    let digest = short_digest(dir);
+    data_home()
+        .join("bailey")
+        .join("shell")
+        .join(format!("{name}-{digest}"))
+        .join("home")
+}
+
+fn short_digest(path: &Path) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(path.as_os_str().as_encoded_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .take(4)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn data_home() -> PathBuf {
     if let Some(dir) = std::env::var_os("XDG_DATA_HOME")
         && !dir.is_empty()
@@ -265,6 +297,21 @@ mod tests {
         let world = World::derive(Path::new("/opt/game/game"), &policy, true);
         assert!(world.home_host.is_some());
         assert_eq!(world.home_inside, real_home());
+    }
+
+    #[test]
+    fn two_directories_of_the_same_name_get_different_homes() {
+        let one = directory_home(Path::new("/home/you/work/one/app"));
+        let two = directory_home(Path::new("/home/you/work/two/app"));
+        assert_ne!(
+            one, two,
+            "a shared home would leak one project into another"
+        );
+        assert!(
+            one.to_string_lossy().contains("app-"),
+            "and the name stays navigable: {}",
+            one.display()
+        );
     }
 
     #[test]

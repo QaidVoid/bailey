@@ -42,6 +42,7 @@ export default defineConfig({
         {
           text: 'Using bailey',
           items: [
+            { text: 'A confined shell', link: '/guide/shell' },
             { text: 'Configuration', link: '/guide/configuration' },
             { text: 'Trusting a config', link: '/guide/trusting-a-config' },
             { text: 'Profiles', link: '/guide/profiles' },

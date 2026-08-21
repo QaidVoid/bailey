@@ -138,6 +138,20 @@ bailey run --profile native-game ./game
 Profiles are additive over the `untrusted` floor, and your own config layers on
 top of them. See [profiles](/guide/profiles).
 
+## 6. Confine a session instead of a command
+
+Everything above confines one program at a time. When the thing you want to
+confine is the work rather than a single binary, start a shell instead:
+
+```sh
+cd ~/projects/thing
+bailey shell
+```
+
+The policy is resolved for that directory and inherited by every process the
+shell starts, so it covers the commands you did not think to prefix. See
+[a confined shell](/guide/shell).
+
 ## Where to go next
 
 - [Configuration](/guide/configuration) for the full config model.

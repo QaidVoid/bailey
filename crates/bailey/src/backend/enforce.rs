@@ -73,12 +73,17 @@ impl RunReport {
         self.skipped.push((layer.to_owned(), reason.to_owned()));
     }
 
-    /// Print the summary for a person.
-    pub fn print(&self, exit_code: i32) {
+    /// Print what the run enforced, without an exit status.
+    fn print_established(&self) {
         eprintln!("bailey: enforced: {}", self.applied.join(", "));
         for (layer, reason) in &self.skipped {
             eprintln!("bailey: not enforced, {layer}: {reason}");
         }
+    }
+
+    /// Print the summary for a person.
+    pub fn print(&self, exit_code: i32) {
+        self.print_established();
         if exit_code != 0 {
             eprintln!("bailey: target exited with {exit_code}");
         }
@@ -123,6 +128,14 @@ pub enum Summary {
     /// A short block on stderr after the target exits.
     #[default]
     Text,
+    /// A short block on stderr once the sandbox is established, before the
+    /// target is spawned.
+    ///
+    /// For a target that takes the terminal and holds it, such as a shell, a
+    /// summary printed on exit arrives after it stopped being useful. Printing
+    /// before the fork rather than after it is what keeps the target's own
+    /// first output from racing ahead of the summary.
+    Established,
     /// One line of JSON, for a caller that parses it.
     Json,
     /// Nothing.
@@ -291,6 +304,10 @@ impl EnforceBackend {
             });
         }
 
+        if self.summary == Summary::Established {
+            report.print_established();
+        }
+
         let child = command.spawn().map_err(BackendError::Io)?;
         Ok(Confined {
             child,
@@ -352,7 +369,8 @@ impl Confined {
         match self.summary {
             Summary::Text => self.report.print(code),
             Summary::Json => println!("{}", self.report.to_json(code)),
-            Summary::Quiet => {}
+            // Already printed, before the target ever ran.
+            Summary::Established | Summary::Quiet => {}
         }
         Ok(code)
     }
@@ -530,10 +548,13 @@ fn build_isolation_plan(policy: &Policy, mode: NetworkMode, world: &World) -> Is
         })
         .collect();
 
+    let mut read_only = policy.read_only.clone();
+    read_only.extend(unwritable_inside_home(policy, world));
+
     IsolationPlan {
         binds,
         conceal,
-        read_only: policy.read_only.clone(),
+        read_only,
         network: mode == NetworkMode::Isolated,
         home: world
             .home_host
@@ -546,6 +567,32 @@ fn build_isolation_plan(policy: &Policy, mode: NetworkMode, world: &World) -> Is
         cwd: world.cwd.clone(),
         staging: PathBuf::from(format!("/tmp/.bailey-root.{}", std::process::id())),
     }
+}
+
+/// Granted paths that live inside the private home and were not granted write.
+///
+/// Under isolation the private home is mounted at the real home's path and
+/// granted read-write, because a program has to be able to write its own home. A
+/// path granted read-only beneath the real home is bind-mounted at that real
+/// path, which puts it inside that hierarchy, and Landlock rights only add: the
+/// home's write right covers it and the narrower grant cannot take it back. The
+/// write would then land on the host file through the bind.
+///
+/// Remounting those paths read-only is what holds the grant the user actually
+/// wrote. It is the same mechanism a `read_only` island uses, and the VFS
+/// enforces it whatever Landlock says.
+fn unwritable_inside_home(policy: &Policy, world: &World) -> Vec<PathBuf> {
+    if world.home_host.is_none() {
+        return Vec::new();
+    }
+    policy
+        .filesystem
+        .iter()
+        .filter(|rule| !rule.access.contains(policy::Access::WRITE))
+        .map(|rule| &rule.path)
+        .filter(|path| *path != &world.home_inside && path.starts_with(&world.home_inside))
+        .cloned()
+        .collect()
 }
 
 fn fs_access_bits(access: policy::Access) -> Option<BitFlags<AccessFs>> {

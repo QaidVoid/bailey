@@ -253,3 +253,57 @@ fn a_read_only_island_survives_inside_a_writable_grant() {
         "and nothing must reach the host"
     );
 }
+
+/// A read-only grant beneath the home is the shape of "let it read my dotfiles".
+/// The private home is mounted at the real home's path and granted read-write,
+/// so without a read-only remount the home's write right covers the narrower
+/// grant, and the write reaches the host file through the bind.
+#[test]
+fn a_read_only_grant_inside_the_home_is_not_writable() {
+    if !isolation_active() {
+        eprintln!("skipping: isolation unavailable on this host");
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    let dotfiles = home.path().join(".config/app");
+    fs::create_dir_all(&dotfiles).unwrap();
+    fs::write(dotfiles.join("settings"), "original").unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("bailey.toml");
+    fs::write(
+        &config,
+        format!("[filesystem]\nread = [\"{}\"]\n", dotfiles.display()),
+    )
+    .unwrap();
+
+    let run = |script: String| {
+        Command::new(bailey())
+            .args(["run", "-c"])
+            .arg(&config)
+            .args(["/bin/sh", "-c"])
+            .arg(script)
+            .env("HOME", home.path())
+            .output()
+            .unwrap()
+    };
+
+    let read = run(format!("cat {}/settings", dotfiles.display()));
+    assert_eq!(
+        String::from_utf8_lossy(&read.stdout).trim(),
+        "original",
+        "a granted dotfile directory must be readable"
+    );
+
+    let write = run(format!("echo tampered > {}/settings", dotfiles.display()));
+    assert!(
+        !write.status.success(),
+        "read was granted, not write: {}",
+        String::from_utf8_lossy(&write.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(dotfiles.join("settings")).unwrap(),
+        "original",
+        "and the host file must be untouched"
+    );
+}

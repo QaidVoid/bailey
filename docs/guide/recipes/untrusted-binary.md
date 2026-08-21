@@ -57,6 +57,19 @@ own directory, and nothing else. Your home directory does not exist in there.
 Under `--no-isolate` the same policy is enforced, but the rest of the filesystem
 remains visible, just unreadable.
 
+## Or poke at it from a confined shell
+
+Unpacking, reading, and running a downloaded thing is several commands, and
+prefixing each one is how you forget one. Take a shell in its directory instead:
+
+```sh
+cd ~/sandbox/thing
+bailey shell
+```
+
+The directory is granted, everything else is not, and every command you type is
+covered. See [a confined shell](/guide/shell).
+
 ## Find out what it wanted
 
 If it fails, record a session:

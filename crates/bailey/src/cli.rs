@@ -34,6 +34,8 @@ struct Cli {
 enum Command {
     /// Run a target under enforcement.
     Run(RunArgs),
+    /// Run a shell confined to this directory, covering everything it starts.
+    Shell(ShellArgs),
     /// Run a target under audit, recording its access and reconciling it.
     Audit(AuditArgs),
     /// Resolve and print the effective policy for a target.
@@ -86,6 +88,23 @@ struct RunArgs {
     /// The target executable, followed by its own arguments.
     #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<String>,
+}
+
+#[derive(Debug, clap::Args)]
+struct ShellArgs {
+    /// Explicit config file, taking highest precedence.
+    #[arg(short, long)]
+    config: Option<PathBuf>,
+    /// Profile to use as the base. Defaults to a profile that claims the shell,
+    /// or to the untrusted floor.
+    #[arg(short, long)]
+    profile: Option<String>,
+    /// The shell to run. Defaults to `$SHELL`, then `/bin/sh`.
+    #[arg(long)]
+    shell: Option<String>,
+    /// Run without namespace isolation, leaving only Landlock and seccomp.
+    #[arg(long)]
+    no_isolate: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -188,6 +207,7 @@ pub fn run() -> ExitCode {
 fn dispatch(command: Command) -> anyhow::Result<i32> {
     match command {
         Command::Run(args) => cmd_run(args),
+        Command::Shell(args) => cmd_shell(args),
         Command::Audit(args) => cmd_audit(args),
         Command::Show(args) => cmd_show(args),
         Command::Profile(args) => cmd_profile(args),
@@ -319,6 +339,140 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
         eprintln!("bailey: post-exit hook failed: {err}");
     }
     Ok(code)
+}
+
+/// Run a shell under the policy for the directory it was launched from.
+///
+/// A Landlock ruleset survives `fork` and `exec` and cannot be relaxed by the
+/// process it restricts, and the namespaces are inherited the same way, so
+/// everything started from the shell is confined by the same policy. That is the
+/// difference between a policy that applies to the commands someone remembered
+/// to prefix and one that applies to a directory.
+fn cmd_shell(args: ShellArgs) -> anyhow::Result<i32> {
+    let shell = resolve_shell(args.shell.as_deref())?;
+    let dir = std::env::current_dir()?;
+
+    let profile = select_profile(args.profile.as_deref(), &shell)?;
+    let mut resolved = resolve_for_shell(&profile, &shell, &dir, args.config.as_deref())?;
+    report_untrusted(&shell, args.config.as_deref());
+    report_nesting();
+    warn_if_home_granted(&dir);
+
+    // Named here rather than derived from the shell, which is called `bash` in
+    // every project and would give them all one home to share.
+    if resolved.policy.home.is_none() {
+        resolved.policy.home = Some(world::directory_home(&dir));
+    }
+    // A marker rather than a modified prompt: every shell spells its prompt
+    // differently, and the prompt belongs to the user. `env.deny` still removes
+    // these, since denials are applied last.
+    resolved
+        .policy
+        .env
+        .set
+        .insert("BAILEY_SANDBOX".into(), "1".into());
+    resolved
+        .policy
+        .env
+        .set
+        .insert("BAILEY_SANDBOX_DIR".into(), dir.display().to_string());
+
+    let target = Target {
+        program: shell,
+        args: Vec::new(),
+        cwd: None,
+    };
+
+    resolved.hooks.run_pre_launch()?;
+    let backend = EnforceBackend {
+        isolate: !args.no_isolate,
+        stop_before_exec: false,
+        // Before the shell takes the terminal, rather than as the user leaves.
+        summary: Summary::Established,
+        always_cgroup: false,
+    };
+    let code = backend.run(&resolved.policy, &target)?;
+    if let Err(err) = resolved.hooks.run_post_exit(code) {
+        eprintln!("bailey: post-exit hook failed: {err}");
+    }
+    Ok(code)
+}
+
+/// The shell to confine: the one the user asked for, the one they chose for
+/// themselves, or the one that exists everywhere.
+fn resolve_shell(requested: Option<&str>) -> anyhow::Result<PathBuf> {
+    if let Some(name) = requested {
+        return resolve_target(name);
+    }
+    match std::env::var("SHELL") {
+        Ok(shell) if !shell.is_empty() => resolve_target(&shell),
+        _ => resolve_target("/bin/sh"),
+    }
+}
+
+/// Resolve the policy for a confined shell.
+///
+/// Two implicit layers sit beneath the profile: the shell itself, without which
+/// nothing can start, and the directory the shell was launched from, without
+/// which the shell cannot read the thing it was opened to work on. Both are at
+/// the bottom of the stack, so any profile or config layer can retract them.
+fn resolve_for_shell(
+    profile: &str,
+    shell: &Path,
+    dir: &Path,
+    explicit: Option<&Path>,
+) -> anyhow::Result<Resolved> {
+    let implicit_shell = implicit_target_layer(shell);
+    let implicit_dir = implicit_dir_layer(dir);
+    let layers = profiles::base_layers(profile).map_err(|err| anyhow::anyhow!(err))?;
+    let mut bases: Vec<(&str, &str)> = vec![
+        ("implicit:shell", implicit_shell.as_str()),
+        ("implicit:cwd", implicit_dir.as_str()),
+    ];
+    bases.extend(
+        layers
+            .iter()
+            .map(|layer| (layer.label.as_str(), layer.toml.as_str())),
+    );
+    Ok(config::resolve_with_bases(&bases, shell, explicit)?)
+}
+
+/// The layer granting the directory the shell was launched from.
+fn implicit_dir_layer(dir: &Path) -> String {
+    let dir = toml_string(dir);
+    format!("[filesystem]\nread = [{dir}]\nwrite = [{dir}]\nexecute = [{dir}]\n")
+}
+
+/// Report that the implicit grant covers the whole home directory.
+///
+/// Inherent to granting "wherever I am": launched from the home, it grants the
+/// home. Refusing would mean overruling a directory the user chose, so this
+/// says what happened and leaves the choice alone.
+fn warn_if_home_granted(dir: &Path) {
+    let Some(home) = std::env::var_os("HOME") else {
+        return;
+    };
+    if Path::new(&home).starts_with(dir) {
+        eprintln!(
+            "bailey: warning: this shell was launched from `{}`, so the implicit \
+             grant covers your whole home directory. Launch it from the directory \
+             you meant to confine it to, or retract the grant in config.",
+            dir.display()
+        );
+    }
+}
+
+/// Report a shell started inside a shell.
+fn report_nesting() {
+    let Some(outer) = std::env::var_os("BAILEY_SANDBOX_DIR") else {
+        return;
+    };
+    eprintln!(
+        "bailey: note: already inside a sandbox for `{}`. Its policy still \
+         applies and this one can only narrow it further; the isolation layer \
+         cannot be entered a second time.",
+        Path::new(&outer).display()
+    );
 }
 
 fn cmd_audit(args: AuditArgs) -> anyhow::Result<i32> {

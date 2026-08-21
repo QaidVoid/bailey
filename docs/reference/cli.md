@@ -5,6 +5,7 @@ bailey <COMMAND>
 
 Commands:
   run      Run a target under enforcement
+  shell    Run a shell confined to this directory, covering everything it starts
   audit    Run a target under audit, recording its access and reconciling it
   show     Resolve and print the effective policy for a target
   profile  Inspect bundled profiles and generate profiles from audit traces
@@ -42,6 +43,32 @@ an error rather than a policy for a file that does not exist.
 The target executable is granted read and execute implicitly, as the lowest
 config layer, so a binary outside the system paths runs without config. Any user
 layer can retract that grant.
+
+## `bailey shell`
+
+```
+bailey shell [OPTIONS]
+```
+
+Runs a shell under the policy resolved for the current directory. The
+confinement is inherited, so every process started from that shell is covered by
+the same policy without being invoked through bailey.
+
+| Option | Description |
+| --- | --- |
+| `--shell <PATH>` | The shell to run. Defaults to `$SHELL`, then `/bin/sh` |
+| `-c, --config <FILE>` | Explicit config file, highest precedence |
+| `-p, --profile <NAME>` | Profile used as the base |
+| `--no-isolate` | Run without namespace isolation, leaving Landlock and seccomp |
+
+The launch directory is granted read, write, and execute as the lowest layer, so
+a shell is useful in a directory with no config; any layer can retract it. The
+shell gets a private home derived from that directory, and its environment
+carries `BAILEY_SANDBOX` and `BAILEY_SANDBOX_DIR`.
+
+What was enforced is printed before the shell takes the terminal, rather than on
+exit as `run` does. Exits with the shell's status. See
+[a confined shell](/guide/shell).
 
 ## `bailey audit`
 
