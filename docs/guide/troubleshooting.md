@@ -130,16 +130,32 @@ the layer.
 
 ## A `deny` seems to do nothing
 
-A denial nested inside a granted directory is not enforced. Bailey warns when
-this applies and marks it `NOT ENFORCED` in `bailey show`. Instead of granting a
-parent and denying a child, grant the specific children you want:
+Check whether the run had the isolation layer. A denial nested inside a granted
+directory is enforced by covering the path over, which needs the mount namespace,
+so under `--no-isolate` the run says:
+
+```
+bailey: warning: `/home/you/.ssh` is denied but nested under a granted path, and
+is not enforced without namespace isolation. Drop `--no-isolate`, or grant the
+specific subdirectories you need instead of granting the parent.
+```
+
+`bailey show <target>` marks the same paths `(nested under a grant: needs
+isolation)`. Isolation is the default, so this is usually a `--no-isolate` you
+did not mean to keep.
+
+Where you do need `--no-isolate`, grant the specific children instead of granting
+a parent and carving out an exception:
 
 ```toml
 [filesystem]
-# Does not protect ~/.ssh:
+# Under --no-isolate, does not protect ~/.ssh:
 # read = ["~"]
 # deny = ["~/.ssh"]
 
-# Does:
+# Does, everywhere:
 read = ["~/Documents", "~/Downloads"]
 ```
+
+A `read_only` island has the same shape: it is a read-only mount, so it needs the
+same layer and warns the same way.

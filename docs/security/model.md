@@ -46,8 +46,8 @@ sandbox helps.
 | Property | Mechanism | Status |
 | --- | --- | --- |
 | Cannot read or write ungranted paths | Landlock | Enforced |
-| Cannot see ungranted paths | Mount namespace, `pivot_root` | Enforced under `--isolate` |
-| Cannot see or signal host processes | PID namespace | Enforced under `--isolate` |
+| Cannot see ungranted paths | Mount namespace, `pivot_root` | Enforced unless `--no-isolate` |
+| Cannot see or signal host processes | PID namespace | Enforced unless `--no-isolate` |
 | Cannot open ungranted TCP connections | Landlock network rules | Enforced on Linux 6.7+ |
 | Cannot reach host abstract UNIX sockets | Landlock scoping, network namespace | Enforced on Linux 6.12+ |
 | Cannot signal processes outside the sandbox | Landlock scoping, PID namespace | Enforced on Linux 6.12+ |
@@ -66,8 +66,9 @@ UDP and denies the rest.
 **Variables you pass.** `pass` forwards a variable verbatim, so passing one that
 holds a credential puts that credential in the sandbox.
 
-**Nested denials without isolation.** Denying a path inside a granted directory
-is enforced only under `--isolate`, where the path can be covered over.
+**Nested denials without isolation.** Denying a path inside a granted directory,
+or marking one read-only, is enforced only by the isolation layer, where the path
+can be covered over or remounted. `--no-isolate` gives that up.
 
 **Side channels.** Bailey does not attempt to prevent timing attacks, resource
 observation, or anything else in that family.
@@ -91,6 +92,6 @@ syscalls that would be useful for escaping it; namespaces remove the paths and
 processes from view entirely; cgroups bound the damage of the crudest attacks. A
 weakness in any one of them does not immediately hand over the machine.
 
-That is a reason to use `--isolate` even though Landlock alone already denies:
-absence is a stronger property than refusal, and it is enforced by a different
-mechanism.
+That is why isolation is the default rather than an option, even though Landlock
+alone already denies: absence is a stronger property than refusal, and it is
+enforced by a different mechanism.

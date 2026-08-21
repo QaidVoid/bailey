@@ -7,10 +7,15 @@ the detail.
 ## Implemented
 
 - **Policy that means what it says.** Denials survive resolution and are enforced
-  under `--isolate` by covering the path; unenforceable network rules fail at
-  resolution rather than silently inverting; the target executable is granted
-  implicitly; config discovery covers the working directory as well as the
-  target's; arguments after the target are passed through untouched.
+  by the isolation layer, which is on by default, by covering the path;
+  unenforceable network rules fail at resolution rather than silently inverting;
+  the target executable is granted implicitly; config discovery covers the
+  working directory as well as the target's; arguments after the target are
+  passed through untouched.
+- **Config you decided to apply.** A `bailey.toml` found by walking a directory
+  can have arrived with the code being confined, so it contributes only once
+  accepted with `bailey trust`, recorded against its contents so an edit asks
+  again. Your global config, your own profiles, and `--config` are unaffected.
 - **The world the target sees.** The environment is built rather than inherited,
   so credentials do not cross unless named. Each target gets a private home that
   persists, a private `/tmp` and `/dev/shm` under isolation, and the directory it

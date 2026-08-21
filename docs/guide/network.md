@@ -25,7 +25,8 @@ socket.socket(socket.AF_INET, socket.SOCK_DGRAM).sendto(b'x', ('8.8.8.8', 53))"
 ```
 
 The namespace is created through a user namespace, so it needs no privilege, and
-it applies to a plain `bailey run`. `--isolate` is not required for it.
+it applies to every `bailey run`, including one with `--no-isolate`: a denied
+egress is enforced this way regardless of the filesystem isolation.
 
 Two things come along with the namespace:
 

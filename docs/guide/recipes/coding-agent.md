@@ -14,7 +14,7 @@ read = ["."]
 write = ["."]
 execute = ["/usr/bin/git", "/usr/bin/cargo", "/usr/bin/rustc", "/usr/bin/sh"]
 
-# Enforced under --isolate: these become empty and read-only.
+# Enforced by the isolation layer: these become empty and read-only.
 deny = ["./.env", "./secrets"]
 
 [network]
@@ -36,12 +36,18 @@ is expected to reach for.
 
 ```sh
 cd ~/projects/thing
-bailey run --isolate /usr/bin/agent-cli
+bailey trust ./bailey.toml     # once, and again whenever you edit it
+bailey run /usr/bin/agent-cli
 ```
 
-Under isolation, the agent's world is the system paths and this project. Your
-other projects, your home directory, and your keys are not present in its
-filesystem view.
+Under isolation, which is the default, the agent's world is the system paths and
+this project. Your other projects, your home directory, and your keys are not
+present in its filesystem view.
+
+The trust step matters more here than anywhere else. An agent that can write your
+project can write your project's `bailey.toml`, and a policy a program can edit is
+not a policy. Editing the file revokes it, so the widened version does not apply
+until you have read it.
 
 ## What this does not protect against yet
 
@@ -53,12 +59,17 @@ so `SSH_AUTH_SOCK` and `GITHUB_TOKEN` do not reach the agent unless you name
 them. If the agent genuinely needs a token, remember that passing it hands it
 over.
 
-**`deny` inside a granted directory only works under `--isolate`.** The
-`deny = ["./secrets"]` above is enforced when you pass `--isolate`, and is
-reported as unenforced when you do not. The command below uses it.
+**`deny` inside a granted directory needs the isolation layer.** The
+`deny = ["./secrets"]` above is enforced by covering the path over, which the
+mount namespace does. That layer is the default; under `--no-isolate` the denial
+is reported as unenforced before the run starts.
 
-See the [roadmap](/roadmap) for the proposals that close each of these, and
-[known limitations](/security/limitations) for the full list.
+**Nothing intercepts your shell.** Running `agent-cli` directly runs it with your
+full authority. The policy applies to what you launch through bailey, and the
+`bailey: enforced:` line after a run is the confirmation.
+
+See [known limitations](/security/limitations) for the full list, and
+[project status](/roadmap) for what was deliberately not built.
 
 ## A narrower variation
 

@@ -16,12 +16,18 @@ A policy is declarative intent, independent of any kernel mechanism:
 
 - **Filesystem grants**: a path hierarchy and the rights on it, read, write, or
   execute. A grant on a directory covers everything beneath it.
+- **Denials and read-only islands**: paths withheld from, or made unwritable
+  inside, a hierarchy that is otherwise granted.
 - **Network policy**: egress denied, allowed, or allowed to a list of
   destinations, plus the TCP ports the program may bind.
 - **Device grants**: paths under `/dev` with their rights. Device grants share
   filesystem semantics; they are separate in config because they are a different
   decision.
-- **Resource limits**: memory, process count, and CPU quota.
+- **Resource limits**: memory, process count, CPU quota, and the size of the
+  private `/tmp` and `/dev/shm`.
+- **The environment**: which variables are passed, set, or removed.
+- **The home directory**: where the target's private home lives, when it is not
+  the derived one.
 
 It carries no notion of Landlock rules, seccomp filters, mount points, or cgroup
 files. That separation is what lets the same value drive both backends.
@@ -37,8 +43,8 @@ So observing and enforcing are mechanically different things:
 
 - The **enforcement backend** builds a deny-by-default world with Landlock,
   seccomp, cgroups, and optionally namespaces.
-- The **audit backend** runs the program permissively while eBPF programs record
-  what it touches.
+- The **audit backend** runs the program under that same policy while eBPF
+  programs record everything it touches, granted or not.
 
 They share the policy type, which is what makes the workflow work: a profile you
 built by watching a program is directly usable for confining it.

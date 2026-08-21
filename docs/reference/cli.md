@@ -55,10 +55,16 @@ accesses the current policy does not grant, split into high-risk and routine.
 | Option | Description |
 | --- | --- |
 | `-c, --config <FILE>` | Explicit config file |
-| `-p, --profile <NAME>` | Bundled profile used as the base. Default `untrusted` |
+| `-p, --profile <NAME>` | Profile used as the base, as for `run` |
 | `--save-trace <FILE>` | Write the recorded trace as JSON |
-| `--isolate` | Rebuild the target's world with namespaces during the audit |
 | `--unconfined` | Run with no confinement at all, reported when used |
+
+The resolved policy applies during an audit; the accesses it denies are recorded
+rather than permitted. `--unconfined` lifts that.
+
+Unlike `run`, audit does not isolate. The recorder needs the target held at
+`exec`, and that stop is not inherited across the fork that puts it in a PID
+namespace, so `--isolate` is rejected with an explanation rather than ignored.
 
 Requires the privileged audit helper. See [installation](/guide/installation).
 
@@ -107,7 +113,7 @@ See [trusting a config](/guide/trusting-a-config).
 
 Reports what this host can enforce and what each gap costs: the Landlock ABI and
 which policy elements it covers, user namespaces, cgroup delegation, kernel BTF,
-whether the audit helper can load, and whether violation hooks can fire. See
+and whether the audit helper can actually load its programs. See
 [knowing what was enforced](/guide/diagnostics).
 
 ## `bailey completions <shell>` and `bailey man`

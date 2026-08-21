@@ -11,7 +11,8 @@ reports what it could not enforce.
 | Landlock | Filesystem policy | 5.13 | No filesystem or network enforcement, warned |
 | Landlock ABI 4 | Network rules | 6.7 | Network policy not enforced |
 | Landlock ABI 5 | Device ioctl restrictions | 6.10 | That subset is skipped |
-| Unprivileged user namespaces | `--isolate` | long-standing, often disabled | Falls back to Landlock and seccomp, warned |
+| Landlock ABI 6 | Scoping abstract sockets and signals | 6.12 | Host abstract sockets and signals are reachable |
+| Unprivileged user namespaces | The isolation layer, and a denied egress | long-standing, often disabled | Falls back to Landlock and seccomp, warned; egress is restricted by TCP port only |
 | cgroup v2 with delegation | Resource limits | long-standing | Limits skipped, warned |
 | seccomp filters | Syscall denylist | long-standing | Run fails to establish |
 | BTF (`/sys/kernel/btf/vmlinux`) | Audit backend | 5.x with `CONFIG_DEBUG_INFO_BTF` | Audit unavailable |

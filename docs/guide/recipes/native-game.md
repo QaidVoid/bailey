@@ -27,9 +27,10 @@ memory = "8GiB"
 pids_max = 1024
 ```
 
-Then:
+Then accept it once and run:
 
 ```sh
+bailey trust ~/games/thegame/bailey.toml
 bailey run --profile native-game ~/games/thegame/thegame
 ```
 
@@ -53,7 +54,8 @@ read = ["/usr/share/vulkan", "/usr/share/glvnd", "~/.cache/mesa_shader_cache"]
 write = ["/run/user/1000"]           # your own runtime dir: Wayland, PipeWire
 ```
 
-Replace `1000` with your uid.
+Replace `1000` with your uid. Each file in the cascade is accepted separately, so
+the shared one needs `bailey trust ~/games/bailey.toml` of its own.
 
 ## NVIDIA
 

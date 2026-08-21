@@ -81,11 +81,13 @@ deny = ["./secrets"]
 ```
 
 ```sh
-bailey run --isolate --profile ai-agent agent-cli
+bailey trust ~/projects/thing/bailey.toml
+bailey run --profile ai-agent agent-cli
 ```
 
-Use `--isolate`: it is what makes the `deny` enforceable and what puts the agent
-in a world where your other projects do not exist.
+The isolation layer is what makes that `deny` enforceable and what puts the agent
+in a world where your other projects do not exist. It is on by default; do not
+reach for `--no-isolate` here.
 
 Remember that nothing intercepts your shell. Running `agent-cli` on its own runs
 it unsandboxed; the policy applies only when you launch it through bailey. The
@@ -121,8 +123,12 @@ egress_allow = [{ host = "*", port = 443 }]
 ```
 
 ```sh
-bailey run --isolate --profile claude claude
+bailey run --profile claude claude
 ```
+
+A profile in your own config directory needs no trust record: you wrote it, and
+unlike a project's `bailey.toml` it did not arrive with code you cloned. That is
+a good reason to keep a rule in a profile rather than repeating it per project.
 
 `bailey profile list` shows yours under the bundled ones, and
 `bailey profile show <name>` prints either. The bundled names are reserved: a
@@ -140,7 +146,7 @@ applies_to = ["claude"]
 ```
 
 ```sh
-bailey run --isolate claude          # uses the claude profile, wherever you are
+bailey run claude          # uses the claude profile, wherever you are
 ```
 
 ```
@@ -191,6 +197,11 @@ below inherits them.
     bailey.toml      # this game's directory and saves
     game
 ```
+
+Each of those files is accepted separately with `bailey trust`, and editing one
+asks again. The trade-off against a profile is exactly that: a `bailey.toml`
+lives where the code lives, so it carries a decision, while a profile lives in
+your config directory and does not.
 
 ## Choosing a base
 

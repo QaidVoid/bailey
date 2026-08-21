@@ -70,9 +70,10 @@ unreachable.
 bailey run ./program        # writes land in the private home
 ```
 
-It persists between runs, so settings and saves survive. Under `--isolate` it is
-mounted at the path your real home would have, so a program that hard-codes
-`/home/you/.config/...` still writes inside the sandbox.
+It persists between runs, so settings and saves survive. Under isolation, which
+is the default, it is mounted at the path your real home would have, so a program
+that hard-codes `/home/you/.config/...` still writes inside the sandbox. Under
+`--no-isolate` it stays at its own path, and only `HOME` points at it.
 
 Two targets with the same file name share a private home. Override the location
 per target:
@@ -90,15 +91,16 @@ read = ["~"]
 
 Only a grant on the home directory itself, or on an ancestor of it, does that. A
 grant on something *inside* your home, such as a project directory, leaves the
-private home in place, and under `--isolate` that granted path appears within
-it. Most programs live under your home, and the target is granted implicitly, so
-the narrower rule is what keeps the private home from switching itself off.
+private home in place, and under isolation that granted path appears within it.
+Most programs live under your home, and the target is granted implicitly, so the
+narrower rule is what keeps the private home from switching itself off.
 
 ## Private temporary storage
 
-Under `--isolate`, `/tmp` and `/dev/shm` are fresh tmpfs mounts private to the
-run. The host's `/tmp` is not visible, nothing written there reaches the host or
-another sandbox, and everything is discarded when the run ends.
+Under isolation, `/tmp` and `/dev/shm` are fresh tmpfs mounts private to the run.
+The host's `/tmp` is not visible, nothing written there reaches the host or
+another sandbox, and everything is discarded when the run ends. Under
+`--no-isolate` the host's `/tmp` is what the program gets.
 
 ```toml
 [resources]
@@ -120,7 +122,7 @@ that happens to live under `/tmp`.
 ## The working directory
 
 A target starts in the directory you invoked it from, so relative paths behave as
-they do outside the sandbox. Under `--isolate` that directory only exists inside
+they do outside the sandbox. Under isolation that directory only exists inside
 the sandbox if the policy grants it; where it does not, the target starts in its
 private home and the run says so:
 

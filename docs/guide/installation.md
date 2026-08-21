@@ -58,14 +58,25 @@ In order:
 
 ## Checking your kernel
 
-Bailey adapts to what the kernel offers, and reports what it cannot enforce. To
-see where you stand before running anything:
+Bailey adapts to what the kernel offers, and reports what it cannot enforce. Ask
+it before running anything:
+
+```sh
+bailey doctor
+```
+
+That covers the Landlock ABI and what it does not reach, user namespaces, cgroup
+delegation, kernel BTF, and whether the audit helper can load its programs, each
+with what its absence costs. See
+[knowing what was enforced](/guide/diagnostics).
+
+By hand, if you want the raw answers:
 
 ```sh
 # Landlock present?
 grep -q landlock /sys/kernel/security/lsm && echo "landlock: yes"
 
-# Unprivileged user namespaces, for --isolate?
+# Unprivileged user namespaces, for the isolation layer?
 cat /proc/sys/user/max_user_namespaces
 
 # BTF, for the audit backend?

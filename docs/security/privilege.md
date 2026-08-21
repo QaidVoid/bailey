@@ -40,9 +40,10 @@ The design constraints on that binary:
 - **The helper never spawns the target.** The unprivileged main tool runs the
   program and tells the helper which PID to watch, so the audited program never
   inherits elevated privilege.
-- **The helper's interface is two pipes.** A ready byte out, a PID in, records out,
-  EOF to stop. There is no path by which the target influences what the helper
-  loads.
+- **The helper's interface is two pipes.** A greeting with a protocol version
+  out, the PID and cgroup id to observe in, an acknowledgement and then framed
+  records out, EOF to stop. There is no path by which the target influences what
+  the helper loads.
 - **The privilege is per-run.** The helper starts with the audit, exits with it,
   and holds nothing between runs. There is no daemon with standing privilege.
 

@@ -37,7 +37,9 @@ ungranted paths are absent rather than merely refused.
 theirs: a global default, per-directory `bailey.toml` files discovered by walking
 up from the target, then an explicit per-run file. Grants accumulate, scalars are
 overridden by the nearest layer, and `bailey show` prints the result along with
-every file that contributed to it.
+every file that contributed to it. As in those tools, a discovered file applies
+only once you have accepted it, because the file that decides how far to open a
+sandbox should not arrive with the thing being sandboxed.
 
 **Observes.** Audit mode runs a program while recording what it opens and connects
 to, using eBPF loaded by a small privileged helper. The trace is diffed against

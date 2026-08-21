@@ -23,22 +23,36 @@ filesystem:
   r-- /proc
   r-x /sbin
   r-- /sys
+  r-x /home/you/programs/program
   r-x /usr
 network:
   egress: DenyAll
   bind_ports: []
+  mode: isolated (own namespace, loopback only, no route off the host)
 devices:
   rw- /dev/full
   rw- /dev/null
   r-- /dev/random
   rw- /dev/tty
   r-- /dev/urandom
-  rw- /dev/zero
-resources: ResourceLimits { memory_bytes: None, pids_max: None, cpu_percent: None }
+  r-- /dev/zero
+resources: ResourceLimits { memory_bytes: None, pids_max: None, cpu_percent: None, tmp_bytes: None, shm_bytes: None }
+home: /home/you/.local/share/bailey/program/home
+  (private; the real home is not granted)
+environment:
+  HOME=/home/you/.local/share/bailey/program/home  (base)
+  LANG=C.UTF-8  (base)
+  ...
 ```
 
-That is the `untrusted` floor profile: enough for a dynamically linked binary to
-start, and nothing else. No home directory, no network, no GPU.
+That is the `untrusted` floor profile, plus the target itself: enough for a
+dynamically linked binary to start, and nothing else. No home directory, no
+network, no GPU.
+
+The last three sections are worth reading as carefully as the first. `mode` says
+how the network policy will actually be enforced, `home` says where the program's
+writes will land, and `environment` is the exact set of variables it will be
+handed.
 
 ## 2. Run it
 
@@ -63,6 +77,17 @@ write = ["./data"]
 Paths are relative to the config file's own directory, so `.` here means the
 directory the program lives in.
 
+A config found by walking a directory could have arrived with the program, so it
+applies only once you accept it:
+
+```sh
+bailey trust ./bailey.toml
+```
+
+Do that again whenever you edit the file. Until you do, the run reports the file
+it skipped rather than applying it. See
+[trusting a config](/guide/trusting-a-config).
+
 When you cannot guess, stop guessing and record a session:
 
 ```sh
@@ -78,21 +103,27 @@ bailey profile generate --trace trace.json --target ./program > bailey.toml
 
 See [auditing a program](/guide/audit) for the whole loop.
 
-## 4. Turn on isolation
+## 4. Know what isolation is doing
 
-By default, ungranted paths are denied but still visible: the program can see that
-`/home/you/.ssh` exists, it just cannot open it. Isolation rebuilds the world so
-those paths are not there at all, and host processes are invisible:
+Landlock alone denies ungranted paths but leaves them visible: the program can
+see that `/home/you/.ssh` exists, it just cannot open it. Isolation rebuilds the
+world so those paths are not there at all, and host processes are invisible.
+
+It is on by default. Turning it off leaves Landlock and seccomp:
 
 ```sh
-bailey run ./program
+bailey run --no-isolate ./program
 ```
 
-This needs unprivileged user namespaces. Where they are unavailable, bailey warns
-and falls back to Landlock and seccomp.
+Four things stop being enforceable without it: a nested `deny`, a `read_only`
+island, the private `/tmp`, and the private home at your real home's path. Each
+is reported as unenforced rather than silently dropped.
 
-Isolation also gives the program a private `/tmp`, a private home, and the
-directory you invoked it from, so relative paths work as they do outside. See
+Isolation needs unprivileged user namespaces. Where they are unavailable, bailey
+warns and falls back to Landlock and seccomp on its own.
+
+It also gives the program a private `/tmp`, a private home, and the directory you
+invoked it from, so relative paths work as they do outside. See
 [environment and storage](/guide/environment).
 
 ## 5. Start from a profile

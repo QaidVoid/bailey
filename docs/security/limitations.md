@@ -31,28 +31,31 @@ ignores the host. Bailey warns when you set a host other than `*`.
 
 ## Filesystem
 
-### A nested `deny` needs `--isolate`
+### Taking access away needs the isolation layer
 
 ```toml
 [filesystem]
 read = ["."]
 deny = ["./secret"]
+read_only = ["./versions"]
 ```
 
-Under `--isolate` this is enforced: `./secret` becomes an empty read-only
-filesystem, so there is nothing to read and nothing can be written. Without
-`--isolate`, `./secret/key` is still readable, and the run says so:
+With isolation, which is the default, both are enforced: `./secret` becomes an
+empty read-only filesystem, and `./versions` is remounted read-only. Under
+`--no-isolate` neither is, and the run says so before it starts:
 
 ```
-bailey: warning: `/work/secret` is denied but nested under a granted path,
-and is not enforced without `--isolate`.
+bailey: warning: `/work/secret` is denied but nested under a granted path, and
+is not enforced without namespace isolation. Drop `--no-isolate`, or grant the
+specific subdirectories you need instead of granting the parent.
 ```
 
 The reason is structural. Landlock resolves access by walking up from the
 accessed file, and any ancestor rule that grants the access allows it, so a
 narrower rule on a subpath cannot take rights away; a rule with no access rights
 at all is rejected by the kernel. Taking access away from a granted hierarchy is
-only possible by covering the path over, which is what the mount namespace does.
+only possible by covering the path over or remounting it, which is what the mount
+namespace does.
 
 For runs without isolation, grant the specific subdirectories you want instead of
 granting the parent and carving out exceptions.
