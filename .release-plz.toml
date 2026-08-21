@@ -4,13 +4,15 @@ dependencies_update = false
 # The release itself is enabled for `bailey` alone, below. Nothing else in the
 # workspace is something anyone installs.
 git_release_enable = false
-# Nothing here goes to crates.io: `bailey-ebpf` only builds for the BPF target,
-# the helper is useless without capabilities granted locally, and `bailey-common`
-# is a private wire format between the two. Set this true per package if that
-# ever changes.
+# Off by default, on for the two crates below. `bailey-ebpf` only builds for the
+# BPF target and the helper is inert without capabilities granted locally, so
+# neither is something anyone would install from crates.io.
 publish = false
 release_always = false
-# Only meaningful for a published library API, and nothing here is one.
+# `bailey-common` is a published library, but it is the wire format between the
+# sandbox and its helper rather than an API anyone builds against: the two are
+# released together and a version byte in the protocol is what guards
+# compatibility. Forcing major bumps on it would be noise.
 semver_check = false
 pr_labels = ["release"]
 git_release_body = """
@@ -25,6 +27,7 @@ git_release_body = """
 
 [[package]]
 name = "bailey"
+publish = true
 git_tag_name = "v{{ version }}"
 git_release_enable = true
 changelog_path = "./CHANGELOG.md"
@@ -32,9 +35,17 @@ changelog_path = "./CHANGELOG.md"
 # changelog rather than nowhere.
 changelog_include = ["bailey-common", "bailey-bpf-helper", "bailey-ebpf"]
 
+# Published because `bailey` depends on it, and cargo refuses to publish a crate
+# whose dependency is not on the registry. It gets no tag and no GitHub release
+# of its own: there is one thing to download here, and this is not it.
 [[package]]
 name = "bailey-common"
-release = false
+publish = true
+git_tag_enable = false
+git_release_enable = false
+# Its commits reach the root changelog through `changelog_include` above, so a
+# second changelog beside it would just be the same entries in a worse place.
+changelog_update = false
 
 [[package]]
 name = "bailey-bpf-helper"

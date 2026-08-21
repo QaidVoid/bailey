@@ -9,6 +9,13 @@ name: release-plz
 # pull-requests write. The default GITHUB_TOKEN would work for tagging but a pull
 # request opened with it does not trigger CI, so the release PR would never be
 # checked by the thing that checks everything else.
+#
+# Publishing to crates.io uses Trusted Publishing rather than a registry token:
+# the `id-token: write` permission below is what lets the release job exchange a
+# GitHub OIDC token for a short-lived crates.io one. That has to be configured
+# once per crate, under Settings then Trusted Publishing on crates.io, naming
+# this repository and this workflow file. Both `bailey` and `bailey-common` need
+# it, since they are published together.
 
 on:
   push:
