@@ -4,7 +4,7 @@ layout: home
 hero:
   name: bailey
   text: A sandbox you can reason about
-  tagline: Layered, deny-by-default confinement for untrusted programs on Linux. Unprivileged, near-zero overhead, and able to show you what a program actually touches.
+  tagline: Layered, deny-by-default confinement for untrusted programs on Linux. Unprivileged, a few milliseconds to start, and able to show you what a program actually touches.
   actions:
     - theme: brand
       text: Get started

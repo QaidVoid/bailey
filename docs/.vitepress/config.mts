@@ -78,6 +78,7 @@ export default defineConfig({
             { text: 'CLI', link: '/reference/cli' },
             { text: 'Configuration file', link: '/reference/config' },
             { text: 'Trace format', link: '/reference/trace' },
+            { text: 'What it costs', link: '/reference/benchmarks' },
             { text: 'Kernel requirements', link: '/reference/kernel' },
           ],
         },

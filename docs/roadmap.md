@@ -30,6 +30,8 @@ the detail.
 - **Knowing what happened.** `bailey doctor` reports what this host can enforce
   and what each gap costs; every run reports what it enforced and what the host
   took away.
+- **Knowing what it costs.** The overhead is measured rather than asserted, by a
+  script in the repository, and the numbers are [published](/reference/benchmarks).
 
 ## Decided against
 

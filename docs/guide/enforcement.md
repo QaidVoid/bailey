@@ -1,8 +1,9 @@
 # Enforcement layers
 
 Enforcement is four mechanisms stacked, each covering something the others
-cannot. All of them are unprivileged on a modern kernel, and all of them are
-cheap enough for a game.
+cannot. All of them are unprivileged on a modern kernel, and together they cost
+about 2.6 ms to establish and around 12% on a workload that does nothing but
+open files. See [what it costs](/reference/benchmarks).
 
 ## Landlock
 

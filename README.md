@@ -9,7 +9,9 @@ per-program rules, and can record what a program actually touches so you can
 tighten its policy from evidence instead of guesswork.
 
 Everything except the audit recorder is unprivileged. No setuid binary, no
-daemon, no container runtime.
+daemon, no container runtime. A confined run costs about 2.6 ms to establish,
+and around 12% on a workload that is nothing but opening files; the numbers and
+the script that produced them are in the documentation.
 
 ## Why
 
