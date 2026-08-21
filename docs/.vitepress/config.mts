@@ -7,11 +7,20 @@ export default defineConfig({
   cleanUrls: true,
   lastUpdated: true,
 
+  // Warm, muted token colours. The default palette is cool-toned and sits at
+  // odds with the stone and amber everything else is built from.
+  markdown: {
+    theme: { light: 'vitesse-light', dark: 'vitesse-dark' },
+  },
+
   head: [
-    ['meta', { name: 'theme-color', content: '#3c8772' }],
+    ['link', { rel: 'icon', type: 'image/svg+xml', href: '/favicon.svg' }],
+    ['meta', { name: 'theme-color', content: '#c8801a' }],
   ],
 
   themeConfig: {
+    logo: { light: '/logo.svg', dark: '/logo-dark.svg' },
+
     nav: [
       { text: 'Guide', link: '/guide/what-is-bailey' },
       { text: 'Reference', link: '/reference/cli' },
@@ -100,7 +109,7 @@ export default defineConfig({
 
     footer: {
       message: 'Released under the MIT or Apache-2.0 license.',
-      copyright: 'Copyright © 2026 bailey contributors',
+      copyright: 'Copyright © 2026 QaidVoid',
     },
 
     outline: [2, 3],
