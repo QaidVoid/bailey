@@ -40,6 +40,9 @@ use crate::policy::{self, Egress, Policy, ResourceLimits};
 /// change how a policy's grants are interpreted.
 const TARGET_ABI: ABI = ABI::V6;
 
+/// Prefix of the host-visible directory a reconstructed root is staged in.
+const STAGING_PREFIX: &str = ".bailey-root.";
+
 /// Default size of the private `/tmp` when the policy does not set one.
 const DEFAULT_TMP_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -533,12 +536,49 @@ impl LandlockPlan {
 /// A denied path is never bound. Where a denial sits beneath a path that is
 /// bound, it arrives with its parent and is covered over instead, which is what
 /// makes a nested denial enforceable: Landlock rules can only add access.
+/// Remove staging directories belonging to runs that are no longer alive.
+///
+/// [`StagingGuard`] removes the directory on every path a run can return by, but
+/// a signal does not unwind: a Ctrl-C, or anything else that sends SIGINT or
+/// SIGTERM, leaves it behind. Sweeping before making our own means the leak
+/// heals on the next run rather than accumulating one directory per interrupted
+/// run.
+///
+/// This can only ever remove an empty directory. On the host the staging path is
+/// a bare mountpoint, since the tmpfs and everything built on it live in the
+/// target's own mount namespace, so `remove_dir` refusing a non-empty directory
+/// is the guarantee that nothing else can be caught by this.
+fn sweep_stale_staging() {
+    let Ok(entries) = std::fs::read_dir("/tmp") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(owner) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix(STAGING_PREFIX))
+        else {
+            continue;
+        };
+        // A directory whose owner is still running belongs to a run in progress,
+        // which may well be a concurrent one.
+        if Path::new("/proc").join(owner).exists() {
+            continue;
+        }
+        // Another user's leftovers are not ours to remove, and saying so would
+        // be noise on every run.
+        let _ = std::fs::remove_dir(entry.path());
+    }
+}
+
 fn build_isolation_plan(
     policy: &Policy,
     mode: NetworkMode,
     world: &World,
     implicit_write: &[PathBuf],
 ) -> IsolationPlan {
+    sweep_stale_staging();
+
     let denied = |path: &Path| policy.denied.iter().any(|deny| path.starts_with(deny));
 
     let mut paths: Vec<PathBuf> = policy
@@ -603,7 +643,7 @@ fn build_isolation_plan(
         private_shm: world.private_shm,
         shm_bytes: policy.resources.shm_bytes.unwrap_or(DEFAULT_SHM_BYTES),
         cwd: world.cwd.clone(),
-        staging: PathBuf::from(format!("/tmp/.bailey-root.{}", std::process::id())),
+        staging: PathBuf::from(format!("/tmp/{STAGING_PREFIX}{}", std::process::id())),
     }
 }
 

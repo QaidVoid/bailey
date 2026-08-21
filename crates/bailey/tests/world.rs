@@ -2,7 +2,7 @@
 //! temporary storage, home, and working directory.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn bailey() -> &'static str {
@@ -281,5 +281,44 @@ fn granting_the_real_home_still_opts_out() {
     assert!(
         !shown.contains("(private;"),
         "granting the home itself must hand over the real one: {shown}"
+    );
+}
+
+/// The guard cleans up on every path a run returns by, but a signal does not
+/// unwind: a Ctrl-C leaves the staging directory behind. The next run is what
+/// clears it.
+#[test]
+fn a_staging_directory_from_a_dead_run_is_swept() {
+    if !isolation_active() {
+        eprintln!("skipping: isolation unavailable on this host");
+        return;
+    }
+
+    // A process id that has certainly finished, standing in for a run that was
+    // interrupted before its guard could run.
+    let finished = Command::new("/bin/true").output().unwrap();
+    assert!(finished.status.success());
+    let owner = Command::new("/bin/sh")
+        .args(["-c", "echo $$"])
+        .output()
+        .unwrap();
+    let owner = String::from_utf8_lossy(&owner.stdout).trim().to_owned();
+    if Path::new(&format!("/proc/{owner}")).exists() {
+        eprintln!("skipping: pid {owner} was reused");
+        return;
+    }
+
+    let stale = PathBuf::from(format!("/tmp/.bailey-root.{owner}"));
+    fs::create_dir(&stale).unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let output = run_in(dir.path(), &["run", "/bin/true"]);
+    assert!(output.status.success());
+
+    let swept = !stale.exists();
+    let _ = fs::remove_dir(&stale);
+    assert!(
+        swept,
+        "a run must remove staging directories whose owner is gone"
     );
 }
