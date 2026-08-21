@@ -12,6 +12,10 @@ read = [
     "~/.config/fontconfig",
     "~/.icons",
     "/usr/share/icons",
+    # Read as well as write, below: programs that keep state in the runtime
+    # directory read it back, and a shader cache exists to be read from.
+    "${XDG_RUNTIME_DIR}",
+    "~/.cache/mesa_shader_cache",
     "/usr/share/vulkan",
     "/usr/share/glvnd",
     "/sys/dev/char",

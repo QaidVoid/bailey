@@ -7,6 +7,10 @@
 [filesystem]
 write = ["${XDG_RUNTIME_DIR}"]
 read = [
+    # Read as well as write: programs that keep state here, dconf among them,
+    # read it back before writing it, and a write-only grant leaves them
+    # failing with a permission error rather than doing without.
+    "${XDG_RUNTIME_DIR}",
     "/usr/share/fonts",
     "~/.fonts",
     "~/.local/share/fonts",
