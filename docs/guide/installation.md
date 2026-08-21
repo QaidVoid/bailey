@@ -3,6 +3,30 @@
 Bailey is Linux only. It builds with a stable Rust toolchain and has no system
 dependencies for the enforcement path.
 
+## From a release
+
+Each release carries a statically linked binary for x86_64 and aarch64, so it
+runs whatever your distribution's glibc is. The archive also holds shell
+completions, the man page, and the licences.
+
+```sh
+tar -xzf bailey-<version>-x86_64-unknown-linux-musl.tar.gz
+cd bailey-<version>-x86_64-unknown-linux-musl
+install -Dm755 bailey ~/.local/bin/bailey
+install -Dm644 completions/bailey.fish ~/.config/fish/completions/bailey.fish
+install -Dm644 bailey.1 ~/.local/share/man/man1/bailey.1
+```
+
+Then ask what your kernel gives you:
+
+```sh
+bailey doctor
+```
+
+The audit recorder is not in the archive: it needs capabilities granted on your
+own machine and a nightly toolchain to build, so it comes from source. The
+sandbox itself does not need it.
+
 ## From source
 
 ```sh

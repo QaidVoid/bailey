@@ -64,6 +64,9 @@ distributions include it by default on kernels that support it.
 x86_64 and aarch64 are supported for the seccomp filter. Other architectures fail
 to build the filter and therefore fail to establish a sandbox.
 
+Both glibc and musl targets build, and the released binaries are static musl
+builds so that they do not carry a glibc version requirement.
+
 The eBPF audit programs attach by BTF id and take their argument layout from the
 running kernel, so they are not tied to one architecture. They have been
 exercised on x86_64.

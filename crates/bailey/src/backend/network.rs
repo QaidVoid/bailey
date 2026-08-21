@@ -157,8 +157,11 @@ pub fn enter_isolated() -> io::Result<()> {
 /// port for its own use would fail. Loopback here reaches nothing but the
 /// sandbox itself.
 pub fn bring_loopback_up() -> io::Result<()> {
-    const SIOCGIFFLAGS: libc::c_ulong = 0x8913;
-    const SIOCSIFFLAGS: libc::c_ulong = 0x8914;
+    // `libc::Ioctl` rather than a fixed integer type: the request argument is
+    // `c_ulong` against glibc and `c_int` against musl, and hard-coding either
+    // makes the crate build for only one of them.
+    const SIOCGIFFLAGS: libc::Ioctl = 0x8913;
+    const SIOCSIFFLAGS: libc::Ioctl = 0x8914;
 
     // The kernel's `ifreq`: a name and a union of same-sized members. Only the
     // flags member is used here, so the rest is padding.

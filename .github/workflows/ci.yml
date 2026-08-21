@@ -2,24 +2,89 @@ name: ci
 
 on:
   push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
 
 jobs:
+  # The sandbox itself: stable toolchain, no system dependencies, no privilege.
+  #
+  # Bare cargo commands act on default-members, which is the main tool and the
+  # shared crate. The eBPF programs are a separate member whose only target is
+  # behind a `bpf` feature nothing here enables, so they are not built by this
+  # job; the audit-helper job below builds them for the BPF target.
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
       - name: Format
         run: cargo fmt --all -- --check
+
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
+
       - name: Build
         run: cargo build --all-targets
+
+      # What this runner can actually enforce, recorded before the tests run.
+      # Tests that need a layer the host cannot provide skip rather than fail,
+      # so this is what says whether a green run exercised them.
+      - name: Host capabilities
+        run: cargo run -p bailey --quiet -- doctor || true
+
       - name: Test
         run: cargo test
-# The eBPF audit backend (the bailey-ebpf member and the `ebpf` feature) needs a
-# nightly toolchain and bpf-linker, so it is not built here. Bare cargo commands
-# act on default-members, which excludes it.
+
+  # The audit recorder, the only part that needs nightly and bpf-linker.
+  audit-helper:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Nightly, for the BPF target
+        run: rustup toolchain install nightly --component rust-src
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: bpf
+
+      - name: Install bpf-linker
+        run: cargo install bpf-linker --locked
+
+      - name: Build
+        run: cargo build -p bailey-bpf-helper
+
+      # The programs are gated behind a feature so host-wide commands skip them.
+      # This is what catches the gate drifting from what the build script
+      # enables, which would produce a helper with nothing to load.
+      - name: The build produced a real BPF object
+        run: |
+          object=$(find target -path '*bpfel-unknown-none/release/bailey-ebpf' | head -1)
+          test -n "$object" || { echo "no eBPF object was produced"; exit 1; }
+          file "$object"
+          file "$object" | grep -q eBPF
+
+  # VitePress fails a build on a dead internal link, which is the failure worth
+  # catching: these pages cross-reference heavily.
+  docs:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: docs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - run: bun run build

@@ -13,6 +13,23 @@ fn bailey() -> &'static str {
     env!("CARGO_BIN_EXE_bailey")
 }
 
+/// Whether this kernel can deny anything at all. Without Landlock a shell still
+/// runs, so a test that asserts a path is unreachable would fail rather than
+/// report the host's limits.
+fn landlock_available() -> bool {
+    bailey::backend::probe::probe(false).landlock_abi.is_some()
+}
+
+/// Whether a run genuinely enters its own namespaces, which the read-only
+/// remount of a narrower grant needs.
+fn isolation_active() -> bool {
+    let output = Command::new(bailey())
+        .args(["run", "/bin/sh", "-c", "echo $$"])
+        .output();
+    matches!(output, Ok(out) if out.status.success()
+        && String::from_utf8_lossy(&out.stdout).trim() == "1")
+}
+
 /// Run a script inside a confined shell launched from `cwd`.
 ///
 /// The store is per-test so that neither the trust records nor the private
@@ -62,6 +79,10 @@ fn workspace() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
 
 #[test]
 fn a_command_in_the_shell_is_confined() {
+    if !landlock_available() {
+        eprintln!("skipping: no Landlock on this kernel");
+        return;
+    }
     let store = tempfile::tempdir().unwrap();
     let (_root, project, private) = workspace();
 
@@ -85,6 +106,10 @@ fn a_command_in_the_shell_is_confined() {
 
 #[test]
 fn a_grandchild_process_is_confined() {
+    if !landlock_available() {
+        eprintln!("skipping: no Landlock on this kernel");
+        return;
+    }
     let store = tempfile::tempdir().unwrap();
     let (_root, project, private) = workspace();
 
@@ -133,6 +158,10 @@ fn the_launch_directory_is_readable_and_writable() {
 
 #[test]
 fn a_config_layer_can_retract_the_implicit_grant() {
+    if !landlock_available() {
+        eprintln!("skipping: no Landlock on this kernel");
+        return;
+    }
     let store = tempfile::tempdir().unwrap();
     let (_root, project, _private) = workspace();
     let config = project.join("bailey.toml");
@@ -168,6 +197,10 @@ fn a_config_layer_can_retract_the_implicit_grant() {
 /// `read` in a config would quietly mean `write` on their own files.
 #[test]
 fn a_read_only_grant_beneath_the_launch_directory_is_honoured() {
+    if !isolation_active() {
+        eprintln!("skipping: isolation unavailable on this host");
+        return;
+    }
     let store = tempfile::tempdir().unwrap();
     let (_root, project, _private) = workspace();
     let vendor = project.join("vendor");

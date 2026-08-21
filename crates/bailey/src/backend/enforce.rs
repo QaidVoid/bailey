@@ -723,6 +723,16 @@ fn set_no_new_privs() -> io::Result<()> {
     Ok(())
 }
 
+/// `kexec_file_load`, which libc does not name on every target it exists on.
+///
+/// The syscall is present on aarch64, but the musl bindings have no constant for
+/// it, so naming it through libc alone makes the crate build for glibc and not
+/// for musl. The number is stable kernel ABI.
+#[cfg(all(target_arch = "aarch64", target_env = "musl"))]
+const SYS_KEXEC_FILE_LOAD: libc::c_long = 294;
+#[cfg(not(all(target_arch = "aarch64", target_env = "musl")))]
+const SYS_KEXEC_FILE_LOAD: libc::c_long = libc::SYS_kexec_file_load;
+
 /// Syscalls denied to the target. These are not needed by normal applications
 /// and are common building blocks for sandbox escape, privilege escalation, or
 /// tampering with other processes.
@@ -733,7 +743,7 @@ fn denied_syscalls() -> &'static [i64] {
         libc::SYS_request_key,
         libc::SYS_keyctl,
         libc::SYS_kexec_load,
-        libc::SYS_kexec_file_load,
+        SYS_KEXEC_FILE_LOAD,
         libc::SYS_init_module,
         libc::SYS_finit_module,
         libc::SYS_delete_module,

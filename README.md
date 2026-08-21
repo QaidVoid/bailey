@@ -47,8 +47,11 @@ profile built by watching a program is directly usable for confining it.
 
 ## Install
 
-Enforcement, config, profiles, and reconciliation build with a stable toolchain
-and no system dependencies:
+A release carries a statically linked binary for x86_64 and aarch64, with shell
+completions and a man page. Unpack it and put `bailey` on your `PATH`.
+
+From source, enforcement, config, profiles, and reconciliation build with a
+stable toolchain and no system dependencies:
 
 ```sh
 cargo build --release
