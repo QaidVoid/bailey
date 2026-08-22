@@ -726,9 +726,16 @@ fn cmd_profile_generate(args: GenerateArgs) -> anyhow::Result<i32> {
     let target_dir = target_dir(&args.target);
 
     let findings = reconcile::reconcile(&trace.events, &resolved.policy, &target_dir);
+
+    // Counted apart from the high-risk ones. A finding whose path could not be
+    // resolved is dropped whatever the flags say, so folding it into the
+    // high-risk count would report a number that disagrees with the list
+    // `bailey audit` printed, and would offer a flag that does not bring it
+    // back.
+    let unresolved = findings.iter().filter(|finding| finding.unresolved).count();
     let excluded = findings
         .iter()
-        .filter(|finding| finding.risk.is_high())
+        .filter(|finding| !finding.unresolved && finding.risk.is_high())
         .count();
     let selected: Vec<Finding> = findings
         .into_iter()
@@ -738,6 +745,13 @@ fn cmd_profile_generate(args: GenerateArgs) -> anyhow::Result<i32> {
     if excluded > 0 && !args.include_high_risk {
         eprintln!(
             "bailey: excluded {excluded} high-risk access(es); pass --include-high-risk to add them"
+        );
+    }
+    if unresolved > 0 {
+        eprintln!(
+            "bailey: skipped {unresolved} access(es) whose path could not be resolved, so the \
+             profile does not grant them. They are relative paths, which the recorder cannot \
+             place after the fact; audit the target by its absolute path to resolve them."
         );
     }
     if trace.is_truncated() {

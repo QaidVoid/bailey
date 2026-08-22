@@ -41,6 +41,26 @@ An ungranted access is high risk when it is:
 
 Everything else is routine.
 
+## Audit by absolute path
+
+```sh
+bailey audit --save-trace trace.json /home/you/app/program     # not ./program
+```
+
+A path the program opens relatively is recorded as the kernel saw it, and
+resolving one needs the accessing process's working directory, which is gone by
+the time the recorder looks. Such findings are reported separately:
+
+```
+unresolved (relative paths whose directory could not be read):
+  [Read] ./data/settings.conf
+```
+
+**A profile generated from them grants nothing**, because a path that names
+nothing in particular cannot be granted. The same program audited by its
+absolute path resolves the same reads and generates the grant. Launching it as
+`./program` is what makes the difference, not anything about the program.
+
 ## Generating a profile
 
 ```sh
@@ -52,6 +72,13 @@ High-risk findings are excluded, and the count of what was excluded is reported:
 
 ```
 bailey: excluded 2 high-risk access(es); pass --include-high-risk to add them
+```
+
+Anything unresolved is reported on its own line, since no flag brings it back:
+
+```
+bailey: skipped 2 access(es) whose path could not be resolved, so the profile
+does not grant them.
 ```
 
 Read the excluded list before reaching for `--include-high-risk`. A game that

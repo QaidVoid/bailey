@@ -91,6 +91,10 @@ accesses the current policy does not grant, split into high-risk and routine.
 The resolved policy applies during an audit; the accesses it denies are recorded
 rather than permitted. `--unconfined` lifts that.
 
+Audit the target by its absolute path. A path opened relatively cannot be
+resolved after the fact, and an unresolved finding is reported but never
+generated into a profile. See [auditing a program](/guide/audit).
+
 Unlike `run`, audit does not isolate. The recorder needs the target held at
 `exec`, and that stop is not inherited across the fork that puts it in a PID
 namespace, so `--isolate` is rejected with an explanation rather than ignored.
