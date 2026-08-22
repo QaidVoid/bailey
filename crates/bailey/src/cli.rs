@@ -925,8 +925,15 @@ fn warn_if_target_denied(policy: &crate::policy::Policy, target: &Path) {
     }
 }
 
+/// The directory the target actually lives in.
+///
+/// Resolved rather than taken as written: a program on `PATH` is often a symlink
+/// into a store elsewhere, and the directory beside the link holds none of its
+/// code. Reconciliation calls everything outside this directory unexpected, so
+/// getting it wrong marks a program's own files as foreign access.
 fn target_dir(target: &Path) -> PathBuf {
-    std::path::absolute(target)
+    std::fs::canonicalize(target)
+        .or_else(|_| std::path::absolute(target))
         .unwrap_or_else(|_| target.to_path_buf())
         .parent()
         .map(Path::to_path_buf)

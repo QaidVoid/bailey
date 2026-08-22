@@ -7,9 +7,10 @@
 //! a generated profile unless the caller explicitly selects it, so auditing an
 //! untrusted target never silently blesses its behavior.
 
-use std::collections::BTreeSet;
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
+use crate::backend::world;
 use crate::event::{AccessEvent, AccessKind, Resolution, Resource};
 use crate::policy::{Access, Egress, Policy};
 
@@ -75,6 +76,89 @@ pub fn reconcile(trace: &[AccessEvent], policy: &Policy, target_dir: &Path) -> V
 /// The caller decides which findings to include; nothing here is implicit. To
 /// honor the never-auto-trust rule, callers should exclude high-risk findings
 /// unless the user explicitly confirmed them.
+/// How many entries a directory needs before a grant names it rather than them.
+const COALESCE_AT: usize = 3;
+
+/// Replace many paths under one directory with the directory itself.
+///
+/// A trace of a real program is thousands of files: one run of a coding agent
+/// read 1,760, of which 192 sat in a single directory of syntax definitions. A
+/// grant per file is unreadable, and a policy nobody reads gets replaced by
+/// something far wider. Bailey's grants are hierarchies, so the useful answer is
+/// the directory.
+///
+/// This grants more than was observed, which is the trade: wide enough to read,
+/// narrow enough to mean something. It stops where a directory has fewer than
+/// [`COALESCE_AT`] entries, which is what keeps it from walking up to the home.
+fn coalesce(paths: BTreeSet<String>) -> (BTreeSet<String>, bool) {
+    let mut current: BTreeSet<PathBuf> = paths.iter().map(PathBuf::from).collect();
+    let mut coalesced = false;
+
+    loop {
+        let mut by_parent: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
+        for path in &current {
+            match path.parent() {
+                Some(parent) => by_parent
+                    .entry(parent.to_path_buf())
+                    .or_default()
+                    .push(path.clone()),
+                None => {
+                    by_parent.entry(path.clone()).or_default();
+                }
+            }
+        }
+
+        let mut next = BTreeSet::new();
+        let mut changed = false;
+        for (parent, children) in by_parent {
+            if children.len() >= COALESCE_AT && may_name(&parent) {
+                next.insert(parent);
+                changed = true;
+            } else {
+                next.extend(children);
+            }
+        }
+
+        coalesced |= changed;
+        if !changed {
+            // A path already covered by a directory in the set adds nothing.
+            let covered: Vec<PathBuf> = next
+                .iter()
+                .filter(|path| {
+                    next.iter()
+                        .any(|other| *other != **path && path.starts_with(other))
+                })
+                .cloned()
+                .collect();
+            for path in covered {
+                next.remove(&path);
+            }
+            return (
+                next.into_iter()
+                    .map(|path| path.display().to_string())
+                    .collect(),
+                coalesced,
+            );
+        }
+        current = next;
+    }
+}
+
+/// Whether a directory is specific enough to name in a grant.
+///
+/// The home directory and anything above it are never the answer: a grant on the
+/// home is the thing this tool exists to avoid, and arriving at one by
+/// accumulation would be the worst way to get there.
+fn may_name(dir: &Path) -> bool {
+    if dir.components().count() < 3 {
+        return false;
+    }
+    match std::env::var_os("HOME") {
+        Some(home) => !Path::new(&home).starts_with(dir),
+        None => true,
+    }
+}
+
 pub fn generate_profile(findings: &[Finding]) -> String {
     let mut read = BTreeSet::new();
     let mut write = BTreeSet::new();
@@ -120,7 +204,31 @@ pub fn generate_profile(findings: &[Finding]) -> String {
         }
     }
 
+    // A program that was executed from outside the sandbox `PATH` cannot be found
+    // by name, and the environment is not otherwise generated: nothing in a trace
+    // implies a variable. An execution is the exception, because the trace says
+    // exactly where the thing that ran was.
+    let interpreter_dirs: BTreeSet<String> = execute
+        .iter()
+        .filter_map(|path| Path::new(path).parent())
+        .filter(|dir| {
+            !world::SANDBOX_PATH
+                .split(':')
+                .any(|known| Path::new(known) == *dir)
+        })
+        .map(|dir| dir.display().to_string())
+        .collect();
+
+    let (read, read_coalesced) = coalesce(read);
+    let (write, write_coalesced) = coalesce(write);
+    let (execute, execute_coalesced) = coalesce(execute);
+
     let mut out = String::new();
+    if read_coalesced || write_coalesced || execute_coalesced {
+        out.push_str("# Directories, where many files under one were used: a grant per file\n");
+        out.push_str("# is unreadable, and these are hierarchies. Narrow any that are wider\n");
+        out.push_str("# than you want.\n");
+    }
     if skipped_terminal {
         out.push_str("# The terminal is not granted: a pty is named per session, and the\n");
         out.push_str("# sandbox provides the one it was started from.\n");
@@ -139,6 +247,16 @@ pub fn generate_profile(findings: &[Finding]) -> String {
         if !bind_ports.is_empty() {
             out.push_str(&toml_port_array("bind_ports", &bind_ports));
         }
+    }
+
+    if !interpreter_dirs.is_empty() {
+        let mut path: Vec<String> = interpreter_dirs.iter().cloned().collect();
+        path.push(world::SANDBOX_PATH.to_owned());
+        out.push_str("\n# Where the programs this ran were found. Without this they are not\n");
+        out.push_str("# on PATH inside the sandbox, and a `#!/usr/bin/env` line finds\n");
+        out.push_str("# nothing. The rest of the environment is never generated.\n");
+        out.push_str("[env]\n");
+        out.push_str(&format!("set = {{ PATH = \"{}\" }}\n", path.join(":")));
     }
 
     out

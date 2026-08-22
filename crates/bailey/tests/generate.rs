@@ -243,3 +243,60 @@ fn a_recorded_run_produces_a_policy_that_run_accepts() {
         String::from_utf8_lossy(&after.stderr)
     );
 }
+
+/// A real trace is thousands of files. One run of a coding agent read 1,760, of
+/// which 192 sat in a single directory: a grant per file is unreadable, and an
+/// unreadable policy gets replaced by a far wider one.
+#[test]
+fn many_files_in_one_directory_become_the_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let trace = dir.path().join("trace.json");
+    let target_dir = dir.path().display();
+
+    let events: Vec<String> = (0..12)
+        .map(|n| {
+            format!(
+                r#"{{"kind":"read","resource":{{"path":"/opt/app/lib/vendor/mod{n}.js"}},"pid":10,"timestamp_ns":0,"resolution":"absolute"}}"#
+            )
+        })
+        .chain(std::iter::once(
+            format!(
+                r#"{{"kind":"read","resource":{{"path":"{target_dir}/alone.conf"}},"pid":10,"timestamp_ns":0,"resolution":"absolute"}}"#
+            ),
+        ))
+        .collect();
+    fs::write(
+        &trace,
+        format!(
+            r#"{{"version":1,"dropped":0,"events":[{}]}}"#,
+            events.join(",")
+        ),
+    )
+    .unwrap();
+
+    let target = dir.path().join("app");
+    fs::write(&target, "").unwrap();
+
+    let output = Command::new(bailey())
+        .args(["profile", "generate", "--trace"])
+        .arg(&trace)
+        .arg("--target")
+        .arg(&target)
+        .arg("--include-high-risk")
+        .output()
+        .unwrap();
+    let profile = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        profile.contains("/opt/app/lib/vendor\""),
+        "twelve files under one directory should be that directory: {profile}"
+    );
+    assert!(
+        !profile.contains("mod0.js"),
+        "and not the files themselves: {profile}"
+    );
+    assert!(
+        profile.contains("alone.conf"),
+        "a lone file stays a file: {profile}"
+    );
+}
