@@ -35,6 +35,68 @@ bailey audit --save-trace trace.json ./program
 Without the audit helper installed, `strace -f -e trace=file ./program` outside the
 sandbox gives you a rougher version of the same answer.
 
+## Something that exists says "No such file or directory"
+
+```
+/bin/sh: /home/you/.local/share/bun/bin/pi: No such file or directory
+```
+
+The path is right there on the host, so this reads as nonsense. It usually means
+a **symlink whose target you did not grant**. Modern toolchain installers put a
+farm of links on your `PATH` pointing into a store somewhere else:
+
+```sh
+readlink -f "$(command -v pi)"
+# /home/you/.local/share/bun/install/global/node_modules/.../dist/cli.js
+```
+
+Granting the `bin` directory grants the links. Their targets are elsewhere, so
+under isolation they are absent, and following one lands on nothing. Grant both:
+
+```toml
+[filesystem]
+read = ["~/.local/share/bun/bin", "~/.local/share/bun/install/global/node_modules"]
+execute = ["~/.local/share/bun/bin", "~/.local/share/bun/install/global/node_modules"]
+```
+
+`bun`, `mise`, `npm`, `pnpm`, and `nvm` all have this shape, and a version
+manager adds a second hop: `.../node/latest/bin/node` is itself a link to
+`.../node/26.7.0/bin/node`.
+
+::: tip A symlinked target is fine
+This applies to links a program follows at run time. The target you name on the
+command line is bind-mounted, and a bind follows the link, so
+`bailey run ~/.local/bin/some-link` works without granting anything extra.
+:::
+
+## An interpreter is not found
+
+```
+env: 'node': No such file or directory
+```
+
+A `#!/usr/bin/env foo` script looks for `foo` on `PATH`, and the sandbox `PATH`
+is `/usr/local/bin:/usr/bin:/bin` rather than yours. An interpreter installed
+under your home is not on it, so the script never finds it.
+
+```toml
+[filesystem]
+read = ["~/.local/share/mise/installs/node/26.7.0"]
+execute = ["~/.local/share/mise/installs/node/26.7.0"]
+
+[env]
+set = { PATH = "${HOME}/.local/share/mise/installs/node/26.7.0/bin:/usr/local/bin:/usr/bin:/bin" }
+```
+
+Setting `PATH` outright is usually better than passing yours through, which would
+name directories the policy does not grant. Use `${HOME}` rather than `~` in a
+value with more than one entry: a leading `~` expands, but only a leading one,
+and `PATH` is a list.
+
+Note that `bailey audit` cannot help you find this one: a program that never
+looks somewhere opens nothing there, so there is nothing to record. The audit
+says so when the target exits 127.
+
 ## A `bailey.toml` next to the program is ignored
 
 ```

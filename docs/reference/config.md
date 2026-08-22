@@ -137,7 +137,7 @@ best-effort.
 | Key | Type | Description |
 | --- | --- | --- |
 | `pass` | list of names | Forward these caller variables. A trailing `*` matches by prefix |
-| `set` | table | Define variables outright |
+| `set` | table | Define variables outright. `${VAR}` and a leading `~` expand, as they do in paths |
 | `deny` | list of names | Remove these from the final environment, including the base set |
 | `reset` | bool | Discard everything lower layers passed or set |
 
@@ -197,7 +197,8 @@ Commands run through `sh -c` and accumulate across layers, running in layer orde
 - Relative paths resolve against the directory of the config file containing them.
 - `~` and `~/...` expand using `$HOME`.
 - `${VAR}` expands from the environment, which is how a shared profile can name
-  something like `${XDG_RUNTIME_DIR}`. An unset variable expands to nothing,
+  something like `${XDG_RUNTIME_DIR}`. It expands in `env.set` values too, since
+  most of what goes there is a path. An unset variable expands to nothing,
   leaving a path that matches nothing rather than one that matches something
   unintended.
 - `${PWD}` is the directory the run was launched from, asked of the kernel when

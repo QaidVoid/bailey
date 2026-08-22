@@ -464,7 +464,7 @@ fn apply_layer(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> 
             }
         }
         for (name, value) in &env.set {
-            acc.env.set.insert(name.clone(), value.clone());
+            acc.env.set.insert(name.clone(), expand_value(value));
         }
         for name in &env.deny {
             acc.env.pass.retain(|passed| passed != name);
@@ -703,6 +703,24 @@ fn expand_variables(raw: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// Expand a value written in config the way a path written in config is.
+///
+/// Most of what people set here is a path: `PATH`, `LD_LIBRARY_PATH`, a cache
+/// directory. Writing `${HOME}/...` in one and having it arrive verbatim, while
+/// the same text in `[filesystem]` resolves, is a trap: it looks right and
+/// silently is not. A leading `~` is expanded too, though `${HOME}` is what
+/// works for the later entries of a list like `PATH`.
+fn expand_value(raw: &str) -> String {
+    let expanded = expand_variables(raw);
+    match expanded.strip_prefix("~/") {
+        Some(rest) => match std::env::var_os("HOME") {
+            Some(home) => format!("{}/{rest}", home.to_string_lossy()),
+            None => expanded,
+        },
+        None => expanded,
+    }
 }
 
 fn expand_tilde(raw: &str) -> PathBuf {
@@ -950,6 +968,26 @@ mod tests {
         )];
         let resolved = merge(&layers).unwrap();
         assert_eq!(resolved.policy.filesystem[0].path, PathBuf::from("/thing"));
+    }
+
+    #[test]
+    fn env_values_expand_like_paths_do() {
+        unsafe { std::env::set_var("BAILEY_TEST_BIN", "/opt/toolchain/bin") };
+        let layers = [layer(
+            "/base",
+            "[env]\nset = { PATH = \"${BAILEY_TEST_BIN}:/usr/bin\", PLAIN = \"literal\" }",
+        )];
+        let resolved = merge(&layers).unwrap();
+        assert_eq!(
+            resolved.policy.env.set.get("PATH").map(String::as_str),
+            Some("/opt/toolchain/bin:/usr/bin"),
+            "a path written in env is a path"
+        );
+        assert_eq!(
+            resolved.policy.env.set.get("PLAIN").map(String::as_str),
+            Some("literal"),
+            "and a value with nothing to expand is left alone"
+        );
     }
 
     #[test]
