@@ -592,7 +592,7 @@ fn cmd_audit(args: AuditArgs) -> anyhow::Result<i32> {
     }
 
     let findings = reconcile::reconcile(&trace.events, &resolved.policy, &target_dir);
-    print_findings(&findings);
+    print_findings(&findings, code);
     Ok(code)
 }
 
@@ -989,10 +989,25 @@ fn print_policy(resolved: &Resolved, target: &Path) {
     }
 }
 
-fn print_findings(findings: &[Finding]) {
+/// Report what the run touched that the policy does not grant.
+///
+/// The exit status is part of the report. A trace is only evidence about the
+/// work the target actually did, so "nothing ungranted" from a run that failed
+/// says nothing about whether the policy is sufficient: the target may have
+/// stopped long before reaching what it needs.
+fn print_findings(findings: &[Finding], exit_code: i32) {
     if findings.is_empty() {
-        println!("audit: no ungranted access observed");
+        println!("{}", nothing_observed(exit_code));
         return;
+    }
+    if exit_code != 0 {
+        println!(
+            "audit: the target exited {exit_code}, so this trace may stop short of what \
+             it needs"
+        );
+        if let Some(hint) = command_not_found_hint(exit_code) {
+            println!("{hint}");
+        }
     }
 
     let unresolved: Vec<_> = findings.iter().filter(|f| f.unresolved).collect();
@@ -1030,6 +1045,45 @@ fn print_findings(findings: &[Finding]) {
     }
 }
 
+/// What to say when a trace holds nothing the policy does not already grant.
+///
+/// From a run that worked, that is the answer everyone wants. From one that
+/// failed it is close to meaningless, and reads like a clean bill of health,
+/// which is the worst way for this to be wrong.
+fn nothing_observed(exit_code: i32) -> String {
+    if exit_code == 0 {
+        return "audit: no ungranted access observed".into();
+    }
+    let mut message = format!(
+        "audit: no ungranted access observed, but the target exited {exit_code}, so this \
+         trace is of a run that did not do its work. Nothing here says the policy is \
+         sufficient."
+    );
+    if let Some(hint) = command_not_found_hint(exit_code) {
+        message.push('\n');
+        message.push_str(&hint);
+    }
+    message
+}
+
+/// Explain the status a shell returns for a program it could not find.
+///
+/// The way to get it here is an interpreter: a `#!/usr/bin/env foo` script whose
+/// `foo` lives under the home, which the built `PATH` does not name. Nothing is
+/// recorded for it either, because a program that never looks somewhere never
+/// opens anything there, and the trace can only hold what was opened.
+fn command_not_found_hint(exit_code: i32) -> Option<String> {
+    (exit_code == 127).then(|| {
+        format!(
+            "audit: 127 is what a shell returns for a program it could not find, and \
+             nothing is recorded for a path that was never looked at. The sandbox PATH \
+             is `{}`, so an interpreter installed under your home is not on it. Grant \
+             its directory and pass PATH through, or name it by absolute path.",
+            world::SANDBOX_PATH
+        )
+    })
+}
+
 fn describe(finding: &Finding) -> String {
     use crate::event::Resource;
     match &finding.resource {
@@ -1059,4 +1113,28 @@ fn access_flags(access: Access) -> String {
         '-'
     });
     flags
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_clean_trace_from_a_failed_run_is_not_a_clean_bill_of_health() {
+        let worked = nothing_observed(0);
+        assert_eq!(worked, "audit: no ungranted access observed");
+
+        let failed = nothing_observed(1);
+        assert!(failed.contains("did not do its work"), "{failed}");
+        assert!(
+            !failed.contains("127 is what a shell returns"),
+            "the interpreter hint belongs to 127 alone: {failed}"
+        );
+
+        // The case that prompted this: a `#!/usr/bin/env node` script whose node
+        // is installed under the home, so nothing is ever opened to record.
+        let missing = nothing_observed(127);
+        assert!(missing.contains("did not do its work"), "{missing}");
+        assert!(missing.contains(world::SANDBOX_PATH), "{missing}");
+    }
 }

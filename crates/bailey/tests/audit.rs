@@ -6,6 +6,7 @@
 //! record.
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -16,6 +17,40 @@ fn bailey() -> &'static str {
 }
 
 /// The helper, if one is configured and able to load its programs.
+/// `doctor` and a run must agree about where the helper is. They looked
+/// separately once, and disagreed: a helper installed on PATH was reported
+/// missing by `doctor` while `bailey audit` used it happily.
+#[test]
+fn the_helper_is_found_on_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let installed = dir.path().join("bailey-bpf-helper");
+    fs::write(&installed, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&installed, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // Somewhere with no helper beside it, so only PATH can answer.
+    let elsewhere = dir.path().join("bin");
+    fs::create_dir(&elsewhere).unwrap();
+    let bailey_copy = elsewhere.join("bailey");
+    fs::copy(bailey(), &bailey_copy).unwrap();
+
+    let output = Command::new(&bailey_copy)
+        .arg("doctor")
+        .env("PATH", dir.path())
+        .env_remove("BAILEY_BPF_HELPER")
+        .output()
+        .unwrap();
+    let report = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        !report.contains("helper: not found"),
+        "a helper on PATH is one a run would use, so `doctor` must see it: {report}"
+    );
+    assert!(
+        report.contains(&installed.display().to_string()),
+        "and must name the one it found: {report}"
+    );
+}
+
 fn helper() -> Option<PathBuf> {
     let path = PathBuf::from(std::env::var_os("BAILEY_BPF_HELPER")?);
     path.is_file().then_some(path)

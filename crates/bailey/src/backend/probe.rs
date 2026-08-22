@@ -20,6 +20,10 @@ const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1 << 0;
 const ABI_NETWORK: u32 = 4;
 /// Landlock ABI level at which scoping became available.
 const ABI_SCOPE: u32 = 6;
+
+/// Name of the privileged helper binary.
+pub const HELPER_BIN: &str = "bailey-bpf-helper";
+
 /// Whether the privileged audit helper is usable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HelperStatus {
@@ -131,7 +135,14 @@ fn helper_status() -> HelperStatus {
     }
 }
 
-fn locate_helper() -> Option<PathBuf> {
+/// Find the audit helper: the path named in the environment, then one beside
+/// this executable, then one on `PATH`.
+///
+/// Both the probe and the audit backend resolve it through here. They used to
+/// look separately, and disagreed: the backend fell back to the bare name, which
+/// `Command` resolves on `PATH`, while the probe gave up before that and had
+/// `doctor` report a helper missing that a run would have found and used.
+pub fn locate_helper() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("BAILEY_BPF_HELPER") {
         let path = PathBuf::from(path);
         return path.is_file().then_some(path);
@@ -139,12 +150,18 @@ fn locate_helper() -> Option<PathBuf> {
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {
-        let candidate = dir.join("bailey-bpf-helper");
+        let candidate = dir.join(HELPER_BIN);
         if candidate.is_file() {
             return Some(candidate);
         }
     }
-    None
+    // An installed helper is the ordinary case for anyone who did not build
+    // from source, and `cargo install` puts it on `PATH` rather than beside
+    // bailey.
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths)
+        .map(|dir| dir.join(HELPER_BIN))
+        .find(|candidate| candidate.is_file())
 }
 
 #[cfg(test)]

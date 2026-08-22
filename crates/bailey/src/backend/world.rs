@@ -15,7 +15,7 @@ use crate::policy::Policy;
 
 /// The `PATH` handed to a target, rather than the caller's, which commonly
 /// includes directories the sandbox does not grant.
-const SANDBOX_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
+pub const SANDBOX_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 
 /// Caller variables that carry locale and terminal settings. These are not
 /// credentials, and a program without them behaves oddly enough to look broken.

@@ -234,19 +234,14 @@ fn read_frames(stream: &mut impl Read) -> Trace {
 }
 
 fn locate_helper() -> Result<PathBuf, BackendError> {
-    if let Some(path) = std::env::var_os("BAILEY_BPF_HELPER") {
-        return Ok(PathBuf::from(path));
-    }
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
-        let candidate = dir.join(HELPER_BIN);
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
-    }
-    // Fall back to PATH resolution by name.
-    Ok(PathBuf::from(HELPER_BIN))
+    crate::backend::probe::locate_helper().ok_or_else(|| {
+        BackendError::Unsupported(format!(
+            "no `{HELPER_BIN}` found. Looked at $BAILEY_BPF_HELPER, beside this \
+             executable, and on PATH. Build it with `cargo build --release -p \
+             bailey-bpf-helper`, then grant it capabilities with `setcap \
+             cap_bpf,cap_perfmon+ep`."
+        ))
+    })
 }
 
 fn to_event(record: &AccessRecord) -> AccessEvent {
