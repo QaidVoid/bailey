@@ -589,9 +589,27 @@ fn cmd_audit(args: AuditArgs) -> anyhow::Result<i32> {
     if let Some(path) = &args.save_trace {
         std::fs::write(path, serde_json::to_string_pretty(&trace)?)?;
         eprintln!("bailey: wrote trace to {}", path.display());
+        // Carrying this run's flags across matters more than it looks: generating
+        // against a different policy reconciles the same trace against different
+        // grants, and reports a wildly different set of findings without saying
+        // that is what happened.
+        let mut flags = String::new();
+        if let Some(config) = &args.config {
+            flags.push_str(&format!(" -c {}", config.display()));
+        }
+        if let Some(profile) = &args.profile {
+            flags.push_str(&format!(" -p {profile}"));
+        }
+        eprintln!("bailey: turn it into a policy with the same policy this run used:");
+        eprintln!(
+            "bailey:   bailey profile generate{flags} --trace {} --target {}",
+            path.display(),
+            target.program.display()
+        );
     }
 
-    let findings = reconcile::reconcile(&trace.events, &resolved.policy, &target_dir);
+    let effective = policy_with_own_storage(&resolved.policy, &target.program);
+    let findings = reconcile::reconcile(&trace.events, &effective, &target_dir);
     print_findings(&findings, code);
     Ok(code)
 }
@@ -702,6 +720,27 @@ fn report_untrusted(target: &Path, explicit: Option<&Path>) {
     }
 }
 
+/// The policy as it stood at run time, including what the sandbox provides on
+/// its own.
+///
+/// The private home is created and granted by the backend rather than written in
+/// anyone's config, so a plain reconciliation reports a program reading its own
+/// settings as ungranted access outside its directory. Every audited program
+/// does that, and a high-risk list full of a program's own storage is one nobody
+/// reads.
+fn policy_with_own_storage(policy: &crate::policy::Policy, target: &Path) -> crate::policy::Policy {
+    let mut effective = policy.clone();
+    // Audit does not isolate, so the home the target used is the host one.
+    let world = World::derive(target, policy, false);
+    if let Some(home) = world.home_host {
+        effective.filesystem.push(crate::policy::FsRule {
+            path: home,
+            access: Access::READ | Access::WRITE,
+        });
+    }
+    effective
+}
+
 fn cmd_profile_generate(args: GenerateArgs) -> anyhow::Result<i32> {
     let text = std::fs::read_to_string(&args.trace)?;
     let trace: Trace = serde_json::from_str(&text).map_err(|err| {
@@ -725,7 +764,8 @@ fn cmd_profile_generate(args: GenerateArgs) -> anyhow::Result<i32> {
     let resolved = resolve(&profile, &args.target, args.config.as_deref())?;
     let target_dir = target_dir(&args.target);
 
-    let findings = reconcile::reconcile(&trace.events, &resolved.policy, &target_dir);
+    let effective = policy_with_own_storage(&resolved.policy, &args.target);
+    let findings = reconcile::reconcile(&trace.events, &effective, &target_dir);
 
     // Counted apart from the high-risk ones. A finding whose path could not be
     // resolved is dropped whatever the flags say, so folding it into the
@@ -758,6 +798,22 @@ fn cmd_profile_generate(args: GenerateArgs) -> anyhow::Result<i32> {
         println!(
             "# Generated from an incomplete trace: {} access(es) were not recorded.",
             trace.dropped
+        );
+    }
+    // What this grants is the difference between the trace and the policy it was
+    // reconciled against, so on its own it is not a policy that runs anything.
+    if args.config.is_some() || args.profile.is_some() {
+        let base = match (&args.config, &args.profile) {
+            (Some(config), _) => format!("-c {}", config.display()),
+            (_, Some(profile)) => format!("-p {profile}"),
+            _ => unreachable!("one of the two is set"),
+        };
+        println!("# Grants what `{base}` did not. Use it alongside that, not instead of it.");
+    }
+    if !resolved.policy.env.set.is_empty() {
+        println!(
+            "# The environment is not generated: `[env]` settings such as PATH are not \
+             accesses, so nothing in a trace can imply them. Carry them over yourself."
         );
     }
     print!("{}", reconcile::generate_profile(&selected));

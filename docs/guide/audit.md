@@ -63,9 +63,22 @@ absolute path resolves the same reads and generates the grant. Launching it as
 
 ## Generating a profile
 
+**Give it the same `-c` and `-p` the audit used.** A trace is only meaningful
+against a policy: generating against a different one reconciles the same events
+against different grants and reports a completely different set of findings. One
+real trace gave 11 findings against the policy it was recorded under, and 1736
+against the bare floor. The audit prints the matching command after writing a
+trace, so copying that line is the safe move.
+
 ```sh
-bailey profile generate --trace trace.json --target ./program > bailey.toml
+bailey profile generate -c ./audit.toml --trace trace.json --target ./program > bailey.toml
 ```
+
+What comes out grants the difference between the trace and that policy, so it is
+a supplement rather than a replacement; the header comment in the generated file
+says so. `[env]` settings are never generated, because an environment variable is
+not an access and nothing in a trace can imply one. If your policy sets `PATH`,
+carry it across yourself.
 
 The generated profile is deny-by-default and grants exactly the routine findings.
 High-risk findings are excluded, and the count of what was excluded is reported:
