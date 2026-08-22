@@ -67,6 +67,12 @@ pub struct World {
     /// Whether the invocation directory was granted and so kept as the working
     /// directory.
     pub kept_invocation_dir: bool,
+    /// The terminal this run is attached to, when it has one.
+    ///
+    /// A pseudo-terminal is named after the session that owns it, so a policy
+    /// cannot name one usefully: `/dev/pts/9` today is `/dev/pts/14` tomorrow.
+    /// It is part of what the sandbox hands the target, like the home.
+    pub terminal: Option<PathBuf>,
 }
 
 impl World {
@@ -120,6 +126,7 @@ impl World {
             private_shm: isolated && !policy_touches(policy, Path::new("/dev/shm")),
             cwd,
             kept_invocation_dir,
+            terminal: controlling_terminal(),
         }
     }
 
@@ -144,6 +151,23 @@ impl World {
         }
         Ok(())
     }
+}
+
+/// The terminal this process is attached to, if any.
+///
+/// Found through the standard descriptors rather than by asking for a name, so
+/// that a run with its output redirected reports nothing rather than the
+/// terminal it inherited on another descriptor.
+fn controlling_terminal() -> Option<PathBuf> {
+    for fd in 0..3 {
+        let Ok(path) = std::fs::read_link(format!("/proc/self/fd/{fd}")) else {
+            continue;
+        };
+        if path.starts_with("/dev/pts/") || path.starts_with("/dev/tty") {
+            return Some(path);
+        }
+    }
+    None
 }
 
 /// Whether this process is already confined by an outer bailey run.

@@ -276,3 +276,57 @@ fn a_bundled_name_cannot_be_shadowed() {
         "the shadowing attempt must be reported"
     );
 }
+
+/// A profile needs no trust record because you wrote it. That reasoning fails
+/// when someone else can write it, and a profile claims targets on its own.
+#[test]
+fn a_profile_others_can_write_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let config_home = tempfile::tempdir().unwrap();
+    let profiles = config_home.path().join("bailey/profiles");
+    std::fs::create_dir_all(&profiles).unwrap();
+    let profile = profiles.join("exposed.toml");
+    std::fs::write(
+        &profile,
+        "applies_to = [\"true\"]\n\n[filesystem]\nread = [\"/etc\"]\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+    let claimed = Command::new(bailey())
+        .args(["show", "/bin/true"])
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&claimed.stderr);
+    let stdout = String::from_utf8_lossy(&claimed.stdout);
+    assert!(
+        stderr.contains("writable by any user"),
+        "an exposed profile must say why it was ignored: {stderr}"
+    );
+    assert!(
+        stdout.contains("profile base: untrusted"),
+        "and must not be the base it claimed to be: {stdout}"
+    );
+
+    // Asked for by name, it fails rather than quietly leaving a weaker policy.
+    let named = Command::new(bailey())
+        .args(["show", "--profile", "exposed", "/bin/true"])
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .output()
+        .unwrap();
+    assert!(!named.status.success());
+    assert!(
+        String::from_utf8_lossy(&named.stderr).contains("chmod go-w"),
+        "and names the fix"
+    );
+
+    std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let fixed = Command::new(bailey())
+        .args(["show", "--profile", "exposed", "/bin/true"])
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .output()
+        .unwrap();
+    assert!(fixed.status.success(), "and works once it is only yours");
+}

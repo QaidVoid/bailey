@@ -271,6 +271,19 @@ pub fn store_path() -> Option<PathBuf> {
     })
 }
 
+/// Whether `path` can be changed by someone other than the running user.
+///
+/// The same question `trust` asks of a discovered config, asked of files that
+/// need no trust record: a profile and the global config are the user's own, but
+/// "in your config directory" is a claim about provenance, not about who can
+/// write there now.
+pub fn exposure_of(path: &Path) -> Option<Rejected> {
+    match fs::metadata(path) {
+        Ok(meta) => exposure(&meta),
+        Err(err) => Some(Rejected::Unreadable(err.to_string())),
+    }
+}
+
 /// Report how a file can be changed by someone other than the running user.
 fn exposure(meta: &fs::Metadata) -> Option<Rejected> {
     // SAFETY: `geteuid` reads the calling process's effective user id and

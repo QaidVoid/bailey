@@ -129,7 +129,22 @@ pub fn user_profiles() -> Vec<(String, PathBuf)> {
         .filter_map(|entry| {
             let path = entry.path();
             let name = path.file_stem()?.to_str()?.to_owned();
-            (path.extension()? == "toml" && get(&name).is_none()).then_some((name, path))
+            if path.extension()? != "toml" || get(&name).is_some() {
+                return None;
+            }
+            // A profile needs no trust record because you wrote it. That reasoning
+            // fails the moment someone else can write it, and a profile claims
+            // targets on its own, so an exposed one is worse than an exposed
+            // `bailey.toml` rather than better.
+            if let Some(exposure) = crate::trust::exposure_of(&path) {
+                eprintln!(
+                    "bailey: warning: ignoring profile `{}`: {}",
+                    path.display(),
+                    exposure.reason()
+                );
+                return None;
+            }
+            Some((name, path))
         })
         .collect();
     found.sort();
@@ -223,6 +238,17 @@ pub fn source(name: &str) -> Result<Source, String> {
     let Some(path) = user_path(name) else {
         return Err(unknown(name));
     };
+    if let Some(exposure) = crate::trust::exposure_of(&path) {
+        let mut message = format!(
+            "refusing to use profile `{}`: {}",
+            path.display(),
+            exposure.reason()
+        );
+        if let Some(remedy) = exposure.remedy(&path) {
+            message.push_str(&format!("; {remedy}"));
+        }
+        return Err(message);
+    }
     let toml = std::fs::read_to_string(&path)
         .map_err(|err| format!("could not read profile `{}`: {err}", path.display()))?;
     Ok(Source::User { path, toml })

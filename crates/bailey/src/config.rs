@@ -306,10 +306,14 @@ fn discover(target: &Path, explicit: Option<&Path>) -> Vec<Source> {
     if let Some(global) = global_config_path()
         && global.is_file()
     {
+        // No trust record is needed for a file in your own config directory, but
+        // that argument is about who wrote it, and says nothing about who can
+        // write it now.
+        let rejected = crate::trust::exposure_of(&global);
         sources.push(Source {
             path: global,
             origin: Origin::Global,
-            rejected: None,
+            rejected,
         });
     }
 

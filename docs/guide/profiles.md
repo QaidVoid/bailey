@@ -130,6 +130,15 @@ A profile in your own config directory needs no trust record: you wrote it, and
 unlike a project's `bailey.toml` it did not arrive with code you cloned. That is
 a good reason to keep a rule in a profile rather than repeating it per project.
 
+::: warning It still has to be only yours
+Needing no trust record is a claim about who *wrote* the file, which says nothing
+about who can write it now. A profile owned by another user, or writable by group
+or by everyone, is refused: ignored with a warning when it claims a target
+through `applies_to`, and a hard error when you name it with `--profile`. The
+same check `bailey trust` applies to a discovered config, applied here, because a
+profile needs no acceptance and can claim targets on its own.
+:::
+
 `bailey profile list` shows yours under the bundled ones, and
 `bailey profile show <name>` prints either. The bundled names are reserved: a
 file called `untrusted.toml` is ignored with a warning rather than quietly

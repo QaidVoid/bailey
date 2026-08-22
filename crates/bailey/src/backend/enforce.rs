@@ -459,6 +459,9 @@ impl LandlockPlan {
     /// private `/tmp` and `/dev/shm` that replace the host's shared ones.
     fn add_world_grants(&mut self, world: &World) {
         let read_write = AccessFs::from_read(TARGET_ABI) | AccessFs::from_write(TARGET_ABI);
+        if let Some(terminal) = &world.terminal {
+            self.filesystem.push((terminal.clone(), read_write));
+        }
         if world.home_host.is_some() {
             self.filesystem
                 .push((world.home_inside.clone(), read_write));
@@ -586,6 +589,9 @@ fn build_isolation_plan(
         .iter()
         .map(|rule| rule.path.clone())
         .chain(policy.devices.iter().map(|rule| rule.path.clone()))
+        // The terminal has to exist inside the reconstructed root, or a program
+        // that opens its own tty by name finds nothing there.
+        .chain(world.terminal.clone())
         .filter(|path| !path.starts_with("/proc"))
         .filter(|path| !denied(path))
         .collect();

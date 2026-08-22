@@ -82,10 +82,22 @@ pub fn generate_profile(findings: &[Finding]) -> String {
     let mut connect_ports = BTreeSet::new();
     let mut bind_ports = BTreeSet::new();
 
+    let mut skipped_terminal = false;
     for finding in findings {
         // A relative path that could not be resolved names nothing in
         // particular, so granting it would be guesswork.
         if finding.unresolved {
+            continue;
+        }
+        // A pseudo-terminal is named per session: `/dev/pts/9` today is a
+        // different number tomorrow, so a policy naming one is stale as soon as
+        // the terminal closes. The sandbox provides the terminal it was started
+        // from, so nothing needs to grant it. Findings still report the access;
+        // it is only generating a grant from one that makes no sense.
+        if let Resource::Path(path) = &finding.resource
+            && path.starts_with("/dev/pts")
+        {
+            skipped_terminal = true;
             continue;
         }
         match (&finding.kind, &finding.resource) {
@@ -108,7 +120,12 @@ pub fn generate_profile(findings: &[Finding]) -> String {
         }
     }
 
-    let mut out = String::from("[filesystem]\n");
+    let mut out = String::new();
+    if skipped_terminal {
+        out.push_str("# The terminal is not granted: a pty is named per session, and the\n");
+        out.push_str("# sandbox provides the one it was started from.\n");
+    }
+    out.push_str("[filesystem]\n");
     out.push_str(&toml_string_array("read", &read));
     out.push_str(&toml_string_array("write", &write));
     out.push_str(&toml_string_array("execute", &execute));

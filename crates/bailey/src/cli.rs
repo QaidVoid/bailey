@@ -723,18 +723,20 @@ fn report_untrusted(target: &Path, explicit: Option<&Path>) {
 /// The policy as it stood at run time, including what the sandbox provides on
 /// its own.
 ///
-/// The private home is created and granted by the backend rather than written in
-/// anyone's config, so a plain reconciliation reports a program reading its own
-/// settings as ungranted access outside its directory. Every audited program
-/// does that, and a high-risk list full of a program's own storage is one nobody
-/// reads.
+/// The private home and the terminal are provided by the backend rather than
+/// written in anyone's config, so a plain reconciliation reports a program
+/// reading its own settings, or writing to its own terminal, as ungranted
+/// access. Every audited program does that, and a findings list full of what the
+/// sandbox itself handed over is one nobody reads. The terminal matters twice
+/// over: a generated profile would name this session's pty, which is a different
+/// number tomorrow.
 fn policy_with_own_storage(policy: &crate::policy::Policy, target: &Path) -> crate::policy::Policy {
     let mut effective = policy.clone();
     // Audit does not isolate, so the home the target used is the host one.
     let world = World::derive(target, policy, false);
-    if let Some(home) = world.home_host {
+    for path in world.home_host.into_iter().chain(world.terminal) {
         effective.filesystem.push(crate::policy::FsRule {
-            path: home,
+            path,
             access: Access::READ | Access::WRITE,
         });
     }
