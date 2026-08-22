@@ -22,6 +22,22 @@ pub struct BindMount {
     pub is_dir: bool,
 }
 
+/// A symlink to recreate inside the reconstructed root.
+///
+/// Binding a symlink follows it, which puts a *regular file* where the link was.
+/// That changes what a program sees about itself: an interpreter that resolves
+/// imports relative to its own path, node among them, then looks beside the link
+/// rather than beside the file the link points at, and fails to find its own
+/// modules. Recreating the link keeps the shape of the filesystem the program was
+/// installed into.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymLink {
+    /// Where the link goes in the new root.
+    pub at: PathBuf,
+    /// What it points at, exactly as the host has it, relative or absolute.
+    pub to: PathBuf,
+}
+
 /// A path to conceal inside the reconstructed root.
 ///
 /// Concealment is how a denial is enforced beneath a granted parent. Landlock
@@ -39,6 +55,8 @@ pub struct Conceal {
 pub struct IsolationPlan {
     /// Paths to bind into the new root.
     pub binds: Vec<BindMount>,
+    /// Symlinks to recreate rather than follow.
+    pub links: Vec<SymLink>,
     /// Paths to cover over after binding.
     pub conceal: Vec<Conceal>,
     /// Paths to re-mount read-only after binding, so a writable hierarchy can
@@ -214,6 +232,27 @@ fn setup_root(plan: &IsolationPlan) -> io::Result<()> {
 
     for bind in &plan.binds {
         bind_into(&new_root, bind)?;
+    }
+
+    // After the binds, which is what creates the directories these sit in.
+    for link in &plan.links {
+        let relative = link.at.strip_prefix("/").unwrap_or(&link.at);
+        let at = new_root.join(relative);
+        // A mountpoint from an earlier run can still be sitting here: the private
+        // home persists, and a bind of a path beneath it leaves the empty file
+        // that anchored the mount. That leftover is not a mount now, and letting
+        // it stand would shadow the link with an empty, unexecutable file.
+        if let Ok(meta) = at.symlink_metadata() {
+            let replaceable = meta.file_type().is_symlink() || (meta.is_file() && meta.len() == 0);
+            if !replaceable {
+                continue;
+            }
+            fs::remove_file(&at)?;
+        }
+        if let Some(parent) = at.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        std::os::unix::fs::symlink(&link.to, &at)?;
     }
 
     // After the binds, so that a bind covering /dev does not hide it.

@@ -598,18 +598,49 @@ fn build_isolation_plan(
     paths.sort();
     paths.dedup();
 
+    // What the policy names, before any of it is turned into mounts: a symlink
+    // is only worth preserving when following it lands somewhere granted.
+    let granted: Vec<PathBuf> = paths.clone();
+
     let mut binds = Vec::new();
+    let mut links = Vec::new();
     let mut roots: Vec<PathBuf> = Vec::new();
     for path in paths {
         if roots.iter().any(|root| path.starts_with(root)) {
             continue;
         }
-        let is_dir = std::fs::metadata(&path)
-            .map(|meta| meta.is_dir())
-            .unwrap_or(false);
         if !path.exists() {
             continue;
         }
+        // A symlink is recreated rather than bound when the policy already
+        // provides what it points at. Binding through it would put a regular
+        // file where the link was, and a program that resolves paths relative to
+        // itself, an interpreter loading its own modules, then looks beside the
+        // link rather than beside the file: node fails to find its own code that
+        // way.
+        //
+        // Where the policy does *not* cover the destination, the link is bound
+        // through as before. That is what makes a lone symlinked binary run
+        // without granting the store it points into, which is the ordinary case
+        // for anything installed by a version manager.
+        if let Ok(to) = std::fs::read_link(&path) {
+            let resolved = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            let provided = granted.iter().any(|grant| resolved.starts_with(grant));
+            // Files only. A link to a directory is a mountpoint other paths are
+            // placed under, and on a system where `/bin` is a link to `usr/bin`,
+            // recreating it means the next path beneath it is created inside the
+            // bound `/usr` rather than in the new root.
+            let to_file = std::fs::metadata(&resolved)
+                .map(|meta| meta.is_file())
+                .unwrap_or(false);
+            if provided && to_file {
+                links.push(isolation::SymLink { at: path, to });
+                continue;
+            }
+        }
+        let is_dir = std::fs::metadata(&path)
+            .map(|meta| meta.is_dir())
+            .unwrap_or(false);
         if is_dir {
             roots.push(path.clone());
         }
@@ -637,6 +668,7 @@ fn build_isolation_plan(
 
     IsolationPlan {
         binds,
+        links,
         conceal,
         read_only,
         network: mode == NetworkMode::Isolated,

@@ -6,6 +6,7 @@
 //! whether the target really lands as PID 1.
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 fn bailey() -> &'static str {
@@ -345,5 +346,55 @@ fn a_read_only_grant_inside_the_home_is_not_writable() {
         fs::read_to_string(dotfiles.join("settings")).unwrap(),
         "original",
         "and the host file must be untouched"
+    );
+}
+
+/// Binding a symlink follows it, which puts a regular file where the link was.
+/// An interpreter that resolves its own modules relative to itself then looks in
+/// the wrong directory, so a link whose destination the policy already provides
+/// is recreated as a link.
+#[test]
+fn a_symlink_into_a_granted_tree_stays_a_symlink() {
+    if !isolation_active() {
+        eprintln!("skipping: isolation unavailable on this host");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("store");
+    let bin = dir.path().join("bin");
+    fs::create_dir_all(&store).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    // A script that reports where it thinks it lives, which is what an
+    // interpreter resolving relative imports is really asking.
+    fs::write(
+        store.join("prog"),
+        "#!/bin/sh\necho \"$(dirname \"$(readlink -f \"$0\")\")\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(store.join("prog"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink("../store/prog", bin.join("prog")).unwrap();
+
+    let config = dir.path().join("bailey.toml");
+    fs::write(
+        &config,
+        format!(
+            "[filesystem]\nread = [\"{store}\"]\nexecute = [\"{store}\"]\n",
+            store = store.display()
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(bailey())
+        .args(["run", "-c"])
+        .arg(&config)
+        .arg(bin.join("prog"))
+        .output()
+        .unwrap();
+    let seen = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        seen.contains("store"),
+        "the link must still resolve into the store it points at, not be replaced \
+         by a file beside the link: {seen}"
     );
 }
