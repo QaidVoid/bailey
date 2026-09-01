@@ -335,6 +335,7 @@ mod tests {
                 .map(|path| FsRule {
                     path: PathBuf::from(path),
                     access: Access::READ,
+                    at: None,
                 })
                 .collect(),
             ..Policy::default()

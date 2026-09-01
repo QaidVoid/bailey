@@ -398,3 +398,105 @@ fn a_symlink_into_a_granted_tree_stays_a_symlink() {
          by a file beside the link: {seen}"
     );
 }
+
+/// A grant may be placed somewhere other than its own path.
+///
+/// Paths are otherwise preserved exactly, because a program that resolves
+/// anything relative to its own location breaks when moved. Relocating is for a
+/// path whose name is the thing to withhold: a directory named after the
+/// operator tells a target who is running it and how the host is laid out.
+#[test]
+fn a_grant_can_be_placed_at_another_path() {
+    if !isolation_active() {
+        eprintln!("skipping: isolation unavailable on this host");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("operator-named-directory");
+    fs::create_dir_all(&real).unwrap();
+    fs::write(real.join("file.txt"), "content").unwrap();
+
+    let config = dir.path().join("bailey.toml");
+    fs::write(
+        &config,
+        format!(
+            "[filesystem]\n\
+             read = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\", \"/etc\", {{ path = \"{real}\", at = \"/workspace\" }}]\n\
+             write = [{{ path = \"{real}\", at = \"/workspace\" }}]\n\
+             execute = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\"]\n",
+            real = real.display()
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(bailey())
+        .args(["run", "--isolate", "-c"])
+        .arg(&config)
+        .args([
+            "/bin/sh",
+            "-c",
+            "cat /workspace/file.txt; echo new > /workspace/w.txt && echo written",
+        ])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("content"),
+        "the grant must be readable at its new path: {stdout} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("written"),
+        "the grant must be writable at its new path, so the rule followed it: {stdout}"
+    );
+    // The write reached the real directory, not somewhere inside the sandbox.
+    assert_eq!(
+        fs::read_to_string(real.join("w.txt")).unwrap().trim(),
+        "new"
+    );
+}
+
+#[test]
+fn the_host_path_of_a_relocated_grant_is_gone() {
+    if !isolation_active() {
+        eprintln!("skipping: isolation unavailable on this host");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("operator-named-directory");
+    fs::create_dir_all(&real).unwrap();
+    fs::write(real.join("file.txt"), "content").unwrap();
+
+    let config = dir.path().join("bailey.toml");
+    fs::write(
+        &config,
+        format!(
+            "[filesystem]\n\
+             read = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\", \"/etc\", {{ path = \"{real}\", at = \"/workspace\" }}]\n\
+             execute = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\"]\n",
+            real = real.display()
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(bailey())
+        .args(["run", "--isolate", "-c"])
+        .arg(&config)
+        .args([
+            "/bin/sh",
+            "-c",
+            &format!(
+                "ls {} 2>/dev/null && echo VISIBLE || echo absent",
+                real.display()
+            ),
+        ])
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("absent"),
+        "the host path must not exist in the reconstructed root: {stdout}"
+    );
+}

@@ -18,6 +18,8 @@ use nix::unistd::{chdir, pivot_root};
 pub struct BindMount {
     /// Source path on the host.
     pub source: PathBuf,
+    /// Where it appears in the reconstructed root. Usually the source's own path.
+    pub at: PathBuf,
     /// Whether the source is a directory (otherwise a file mountpoint is made).
     pub is_dir: bool,
 }
@@ -392,7 +394,7 @@ fn conceal_all(new_root: &Path, conceal: &[Conceal]) -> io::Result<()> {
 }
 
 fn bind_into(new_root: &Path, bind: &BindMount) -> io::Result<()> {
-    let relative = bind.source.strip_prefix("/").unwrap_or(&bind.source);
+    let relative = bind.at.strip_prefix("/").unwrap_or(&bind.at);
     let target = new_root.join(relative);
 
     if bind.is_dir {

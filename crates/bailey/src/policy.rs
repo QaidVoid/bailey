@@ -26,10 +26,31 @@ bitflags! {
 /// A single filesystem grant: a path hierarchy and the rights allowed on it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FsRule {
-    /// The path hierarchy the grant applies to.
+    /// The path hierarchy the grant applies to, as the host has it.
     pub path: PathBuf,
     /// The rights granted on the hierarchy.
     pub access: Access,
+    /// Where the hierarchy appears to the target, when that is not its own path.
+    ///
+    /// Paths are otherwise preserved exactly, because a program that resolves
+    /// anything relative to its own location breaks when moved. Relocating is
+    /// worth it for a path whose name is itself the thing to withhold: a
+    /// directory named after the operator tells a target who is running it and
+    /// how the host is laid out, which no amount of access control takes back.
+    ///
+    /// Only meaningful under isolation. Without a reconstructed root there is
+    /// nowhere else for a path to be.
+    pub at: Option<PathBuf>,
+}
+
+impl FsRule {
+    /// The path the target sees, which is what a rule must be attached to.
+    ///
+    /// Landlock is applied after the pivot, so a rule naming the host path
+    /// would name something that no longer exists and be silently skipped.
+    pub fn visible(&self) -> &PathBuf {
+        self.at.as_ref().unwrap_or(&self.path)
+    }
 }
 
 /// Network egress intent.

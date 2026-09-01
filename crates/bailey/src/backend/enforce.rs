@@ -446,7 +446,11 @@ impl LandlockPlan {
         let mut filesystem = Vec::new();
         for rule in &policy.filesystem {
             if let Some(bits) = fs_access_bits(rule.access) {
-                filesystem.push((rule.path.clone(), bits));
+                // The path as the target sees it. Landlock is applied after the
+                // pivot, so a relocated hierarchy must be named where it ended
+                // up: naming the host path would open nothing and the rule
+                // would be dropped as a path that does not exist.
+                filesystem.push((rule.visible().clone(), bits));
             }
         }
         for rule in &policy.devices {
@@ -603,6 +607,12 @@ fn build_isolation_plan(
 
     let denied = |path: &Path| policy.denied.iter().any(|deny| path.starts_with(deny));
 
+    let relocation: BTreeMap<PathBuf, PathBuf> = policy
+        .filesystem
+        .iter()
+        .filter_map(|rule| rule.at.clone().map(|at| (rule.path.clone(), at)))
+        .collect();
+
     let mut paths: Vec<PathBuf> = policy
         .filesystem
         .iter()
@@ -663,8 +673,13 @@ fn build_isolation_plan(
         if is_dir {
             roots.push(path.clone());
         }
+        let at = relocation
+            .get(&path)
+            .cloned()
+            .unwrap_or_else(|| path.clone());
         binds.push(BindMount {
             source: path,
+            at,
             is_dir,
         });
     }
@@ -672,11 +687,17 @@ fn build_isolation_plan(
     let conceal = policy
         .denied
         .iter()
-        .filter(|path| binds.iter().any(|bind| path.starts_with(&bind.source)))
         .filter_map(|path| {
+            // Concealment covers a denied path where it ends up, which is not
+            // where the host keeps it once its parent has been relocated.
+            // Covering the host path would leave the denied one reachable at
+            // its new location, which is the grant leaking exactly what the
+            // deny was written to withhold.
+            let bind = binds.iter().find(|bind| path.starts_with(&bind.source))?;
+            let relative = path.strip_prefix(&bind.source).ok()?;
             let is_dir = std::fs::metadata(path).ok()?.is_dir();
             Some(Conceal {
-                path: path.clone(),
+                path: bind.at.join(relative),
                 is_dir,
             })
         })
@@ -1023,6 +1044,7 @@ mod tests {
         policy.filesystem.push(FsRule {
             path: PathBuf::from("/usr"),
             access: Access::READ | Access::EXECUTE,
+            at: None,
         });
         policy.devices.push(DeviceRule {
             path: PathBuf::from("/dev/dri"),

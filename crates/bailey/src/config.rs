@@ -210,17 +210,44 @@ struct RawEnv {
     set: BTreeMap<String, String>,
 }
 
+/// One entry in a grant list.
+///
+/// Written as a plain path, or as a table naming where the path should appear
+/// to the target: `{ path = "/srv/project", at = "/workspace" }`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum RawGrant {
+    Path(String),
+    Relocated { path: String, at: String },
+}
+
+impl RawGrant {
+    fn path(&self) -> &str {
+        match self {
+            RawGrant::Path(path) => path,
+            RawGrant::Relocated { path, .. } => path,
+        }
+    }
+
+    fn at(&self) -> Option<&str> {
+        match self {
+            RawGrant::Path(_) => None,
+            RawGrant::Relocated { at, .. } => Some(at),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawFs {
     #[serde(default)]
     reset: bool,
     #[serde(default)]
-    read: Vec<String>,
+    read: Vec<RawGrant>,
     #[serde(default)]
-    write: Vec<String>,
+    write: Vec<RawGrant>,
     #[serde(default)]
-    execute: Vec<String>,
+    execute: Vec<RawGrant>,
     #[serde(default)]
     deny: Vec<String>,
     #[serde(default)]
@@ -278,6 +305,8 @@ struct RawHooks {
 #[derive(Default)]
 struct Accumulator {
     filesystem: BTreeMap<PathBuf, Access>,
+    /// Where a granted path appears to the target, for the few that are moved.
+    relocated: BTreeMap<PathBuf, PathBuf>,
     denied: BTreeSet<PathBuf>,
     read_only: BTreeSet<PathBuf>,
     egress: Option<Egress>,
@@ -378,12 +407,37 @@ fn apply_layer(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> 
     ];
 
     let mut granted: BTreeMap<PathBuf, Access> = BTreeMap::new();
+    let mut relocated: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
     for (paths, access) in grants {
         for raw in paths {
-            *granted
-                .entry(resolve_path(raw, &layer.base))
-                .or_insert(Access::empty()) |= access;
+            let path = resolve_path(raw.path(), &layer.base);
+            if let Some(at) = raw.at() {
+                let at = resolve_path(at, &layer.base);
+                if !at.is_absolute() {
+                    return Err(ConfigError::Invalid {
+                        path: layer.path.clone(),
+                        reason: format!("at must be an absolute path, got {}", at.display()),
+                    });
+                }
+                // Two hierarchies at one location would leave whichever is
+                // mounted second covering the first, granting access to a path
+                // the target cannot reach.
+                if let Some(existing) = relocated.get(&at)
+                    && existing != &path
+                {
+                    return Err(ConfigError::Conflict {
+                        path: layer.path.clone(),
+                        target: at.display().to_string(),
+                        reason: "two different paths are placed at the same location".into(),
+                    });
+                }
+                relocated.insert(at, path.clone());
+            }
+            *granted.entry(path).or_insert(Access::empty()) |= access;
         }
+    }
+    for (at, source) in relocated {
+        acc.relocated.insert(source, at);
     }
 
     for raw in &fs.deny {
@@ -507,10 +561,14 @@ fn apply_layer(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> 
 }
 
 fn finalize(acc: Accumulator) -> Resolved {
+    let relocated = acc.relocated;
     let filesystem = acc
         .filesystem
         .into_iter()
-        .map(|(path, access)| FsRule { path, access })
+        .map(|(path, access)| {
+            let at = relocated.get(&path).cloned();
+            FsRule { path, access, at }
+        })
         .collect();
     let devices = acc
         .devices

@@ -738,6 +738,7 @@ fn policy_with_own_storage(policy: &crate::policy::Policy, target: &Path) -> cra
         effective.filesystem.push(crate::policy::FsRule {
             path,
             access: Access::READ | Access::WRITE,
+            at: None,
         });
     }
     effective

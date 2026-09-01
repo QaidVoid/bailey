@@ -396,6 +396,7 @@ mod tests {
         policy.filesystem.push(FsRule {
             path: PathBuf::from("/game"),
             access: Access::READ,
+            at: None,
         });
         let trace = [event(AccessKind::Read, "/game/data.pak")];
         let findings = reconcile(&trace, &policy, Path::new("/game"));

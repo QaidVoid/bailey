@@ -81,6 +81,7 @@ fn envelope(policy: &Policy, target: &Target) -> Policy {
         envelope.filesystem.push(FsRule {
             path: dir,
             access: Access::READ,
+            at: None,
         });
     }
     envelope

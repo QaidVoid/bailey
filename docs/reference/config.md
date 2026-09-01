@@ -46,6 +46,31 @@ deny = ["~/.config/app/token"]
 
 Granting and denying the same path within one layer is an error.
 
+### Placing a grant somewhere else
+
+An entry may be a table naming where the path should appear to the target:
+
+```toml
+[filesystem]
+read = [{ path = "/home/you/projects/thing", at = "/workspace" }]
+write = [{ path = "/home/you/projects/thing", at = "/workspace" }]
+```
+
+The target sees `/workspace`, and the host path does not exist for it at all.
+This needs the isolation layer, since without a reconstructed root there is
+nowhere else for a path to be.
+
+Paths are otherwise preserved exactly, and that is worth keeping: a program that
+resolves anything relative to its own location breaks when moved, which is why a
+granted symlink is recreated rather than bound through. Reach for `at` when the
+name of a path is itself the thing to withhold. A directory named after the
+person running the sandbox tells a target who they are and how the host is laid
+out, and no amount of access control takes that back once the target has read
+it.
+
+A `deny` beneath a relocated grant is applied at the new location, and two
+different paths may not be placed at the same location.
+
 ### A read-only island
 
 `read_only` is how you keep part of a writable hierarchy from being written:
