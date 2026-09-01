@@ -14,6 +14,9 @@ use nix::mount::{MntFlags, MsFlags, mount, umount2};
 use nix::sched::{CloneFlags, unshare};
 use nix::unistd::{chdir, pivot_root};
 
+/// Hostname a target sees, in place of the machine's own.
+const SANDBOX_HOSTNAME: &str = "sandbox";
+
 /// A path to bind into the reconstructed root.
 pub struct BindMount {
     /// Source path on the host.
@@ -153,11 +156,15 @@ pub fn enter(plan: &IsolationPlan) -> io::Result<()> {
     fs::write("/proc/self/gid_map", format!("0 {gid} 1"))?;
     fs::write("/proc/self/uid_map", format!("0 {uid} 1"))?;
 
-    let mut flags = CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWPID;
+    // UTS as well, so the target is not told the machine's name. Denying
+    // /etc/hostname is not enough: `uname` is a syscall, and a program that
+    // asks the kernel gets the real name however the filesystem is confined.
+    let mut flags = CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWPID | CloneFlags::CLONE_NEWUTS;
     if plan.network {
         flags |= CloneFlags::CLONE_NEWNET;
     }
     unshare(flags).map_err(errno)?;
+    set_hostname(SANDBOX_HOSTNAME)?;
     if plan.network {
         crate::backend::network::bring_loopback_up()?;
     }
@@ -415,6 +422,19 @@ fn bind_into(new_root: &Path, bind: &BindMount) -> io::Result<()> {
         None::<&str>,
     )
     .map_err(errno)
+}
+
+/// Sets the hostname inside the new UTS namespace.
+///
+/// The name is fixed rather than derived from anything: a name that varied with
+/// the target or the caller would put back the identity this removes.
+fn set_hostname(name: &str) -> io::Result<()> {
+    let bytes = name.as_bytes();
+    let result = unsafe { libc::sethostname(bytes.as_ptr().cast(), bytes.len()) };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn errno(err: nix::errno::Errno) -> io::Error {

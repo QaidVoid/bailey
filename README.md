@@ -38,7 +38,7 @@ needs" into a profile you can read.
 | Network | Network namespace, Landlock | Denied egress means no route at all; a partial allowance is enforced by TCP port |
 | Syscalls | seccomp | Removes syscalls a normal program never needs |
 | Resources | cgroup v2 | Caps memory, process count, and CPU |
-| World | user, mount, PID namespaces | Rebuilds the root from the policy, so ungranted paths are absent rather than merely denied, and host processes are invisible |
+| World | user, mount, PID, UTS namespaces | Rebuilds the root from the policy, so ungranted paths are absent rather than merely denied, host processes are invisible, and the target is not told the machine's name |
 | Reachability | Landlock scoping | Host abstract UNIX sockets and processes outside the sandbox are out of reach |
 | Observation | eBPF, via a privileged helper | Records what the program opens and connects to, without blocking it |
 | Coverage | Inheritance | `bailey shell` confines a shell, and a Landlock ruleset cannot be dropped, so everything started from it is confined too |

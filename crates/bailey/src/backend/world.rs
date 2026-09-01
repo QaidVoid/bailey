@@ -109,8 +109,14 @@ impl World {
         // granted, so an ungranted one falls back to the home.
         let invocation_dir = std::env::current_dir().unwrap_or_else(|_| home_inside.clone());
         let kept_invocation_dir = covered_by_grant(policy, &invocation_dir);
-        let cwd = if !isolated || kept_invocation_dir {
+        let cwd = if !isolated {
             invocation_dir
+        } else if kept_invocation_dir {
+            // A relocated grant does not exist at its host path inside the
+            // sandbox, so the directory to enter is where the grant was placed.
+            // Entering the host path would fail and drop the target into its
+            // home, which reads as the grant not having worked at all.
+            relocated_dir(policy, &invocation_dir).unwrap_or(invocation_dir)
         } else {
             home_inside.clone()
         };
@@ -257,6 +263,18 @@ fn policy_touches(policy: &Policy, path: &Path) -> bool {
 }
 
 /// Whether a grant covers `path` itself.
+/// Where `path` ends up when the grant covering it was placed elsewhere.
+///
+/// Returns `None` when nothing covering it was moved, which is the ordinary
+/// case and leaves the path exactly as the caller gave it.
+fn relocated_dir(policy: &Policy, path: &Path) -> Option<PathBuf> {
+    policy.filesystem.iter().find_map(|rule| {
+        let at = rule.at.as_ref()?;
+        let relative = path.strip_prefix(&rule.path).ok()?;
+        Some(at.join(relative))
+    })
+}
+
 fn covered_by_grant(policy: &Policy, path: &Path) -> bool {
     policy
         .filesystem

@@ -500,3 +500,42 @@ fn the_host_path_of_a_relocated_grant_is_gone() {
         "the host path must not exist in the reconstructed root: {stdout}"
     );
 }
+
+/// Denying `/etc/hostname` is not enough. `uname` is a syscall, so a program
+/// that asks the kernel gets the machine's real name however the filesystem is
+/// confined. Only a UTS namespace takes that away.
+#[test]
+fn the_target_is_not_told_the_machines_name() {
+    if !isolation_active() {
+        eprintln!("skipping: isolation unavailable on this host");
+        return;
+    }
+    let real = std::process::Command::new("uname")
+        .arg("-n")
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+        .unwrap_or_default();
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("bailey.toml");
+    fs::write(
+        &config,
+        "[filesystem]\n\
+         read = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\", \"/etc\"]\n\
+         execute = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\"]\n",
+    )
+    .unwrap();
+
+    let output = Command::new(bailey())
+        .args(["run", "--isolate", "-c"])
+        .arg(&config)
+        .args(["/bin/sh", "-c", "uname -n"])
+        .output()
+        .unwrap();
+
+    let seen = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    assert!(!seen.is_empty(), "the target must still have a hostname");
+    if !real.is_empty() {
+        assert_ne!(seen, real, "the target must not be told the machine's name");
+    }
+}
