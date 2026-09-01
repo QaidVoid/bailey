@@ -116,6 +116,7 @@ filesystem grants.
 | `memory` | string | Maximum memory. Bytes, or a suffix |
 | `pids_max` | integer | Maximum processes and threads |
 | `cpu_percent` | integer | CPU quota as a percentage of one core |
+| `file_max` | string | Largest single file the target may create |
 | `tmp_size` | string | Size of the private `/tmp`. Default 64MiB |
 | `shm_size` | string | Size of the private `/dev/shm`. Default 256MiB |
 
@@ -127,10 +128,22 @@ Accepted size suffixes, case-insensitive: `b`, `k`/`kb` (1000), `kib` (1024),
 memory = "2GiB"
 pids_max = 512
 cpu_percent = 150
+file_max = "1GiB"
 ```
 
-Each key is replaced by the nearest layer that sets it. Applied through cgroup v2,
-best-effort.
+Each key is replaced by the nearest layer that sets it. `memory`, `pids_max` and
+`cpu_percent` are applied through cgroup v2, best-effort: without a writable
+delegated cgroup they are skipped, and the run reports that.
+
+`file_max` is different. It is an `RLIMIT_FSIZE`, so it holds on any host,
+cgroups or not, and it is inherited by every process the target starts. A write
+past it raises `SIGXFSZ`, and fails with `EFBIG` for a target that handles the
+signal.
+
+It bounds one file rather than total usage. Linux has no rootless way to cap
+what a process tree writes in aggregate, because cgroups have no disk controller
+and a sized filesystem needs a mount. What this stops is the runaway log or dump
+that fills a disk, not a target that writes many small files.
 
 ## `[env]`
 

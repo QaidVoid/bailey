@@ -257,6 +257,7 @@ struct RawResources {
     memory: Option<String>,
     pids_max: Option<u64>,
     cpu_percent: Option<u32>,
+    file_max: Option<String>,
     tmp_size: Option<String>,
     shm_size: Option<String>,
 }
@@ -449,6 +450,9 @@ fn apply_layer(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> 
         }
         if let Some(cpu) = resources.cpu_percent {
             acc.resources.cpu_percent = Some(cpu);
+        }
+        if let Some(size) = &resources.file_max {
+            acc.resources.file_bytes = Some(size_value(size, &layer.path)?);
         }
         if let Some(size) = &resources.tmp_size {
             acc.resources.tmp_bytes = Some(size_value(size, &layer.path)?);

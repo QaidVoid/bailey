@@ -272,7 +272,15 @@ impl EnforceBackend {
         // process the target goes on to create.
         let cgroup = CgroupGuard::create(&policy.resources, self.always_cgroup);
         let procs = cgroup.procs_path();
-        if policy.resources == ResourceLimits::default() {
+        // The file size limit is an rlimit rather than a cgroup control, so it
+        // holds with or without a delegated cgroup and is reported on its own.
+        // Folding it in here would report it skipped on a host with no cgroup,
+        // when it is the one limit that still applied.
+        let via_cgroup = ResourceLimits {
+            file_bytes: None,
+            ..policy.resources.clone()
+        };
+        if via_cgroup == ResourceLimits::default() {
             // The policy asked for none, so there is nothing to report.
         } else if procs.is_some() {
             report.applied("resource limits");
@@ -284,6 +292,9 @@ impl EnforceBackend {
                     .as_deref()
                     .unwrap_or("no writable delegated cgroup"),
             );
+        }
+        if policy.resources.file_bytes.is_some() {
+            report.applied("file size limit");
         }
 
         let mut command = Command::new(&target.program);
@@ -302,6 +313,7 @@ impl EnforceBackend {
             dir: isolation.as_ref().map(|plan| plan.staging.clone()),
         };
         let stop_before_exec = self.stop_before_exec;
+        let file_bytes = policy.resources.file_bytes;
 
         // Safety: the closure runs in the forked child before exec. Bailey is
         // single-threaded at this point, so the usual fork-safety hazard of
@@ -311,6 +323,13 @@ impl EnforceBackend {
         unsafe {
             command.pre_exec(move || {
                 set_no_new_privs()?;
+                // Set before the namespaces and before seccomp: an rlimit is
+                // inherited across fork and exec, so every process the target
+                // goes on to start carries it too, and lowering it here cannot
+                // be undone by a target that has no privilege to raise it.
+                if let Some(bytes) = file_bytes {
+                    set_file_size_limit(bytes)?;
+                }
                 if stop_before_exec {
                     // Trace ourselves, so the kernel stops this process at
                     // `execve` rather than before it. Stopping earlier would
@@ -795,6 +814,26 @@ fn report_degradation(policy: &Policy) {
 fn set_no_new_privs() -> io::Result<()> {
     // Required before applying seccomp or Landlock without CAP_SYS_ADMIN.
     let result = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Caps the size of any single file the target writes.
+///
+/// Both the soft and hard limit are set. Leaving the hard limit alone would
+/// leave the soft one advisory, since a process may raise its own soft limit
+/// up to the hard one, and the target is exactly the party being restrained.
+///
+/// Exceeding it raises SIGXFSZ, and a write past the limit fails with EFBIG
+/// for a process that handles or ignores the signal.
+fn set_file_size_limit(bytes: u64) -> io::Result<()> {
+    let limit = libc::rlimit {
+        rlim_cur: bytes as libc::rlim_t,
+        rlim_max: bytes as libc::rlim_t,
+    };
+    let result = unsafe { libc::setrlimit(libc::RLIMIT_FSIZE, &limit) };
     if result != 0 {
         return Err(io::Error::last_os_error());
     }

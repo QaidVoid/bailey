@@ -79,7 +79,11 @@ pub struct DeviceRule {
     pub access: Access,
 }
 
-/// Resource limits applied via cgroups.
+/// Resource limits applied to a run.
+///
+/// Most are applied via cgroups and need a delegated one to have any effect.
+/// `file_bytes` is the exception: it is an rlimit, so it holds on any host,
+/// with or without cgroups.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResourceLimits {
     /// Maximum resident memory in bytes.
@@ -88,6 +92,13 @@ pub struct ResourceLimits {
     pub pids_max: Option<u64>,
     /// CPU quota as a percentage of a single core (100 = one full core).
     pub cpu_percent: Option<u32>,
+    /// Largest single file the target may create, in bytes.
+    ///
+    /// This bounds one file rather than total usage, because Linux offers no
+    /// rootless way to cap what a process tree writes in aggregate: cgroups
+    /// have no disk controller, and a sized filesystem needs a mount. It stops
+    /// a runaway log or dump, which is the common way a sandbox fills a disk.
+    pub file_bytes: Option<u64>,
     /// Size of the private `/tmp`, in bytes.
     pub tmp_bytes: Option<u64>,
     /// Size of the private `/dev/shm`, in bytes.
