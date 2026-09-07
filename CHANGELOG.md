@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.1.1](https://github.com/QaidVoid/bailey/compare/v0.1.0...v0.1.1) - 2026-09-07
+
+### ⛰️  Features
+
+- *(config)* Expand variables and tilde in env values - ([e54e2ef](https://github.com/QaidVoid/bailey/commit/e54e2effc158a1d32bee4b41bfbdeffbddc69ab5))
+- *(filesystem)* Let a grant be placed at another path - ([e8db2d8](https://github.com/QaidVoid/bailey/commit/e8db2d8291f6c3d27ed05aeb0c51c49a5023f6e2))
+- *(isolation)* Withhold the machine name with a UTS namespace - ([bbccb4a](https://github.com/QaidVoid/bailey/commit/bbccb4a66b1e40eeef507a595c074d44636e478c))
+- *(reconcile)* Generate readable policies from real traces - ([25eed1b](https://github.com/QaidVoid/bailey/commit/25eed1b15a4f751e1eff2cfee17052edae019d35))
+- *(resources)* Cap the size of any file a target writes - ([3eda2b6](https://github.com/QaidVoid/bailey/commit/3eda2b689e2d5f905e51bf8d6e583f6957b6f707))
+
+### 🐛 Bug Fixes
+
+- *(audit)* Stop reporting a target's own private home as a finding - ([02b7bbd](https://github.com/QaidVoid/bailey/commit/02b7bbd4b4dfb553ea67137cf20999b353447daa))
+- *(audit)* Report the exit status, and find the helper on PATH - ([b899655](https://github.com/QaidVoid/bailey/commit/b8996557955ba05e23d838de0814bcb161e18e55))
+- *(isolation)* Recreate a symlink instead of binding through it - ([8cf3a92](https://github.com/QaidVoid/bailey/commit/8cf3a92bbe52d0db2047c792aa5149ea855fdc1e))
+- *(isolation)* Sweep staging dirs left by interrupted runs - ([1639fa2](https://github.com/QaidVoid/bailey/commit/1639fa2b2f961b0e9a2c6915d38ccb6da658d1ef))
+- *(policy)* Check profiles for exposure, and provide the terminal - ([a573429](https://github.com/QaidVoid/bailey/commit/a573429279ef9e710810e1653585dbf4baf5f50f))
+- *(profiles)* Make the runtime dir and shader cache readable - ([b0843af](https://github.com/QaidVoid/bailey/commit/b0843afa5c551dd08186aad2ec4c26f1d2113f2d))
+- *(reconcile)* Count unresolved findings apart from high-risk - ([6af724d](https://github.com/QaidVoid/bailey/commit/6af724dd52c69adae2b4ffe1778c520216ae2fe4))
+
 ## [0.1.0] - 2026-08-21
 
 ### ⛰️  Features
