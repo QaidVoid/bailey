@@ -893,6 +893,15 @@ fn denied_syscalls() -> &'static [i64] {
         libc::SYS_reboot,
         libc::SYS_mount,
         libc::SYS_umount2,
+        // The mount(2) replacement, split across several syscalls. Denying the
+        // old call alone would leave the same power reachable by the new one.
+        libc::SYS_fsopen,
+        libc::SYS_fsconfig,
+        libc::SYS_fsmount,
+        libc::SYS_move_mount,
+        libc::SYS_open_tree,
+        libc::SYS_fspick,
+        libc::SYS_mount_setattr,
         libc::SYS_pivot_root,
         libc::SYS_setns,
         libc::SYS_unshare,
@@ -1061,5 +1070,26 @@ mod tests {
     #[test]
     fn seccomp_filter_builds() {
         assert!(build_seccomp_filter().is_ok());
+    }
+
+    #[test]
+    fn the_whole_mount_family_is_denied() {
+        // The old mount(2) and its split successors reach the same power, so a
+        // denylist that stops one but not the others stops nothing.
+        let denied = denied_syscalls();
+        for nr in [
+            libc::SYS_mount,
+            libc::SYS_umount2,
+            libc::SYS_fsopen,
+            libc::SYS_fsconfig,
+            libc::SYS_fsmount,
+            libc::SYS_move_mount,
+            libc::SYS_open_tree,
+            libc::SYS_fspick,
+            libc::SYS_mount_setattr,
+            libc::SYS_pivot_root,
+        ] {
+            assert!(denied.contains(&nr), "syscall {nr} should be denied");
+        }
     }
 }
