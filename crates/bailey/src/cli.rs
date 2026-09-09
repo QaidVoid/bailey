@@ -88,6 +88,19 @@ struct RunArgs {
     /// Print what the run enforced as JSON.
     #[arg(long)]
     json: bool,
+    /// Route egress through a private network namespace, so the session sees a
+    /// synthetic address and MAC rather than the host's. Needs pasta and user
+    /// namespaces; without them the run continues and says the host stays
+    /// visible.
+    #[arg(long, conflicts_with = "no_proxy_net")]
+    proxy_net: bool,
+    /// Never use a private network namespace, even where one was available.
+    #[arg(long)]
+    no_proxy_net: bool,
+    /// Internal: this run is already inside a pasta-provided namespace, so it
+    /// confines the target where it is rather than wrapping it again.
+    #[arg(long, hide = true)]
+    in_proxy_netns: bool,
     /// The target executable, followed by its own arguments.
     #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<String>,
@@ -380,12 +393,135 @@ fn yes_no(value: bool) -> &'static str {
     if value { "yes" } else { "no" }
 }
 
+/// The private address a proxied session is given, in place of the host's.
+///
+/// Every proxied run has a network namespace to itself, so the same address in
+/// each collides with nothing: a concurrent run is a separate namespace, not a
+/// second interface on one.
+const PROXY_ADDRESS: &str = "10.0.2.15";
+
+/// The bailey invocation to run inside the private namespace, the outer one
+/// with the marker added so the inner run confines rather than wrapping again.
+///
+/// Rebuilt from the parsed arguments rather than the raw argv, so the target
+/// after `--` cannot be mistaken for an option however it was spelled.
+fn inner_invocation(args: &RunArgs) -> Vec<std::ffi::OsString> {
+    let mut inner: Vec<std::ffi::OsString> = vec!["run".into()];
+    if let Some(config) = &args.config {
+        inner.push("--config".into());
+        inner.push(config.into());
+    }
+    if let Some(profile) = &args.profile {
+        inner.push("--profile".into());
+        inner.push(profile.into());
+    }
+    if args.isolate {
+        inner.push("--isolate".into());
+    }
+    if args.no_isolate {
+        inner.push("--no-isolate".into());
+    }
+    if args.quiet {
+        inner.push("--quiet".into());
+    }
+    if args.json {
+        inner.push("--json".into());
+    }
+    inner.push("--in-proxy-netns".into());
+    inner.push("--".into());
+    for part in &args.command {
+        inner.push(part.into());
+    }
+    inner
+}
+
+/// Re-run the target inside a pasta-provided network namespace when asked.
+///
+/// Returns the child's exit code when it wrapped, or `None` to run the target
+/// directly. Only an allowed egress shares the host's interfaces: a denied
+/// network is already in an empty namespace of its own, with no address to
+/// hide, and pasta cannot give one connectivity it is meant not to have.
+///
+/// The inner run keeps every layer of confinement; pasta only supplies the
+/// interface it runs behind, a private address and a synthetic MAC in place of
+/// the host's. Egress is still gated by the policy's ports, since Landlock
+/// applies inside the namespace as it does outside.
+fn wrap_in_private_namespace(
+    policy: &crate::policy::Policy,
+    args: &RunArgs,
+) -> anyhow::Result<Option<i32>> {
+    use crate::policy::Egress;
+
+    if args.no_proxy_net || !args.proxy_net {
+        return Ok(None);
+    }
+    if matches!(policy.network.egress, Egress::DenyAll) {
+        return Ok(None);
+    }
+
+    let pasta = match resolve_target("pasta") {
+        Ok(path) => path,
+        Err(_) => {
+            eprintln!(
+                "bailey: warning: --proxy-net was asked for but pasta is not on \
+                 PATH, so the host address stays visible"
+            );
+            return Ok(None);
+        }
+    };
+    if !isolation::available() {
+        eprintln!(
+            "bailey: warning: --proxy-net needs user namespaces, which are \
+             unavailable, so the host address stays visible"
+        );
+        return Ok(None);
+    }
+
+    let exe = std::env::current_exe()?;
+    let inner = inner_invocation(args);
+
+    if !args.quiet && !args.json {
+        eprintln!(
+            "bailey: egress runs through a private namespace; the host address \
+             and MAC are not exposed"
+        );
+    }
+
+    // IPv4 only and a private address, so the host's own address is not copied
+    // in and its global IPv6, which encodes the interface MAC, is never formed.
+    // `--no-map-gw` keeps the host's gateway address out of the namespace too.
+    let status = std::process::Command::new(&pasta)
+        .args([
+            "--config-net",
+            "--quiet",
+            "-4",
+            "--no-map-gw",
+            "-a",
+            PROXY_ADDRESS,
+            "--",
+        ])
+        .arg(&exe)
+        .args(&inner)
+        .status()?;
+    Ok(Some(status.code().unwrap_or(1)))
+}
+
 fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
-    let (program, program_args) = split_command(args.command)?;
+    let (program, program_args) = split_command(args.command.clone())?;
     let profile = select_profile(args.profile.as_deref(), &program)?;
     let resolved = resolve(&profile, &program, args.config.as_deref())?;
     report_untrusted(&program, args.config.as_deref());
     warn_if_target_denied(&resolved.policy, &program);
+
+    // Wrap before the hooks and the backend, so the confinement, the cgroup,
+    // and the pre-launch hooks all run in the inner process that pasta places
+    // in the private namespace, never twice.
+    if !args.in_proxy_netns
+        && let Some(code) = wrap_in_private_namespace(&resolved.policy, &args)?
+    {
+        return Ok(code);
+    }
+
     let target = Target {
         program,
         args: program_args,
@@ -1184,6 +1320,42 @@ fn access_flags(access: Access) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_inner_invocation_confines_and_never_wraps_again() {
+        let cli = Cli::parse_from([
+            "bailey",
+            "run",
+            "--config",
+            "/p/policy.toml",
+            "--proxy-net",
+            "--",
+            "/bin/echo",
+            "-n",
+            "hi",
+        ]);
+        let Command::Run(args) = cli.command else {
+            panic!("expected a run command");
+        };
+
+        let inner: Vec<String> = inner_invocation(&args)
+            .into_iter()
+            .map(|part| part.to_string_lossy().into_owned())
+            .collect();
+
+        // The marker is present, so the inner run confines rather than wrapping.
+        assert!(inner.contains(&"--in-proxy-netns".to_string()), "{inner:?}");
+        // The wrapping flag is not carried in, or it would loop.
+        assert!(!inner.contains(&"--proxy-net".to_string()), "{inner:?}");
+        // The config crosses, and the target sits after `--`, so a leading dash
+        // in its own arguments cannot be read as a bailey option.
+        let sep = inner.iter().position(|p| p == "--").expect("a separator");
+        assert_eq!(&inner[sep + 1..], &["/bin/echo", "-n", "hi"]);
+        assert!(
+            inner[..sep].contains(&"/p/policy.toml".to_string()),
+            "{inner:?}"
+        );
+    }
 
     #[test]
     fn a_clean_trace_from_a_failed_run_is_not_a_clean_bill_of_health() {

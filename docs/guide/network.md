@@ -62,6 +62,31 @@ If you need a program to reach one TCP port and nothing else, this mode does
 that. If you need more than that, deny egress entirely and give the program its
 data another way, or put it behind a proxy that can filter.
 
+Because the target shares the host's network namespace, it also sees the host's
+interfaces: the IP address, the MAC, the ARP neighbours, and the routes are all
+readable, whether through `ip`, `/proc/net`, or `/sys/class/net`. Blocking one
+of those does not help, since the same facts are reachable through the others,
+and the host's global IPv6 address encodes the interface MAC on its own.
+
+### Hiding the host's address with `--proxy-net`
+
+`bailey run --proxy-net` gives the target its own network namespace after all,
+with connectivity supplied by [pasta](https://passt.top). The target sees a
+private address and a synthetic MAC in place of the host's; egress still leaves
+over the host's connection, and the policy's TCP ports are still enforced by
+Landlock inside the namespace exactly as they are without it.
+
+```sh
+bailey run --proxy-net /usr/bin/ip -o addr show scope global
+# a private address such as 10.0.2.15, never the host's
+```
+
+It needs pasta on `PATH` and unprivileged user namespaces. Without either, the
+run continues and says the host address stays visible rather than failing. Egress
+is IPv4 only, so the host's global IPv6, and the MAC embedded in it, are never
+formed. This addresses the host-identity exposure above; it does not tighten the
+egress surface, which the policy's ports already govern.
+
 ## Scoping
 
 Independently of the mode, on Linux 6.12 and later bailey asks Landlock to scope
