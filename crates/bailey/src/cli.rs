@@ -398,7 +398,10 @@ fn yes_no(value: bool) -> &'static str {
 /// Every proxied run has a network namespace to itself, so the same address in
 /// each collides with nothing: a concurrent run is a separate namespace, not a
 /// second interface on one.
-const PROXY_ADDRESS: &str = "10.0.2.15";
+const PROXY_ADDRESS_V4: &str = "10.0.2.15";
+/// The private IPv6 address a proxied session is given, a ULA that routes
+/// nowhere on its own; pasta translates it to the host's real source address.
+const PROXY_ADDRESS_V6: &str = "fd00::2";
 
 /// The bailey invocation to run inside the private namespace, the outer one
 /// with the marker added so the inner run confines rather than wrapping again.
@@ -487,23 +490,57 @@ fn wrap_in_private_namespace(
         );
     }
 
-    // IPv4 only and a private address, so the host's own address is not copied
-    // in and its global IPv6, which encodes the interface MAC, is never formed.
-    // `--no-map-gw` keeps the host's gateway address out of the namespace too.
+    // Private addresses, so the host's own are not copied in. Its global IPv6
+    // encodes the interface MAC, so a private one is given in its place rather
+    // than the host's; `--no-map-gw` keeps the host's gateway address out too.
+    //
+    // IPv6 only where the host has it: handing the namespace a v6 route the host
+    // cannot follow would leave a program stalling on v6 before it fell back.
+    let mut pasta_args: Vec<&str> = vec!["--config-net", "--quiet", "--no-map-gw"];
+    pasta_args.push("-a");
+    pasta_args.push(PROXY_ADDRESS_V4);
+    if host_has_ipv6() {
+        pasta_args.push("-a");
+        pasta_args.push(PROXY_ADDRESS_V6);
+    } else {
+        pasta_args.push("-4");
+    }
+    pasta_args.push("--");
+
     let status = std::process::Command::new(&pasta)
-        .args([
-            "--config-net",
-            "--quiet",
-            "-4",
-            "--no-map-gw",
-            "-a",
-            PROXY_ADDRESS,
-            "--",
-        ])
+        .args(&pasta_args)
         .arg(&exe)
         .args(&inner)
         .status()?;
     Ok(Some(status.code().unwrap_or(1)))
+}
+
+/// Whether the host holds a routable IPv6 address of its own.
+///
+/// Read rather than assumed, because a namespace given a v6 route the host
+/// cannot follow makes a program try v6 and wait for it to fail. A global-scope
+/// address on something other than loopback is the signal that v6 goes
+/// anywhere at all.
+fn host_has_ipv6() -> bool {
+    match std::fs::read_to_string("/proc/net/if_inet6") {
+        Ok(contents) => ipv6_global_present(&contents),
+        // Reading nothing is as good a reason as any to stay on IPv4.
+        Err(_) => false,
+    }
+}
+
+/// Whether `/proc/net/if_inet6` names a global-scope address off the loopback.
+///
+/// Each line is an address, an interface index, a prefix length, a scope, a set
+/// of flags, and a device name. Scope `00` is global; loopback and link-local
+/// carry their own and reach nowhere off the host.
+fn ipv6_global_present(if_inet6: &str) -> bool {
+    if_inet6.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        let scope = fields.nth(3);
+        let device = fields.nth(1);
+        scope == Some("00") && device != Some("lo")
+    })
 }
 
 fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
@@ -1355,6 +1392,26 @@ mod tests {
             inner[..sep].contains(&"/p/policy.toml".to_string()),
             "{inner:?}"
         );
+    }
+
+    #[test]
+    fn a_global_v6_address_is_what_marks_the_host_as_reachable() {
+        // A global-scope address on wlan0 (scope 00), alongside loopback and a
+        // link-local that reach nowhere off the host.
+        let with_global = "\
+fe80000000000000869e56fffe032b71 04 40 20 80    wlan0
+00000000000000000000000000000001 01 80 10 80       lo
+24001a005b2bdc94869e56fffe032b71 04 80 00 00    wlan0
+";
+        assert!(ipv6_global_present(with_global));
+
+        // Loopback and link-local only: no route off the host, so v4 alone.
+        let no_global = "\
+fe80000000000000869e56fffe032b71 04 40 20 80    wlan0
+00000000000000000000000000000001 01 80 10 80       lo
+";
+        assert!(!ipv6_global_present(no_global));
+        assert!(!ipv6_global_present(""));
     }
 
     #[test]

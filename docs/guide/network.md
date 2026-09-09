@@ -82,9 +82,11 @@ bailey run --proxy-net /usr/bin/ip -o addr show scope global
 ```
 
 It needs pasta on `PATH` and unprivileged user namespaces. Without either, the
-run continues and says the host address stays visible rather than failing. Egress
-is IPv4 only, so the host's global IPv6, and the MAC embedded in it, are never
-formed. This addresses the host-identity exposure above; it does not tighten the
+run continues and says the host address stays visible rather than failing. The
+namespace is given a private IPv6 address as well, where the host has one to
+reach, so the host's global IPv6 and the MAC embedded in it are never formed; on
+a host with no IPv6, the namespace gets none rather than a route it cannot
+follow. This addresses the host-identity exposure above; it does not tighten the
 egress surface, which the policy's ports already govern.
 
 ## Scoping
