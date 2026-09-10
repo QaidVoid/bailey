@@ -322,3 +322,49 @@ fn a_staging_directory_from_a_dead_run_is_swept() {
         "a run must remove staging directories whose owner is gone"
     );
 }
+
+#[test]
+fn a_grant_relocated_out_of_tmp_keeps_the_private_tmp() {
+    if !isolation_active() {
+        eprintln!("skipping: isolation unavailable on this host");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let host_marker = PathBuf::from(format!("/tmp/bailey-it-relocated.{}", std::process::id()));
+    fs::write(&host_marker, "from the host").unwrap();
+
+    let config = dir.path().join("bailey.toml");
+    fs::write(
+        &config,
+        format!(
+            "[filesystem]\n\
+             read = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\", \"/etc\", \
+             {{ path = \"{marker}\", at = \"/run/relocated\" }}]\n\
+             execute = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\"]\n",
+            marker = host_marker.display()
+        ),
+    )
+    .unwrap();
+
+    let output = run_in(
+        dir.path(),
+        &[
+            "run",
+            "--isolate",
+            "--config",
+            config.to_str().unwrap(),
+            "/bin/sh",
+            "-c",
+            "cat /run/relocated && echo -n ' ' && echo private > /tmp/probe && cat /tmp/probe",
+        ],
+    );
+
+    let _ = fs::remove_file(&host_marker);
+    assert_eq!(
+        stdout_of(&output),
+        "from the host private",
+        "a grant placed outside /tmp must arrive without costing the run its \
+         private /tmp, which is the only writable one it has:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

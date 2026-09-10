@@ -257,7 +257,11 @@ fn policy_touches(policy: &Policy, path: &Path) -> bool {
     policy
         .filesystem
         .iter()
-        .map(|rule| &rule.path)
+        // Where the grant is placed elsewhere, that is where it lands for the
+        // target, and its own path is nowhere the target can reach. A session
+        // bus socket bound out of /tmp and into /run is not a reason to hand
+        // the target the host's /tmp.
+        .map(|rule| rule.at.as_ref().unwrap_or(&rule.path))
         .chain(policy.devices.iter().map(|rule| &rule.path))
         .any(|granted| granted.starts_with(path) || path.starts_with(granted))
 }
@@ -279,7 +283,7 @@ fn covered_by_grant(policy: &Policy, path: &Path) -> bool {
     policy
         .filesystem
         .iter()
-        .map(|rule| &rule.path)
+        .map(|rule| rule.at.as_ref().unwrap_or(&rule.path))
         .chain(policy.devices.iter().map(|rule| &rule.path))
         .any(|granted| path.starts_with(granted))
 }
