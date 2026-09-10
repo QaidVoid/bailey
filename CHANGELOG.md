@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.1.2](https://github.com/QaidVoid/bailey/compare/v0.1.1...v0.1.2) - 2026-09-10
+
+### ⛰️  Features
+
+- *(network)* Give the private namespace IPv6 where the host has it - ([89f3900](https://github.com/QaidVoid/bailey/commit/89f390043c428a6d46bcbb4d5d8fc658b4c61c20))
+- *(network)* Hide the host address behind a private namespace - ([6bccff8](https://github.com/QaidVoid/bailey/commit/6bccff86aa0c7710c4597275c75e5ebcdcae202e))
+
+### 🐛 Bug Fixes
+
+- *(seccomp)* Deny the new mount API, not just mount(2) - ([572899a](https://github.com/QaidVoid/bailey/commit/572899a77caabab2525c0916aab87a84ab6a5f1a))
+
 ## [0.1.1](https://github.com/QaidVoid/bailey/compare/v0.1.0...v0.1.1) - 2026-09-07
 
 ### ⛰️  Features
