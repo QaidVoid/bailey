@@ -539,3 +539,28 @@ fn the_target_is_not_told_the_machines_name() {
         assert_ne!(seen, real, "the target must not be told the machine's name");
     }
 }
+
+#[test]
+fn the_target_keeps_the_callers_uid() {
+    if !isolation_active() {
+        eprintln!("skipping: isolation unavailable on this host");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let output = Command::new(bailey())
+        .args(["run", "--isolate", "/usr/bin/id", "-u"])
+        .env("XDG_DATA_HOME", dir.path())
+        .output()
+        .unwrap();
+
+    let seen = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let real = unsafe { libc::getuid() }.to_string();
+    assert_eq!(
+        seen,
+        real,
+        "the isolation layer must map the caller's own uid, not 0: a target \
+         that refuses to run as root would refuse here, and D-Bus EXTERNAL \
+         authentication would fail against the daemon's SO_PEERCRED:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

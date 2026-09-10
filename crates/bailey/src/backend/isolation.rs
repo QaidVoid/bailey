@@ -115,8 +115,8 @@ fn probe() -> io::Result<()> {
     let gid = unsafe { libc::getgid() };
     unshare(CloneFlags::CLONE_NEWUSER).map_err(errno)?;
     fs::write("/proc/self/setgroups", "deny")?;
-    fs::write("/proc/self/gid_map", format!("0 {gid} 1"))?;
-    fs::write("/proc/self/uid_map", format!("0 {uid} 1"))?;
+    fs::write("/proc/self/gid_map", format!("{gid} {gid} 1"))?;
+    fs::write("/proc/self/uid_map", format!("{uid} {uid} 1"))?;
     unshare(CloneFlags::CLONE_NEWNS).map_err(errno)?;
     mount(
         None::<&str>,
@@ -151,10 +151,18 @@ pub fn enter(plan: &IsolationPlan) -> io::Result<()> {
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
 
+    // An identity map, not `0 {uid} 1`. What permits the mounts below is
+    // CAP_SYS_ADMIN in the new user namespace, which its creator holds whatever
+    // uid the map names, so mapping to 0 buys nothing and costs two things: a
+    // program that refuses to run as root does, Electron and Chromium among
+    // them, and D-Bus EXTERNAL authentication fails, because the client offers
+    // the uid it sees while the daemon reads SO_PEERCRED and gets the real one.
+    // Keeping the caller's uid leaves the keyring, and everything behind the
+    // session bus, reachable.
     unshare(CloneFlags::CLONE_NEWUSER).map_err(errno)?;
     fs::write("/proc/self/setgroups", "deny")?;
-    fs::write("/proc/self/gid_map", format!("0 {gid} 1"))?;
-    fs::write("/proc/self/uid_map", format!("0 {uid} 1"))?;
+    fs::write("/proc/self/gid_map", format!("{gid} {gid} 1"))?;
+    fs::write("/proc/self/uid_map", format!("{uid} {uid} 1"))?;
 
     // UTS as well, so the target is not told the machine's name. Denying
     // /etc/hostname is not enough: `uname` is a syscall, and a program that

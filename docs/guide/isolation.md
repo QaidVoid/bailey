@@ -26,9 +26,12 @@ enforced. This is the only place it can be: Landlock rules add access and never
 subtract it.
 
 **Privilege.** All of it happens inside a user namespace, so none of it needs
-root. The invoking user is mapped to uid 0 inside the namespace, which is what
-makes the mount operations permitted; that root is meaningless outside the
-namespace.
+root. What permits the mount operations is `CAP_SYS_ADMIN` in that namespace,
+which its creator holds whatever uid the map names, so the map is an identity
+one: you are yourself inside the sandbox. Mapping to 0 instead would buy
+nothing and cost two things, a program that refuses to run as root, Electron
+and Chromium among them, and D-Bus `EXTERNAL` authentication, which fails when
+the uid the client offers is not the one the daemon reads from `SO_PEERCRED`.
 
 ## How it is built
 
