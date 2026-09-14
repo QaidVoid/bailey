@@ -266,7 +266,6 @@ fn policy_touches(policy: &Policy, path: &Path) -> bool {
         .any(|granted| granted.starts_with(path) || path.starts_with(granted))
 }
 
-/// Whether a grant covers `path` itself.
 /// Where `path` ends up when the grant covering it was placed elsewhere.
 ///
 /// Returns `None` when nothing covering it was moved, which is the ordinary
@@ -279,12 +278,22 @@ fn relocated_dir(policy: &Policy, path: &Path) -> Option<PathBuf> {
     })
 }
 
+/// Whether a grant covers the host `path` itself.
+///
+/// Callers pass host paths, the real home, the invocation directory, the
+/// runtime dir. A grant covers such a path through its own source, and a
+/// relocated grant also occupies its placement, so both are matched: the source
+/// answers "did the operator grant this", the placement answers "does something
+/// already sit here". Matching only the placement, as `policy_touches` does for
+/// its sandbox-side question, drops the source and loses the grant on the host
+/// path the caller asked about.
 fn covered_by_grant(policy: &Policy, path: &Path) -> bool {
     policy
         .filesystem
         .iter()
-        .map(|rule| rule.at.as_ref().unwrap_or(&rule.path))
-        .chain(policy.devices.iter().map(|rule| &rule.path))
+        .flat_map(|rule| [Some(rule.path.as_path()), rule.at.as_deref()])
+        .flatten()
+        .chain(policy.devices.iter().map(|rule| rule.path.as_path()))
         .any(|granted| path.starts_with(granted))
 }
 
@@ -403,6 +412,29 @@ mod tests {
         let world = World::derive(Path::new("/opt/game/game"), &policy, true);
         assert!(world.home_host.is_none());
         assert_eq!(world.home_inside, home);
+    }
+
+    #[test]
+    fn a_relocated_grant_still_covers_its_source() {
+        // The invocation directory is a host path; a grant that relocates it to
+        // another path must still register as covering it, or the cwd is
+        // dropped and the target starts in the private home. Both the source
+        // and the placement count, and an unrelated path counts as neither.
+        let policy = Policy {
+            filesystem: vec![FsRule {
+                path: PathBuf::from("/home/you/project"),
+                access: Access::READ,
+                at: Some(PathBuf::from("/workspace")),
+            }],
+            ..Policy::default()
+        };
+        assert!(covered_by_grant(&policy, Path::new("/home/you/project")));
+        assert!(covered_by_grant(
+            &policy,
+            Path::new("/home/you/project/src")
+        ));
+        assert!(covered_by_grant(&policy, Path::new("/workspace")));
+        assert!(!covered_by_grant(&policy, Path::new("/home/you/other")));
     }
 
     #[test]
