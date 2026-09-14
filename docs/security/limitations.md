@@ -60,6 +60,28 @@ namespace does.
 For runs without isolation, grant the specific subdirectories you want instead of
 granting the parent and carving out exceptions.
 
+### A read grant still allows a file's metadata to be changed
+
+Landlock governs the content of a file and the shape of a directory. It does not
+govern a file's mode, its owner, its timestamps, or its extended attributes, so
+`chmod`, `chown`, `utimensat` and `setxattr` succeed on a file a policy grants
+only read access to. Measured on a read-granted path: creating, writing,
+deleting, linking and binding are all refused, and those four return `OK`.
+
+Ordinary permissions still apply underneath, so this reaches only files the
+invoking user already owns. It cannot change a file's contents and it cannot
+gain a privilege, but it can make a file unreadable to its owner or move its
+timestamps.
+
+seccomp cannot close this. It matches syscall numbers and register values, not
+resolved paths, so it cannot tell `chmod` on a granted path from `chmod` on a
+path outside one, and a target that may not `chmod` inside its own workspace is
+not a working sandbox. The boundary belongs in Landlock, which does not yet
+express it.
+
+Grant read where a target genuinely needs to read. A path granted for the sake
+of one file inside it exposes the metadata of everything else in it.
+
 ## Environment
 
 ### A passed variable is passed in full
