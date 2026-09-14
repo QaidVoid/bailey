@@ -101,6 +101,15 @@ struct RunArgs {
     /// confines the target where it is rather than wrapping it again.
     #[arg(long, hide = true)]
     in_proxy_netns: bool,
+    /// Force all egress through a broker reachable only at ADDR:PORT.
+    ///
+    /// Implies `--proxy-net`. The private namespace is given ADDR as the host's
+    /// loopback stand-in, and a netfilter rule drops every outbound connection
+    /// except one to ADDR:PORT, so the session reaches the broker and nothing
+    /// else. If the rule cannot be applied the run refuses rather than fall back
+    /// to open egress. `nft` must be present.
+    #[arg(long, value_name = "ADDR:PORT")]
+    egress_proxy: Option<String>,
     /// The target executable, followed by its own arguments.
     #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<String>,
@@ -403,6 +412,86 @@ const PROXY_ADDRESS_V4: &str = "10.0.2.15";
 /// nowhere on its own; pasta translates it to the host's real source address.
 const PROXY_ADDRESS_V6: &str = "fd00::2";
 
+/// Reads an `ADDR:PORT` egress-proxy value into an IPv4 address and a port.
+fn parse_egress_proxy(value: &str) -> anyhow::Result<(std::net::Ipv4Addr, u16)> {
+    let (addr, port) = value
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow::anyhow!("--egress-proxy must be ADDR:PORT, got {value:?}"))?;
+    let addr = addr
+        .parse::<std::net::Ipv4Addr>()
+        .map_err(|_| anyhow::anyhow!("--egress-proxy address is not IPv4: {addr:?}"))?;
+    let port = port
+        .parse::<u16>()
+        .map_err(|_| anyhow::anyhow!("--egress-proxy port is not a port: {port:?}"))?;
+    Ok((addr, port))
+}
+
+/// Locks the current network namespace to the egress broker at `addr:port`.
+///
+/// A default-drop output chain admits loopback, the one broker destination, and
+/// the return traffic of connections already allowed. Everything else, every
+/// other host, every other port, and all of IPv6, is dropped, so the session
+/// reaches the broker and nothing else. The process holds CAP_NET_ADMIN over
+/// its own namespace, which is what lets an unprivileged run install this.
+///
+/// Fail-closed: any error installing the rule is returned, and the caller
+/// refuses the run rather than proceed with open egress. A proxy that is asked
+/// for but not enforced is worse than none, because it is believed.
+/// Adds the broker port to a policy's egress allowance, so Landlock's port
+/// rule does not refuse the connection the netfilter rule already bounds.
+fn permit_broker_port(policy: &mut crate::policy::Policy, port: u16) {
+    use crate::policy::{Egress, EgressRule};
+    let rule = EgressRule {
+        host: "*".to_string(),
+        port: Some(port),
+    };
+    match &mut policy.network.egress {
+        Egress::Allow(rules) => rules.push(rule),
+        // Deny would not have reached a proxied run; all-ports needs nothing.
+        Egress::DenyAll => policy.network.egress = Egress::Allow(vec![rule]),
+        Egress::AllowAll => {}
+    }
+}
+
+fn lock_egress_to_broker(addr: std::net::Ipv4Addr, port: u16) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    // A dedicated table, so it is this rule that is added and removed and never
+    // another's. IPv6 has no accept rule, so the inet chain drops it entirely.
+    let ruleset = format!(
+        "table inet bailey_egress {{\n\
+         \tchain output {{\n\
+         \t\ttype filter hook output priority 0; policy drop;\n\
+         \t\toif \"lo\" accept\n\
+         \t\tip daddr {addr} tcp dport {port} accept\n\
+         \t\tct state established,related accept\n\
+         \t}}\n\
+         }}\n"
+    );
+
+    let mut child = std::process::Command::new("nft")
+        .arg("-f")
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|err| anyhow::anyhow!("--egress-proxy needs nft, which could not run: {err}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("could not write the egress ruleset to nft"))?
+        .write_all(ruleset.as_bytes())?;
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "the egress lockdown could not be installed, so the run is refused: nft: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 /// The bailey invocation to run inside the private namespace, the outer one
 /// with the marker added so the inner run confines rather than wrapping again.
 ///
@@ -431,6 +520,10 @@ fn inner_invocation(args: &RunArgs) -> Vec<std::ffi::OsString> {
         inner.push("--json".into());
     }
     inner.push("--in-proxy-netns".into());
+    if let Some(proxy) = &args.egress_proxy {
+        inner.push("--egress-proxy".into());
+        inner.push(proxy.into());
+    }
     inner.push("--".into());
     for part in &args.command {
         inner.push(part.into());
@@ -455,15 +548,24 @@ fn wrap_in_private_namespace(
 ) -> anyhow::Result<Option<i32>> {
     use crate::policy::Egress;
 
-    if args.no_proxy_net || !args.proxy_net {
+    // An egress proxy needs the private namespace, so it implies --proxy-net.
+    let want_proxy = args.proxy_net || args.egress_proxy.is_some();
+    if args.no_proxy_net || !want_proxy {
         return Ok(None);
     }
     if matches!(policy.network.egress, Egress::DenyAll) {
         return Ok(None);
     }
 
+    // With an egress proxy a missing dependency is fatal, not a downgrade: the
+    // point of the proxy is that egress is bounded, and continuing without the
+    // namespace would leave it open while the caller believed it closed.
+    let strict = args.egress_proxy.is_some();
     let pasta = match resolve_target("pasta") {
         Ok(path) => path,
+        Err(_) if strict => {
+            anyhow::bail!("--egress-proxy needs pasta, which is not on PATH; the run is refused")
+        }
         Err(_) => {
             eprintln!(
                 "bailey: warning: --proxy-net was asked for but pasta is not on \
@@ -473,6 +575,11 @@ fn wrap_in_private_namespace(
         }
     };
     if !isolation::available() {
+        if strict {
+            anyhow::bail!(
+                "--egress-proxy needs user namespaces, which are unavailable; the run is refused"
+            );
+        }
         eprintln!(
             "bailey: warning: --proxy-net needs user namespaces, which are \
              unavailable, so the host address stays visible"
@@ -497,6 +604,19 @@ fn wrap_in_private_namespace(
     // IPv6 only where the host has it: handing the namespace a v6 route the host
     // cannot follow would leave a program stalling on v6 before it fell back.
     let mut pasta_args: Vec<&str> = vec!["--config-net", "--quiet", "--no-map-gw"];
+    // Under an egress proxy the namespace must be able to reach the broker,
+    // which listens on the host's loopback. Map that loopback to the broker's
+    // namespace-visible address so a connection to it reaches the host; the
+    // netfilter rule installed inside the namespace then allows only that one
+    // destination. Kept off the plain --proxy-net path, which maps no host.
+    let egress_addr = match &args.egress_proxy {
+        Some(value) => Some(parse_egress_proxy(value)?.0.to_string()),
+        None => None,
+    };
+    if let Some(addr) = &egress_addr {
+        pasta_args.push("--map-host-loopback");
+        pasta_args.push(addr);
+    }
     pasta_args.push("-a");
     pasta_args.push(PROXY_ADDRESS_V4);
     if host_has_ipv6() {
@@ -546,7 +666,7 @@ fn ipv6_global_present(if_inet6: &str) -> bool {
 fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
     let (program, program_args) = split_command(args.command.clone())?;
     let profile = select_profile(args.profile.as_deref(), &program)?;
-    let resolved = resolve(&profile, &program, args.config.as_deref())?;
+    let mut resolved = resolve(&profile, &program, args.config.as_deref())?;
     report_untrusted(&program, args.config.as_deref());
     warn_if_target_denied(&resolved.policy, &program);
 
@@ -557,6 +677,19 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
         && let Some(code) = wrap_in_private_namespace(&resolved.policy, &args)?
     {
         return Ok(code);
+    }
+
+    // Inside the namespace now, whether by the wrap above or a re-exec into it.
+    // The lockdown goes on before the target is confined and run, so there is
+    // no window in which the target has both a network and no egress rule.
+    if let Some(proxy) = &args.egress_proxy {
+        let (addr, port) = parse_egress_proxy(proxy)?;
+        lock_egress_to_broker(addr, port)?;
+        // Landlock gates egress by port, and the broker does not listen on the
+        // policy's ports. The netfilter rule already holds egress to the broker
+        // address, so permitting its port here widens nothing a session can
+        // reach; it only stops Landlock from refusing the one allowed hop.
+        permit_broker_port(&mut resolved.policy, port);
     }
 
     let target = Target {
@@ -1357,6 +1490,67 @@ fn access_flags(access: Access) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_egress_proxy_value_parses_into_an_address_and_port() {
+        assert_eq!(
+            parse_egress_proxy("169.254.169.1:8443").unwrap(),
+            ("169.254.169.1".parse().unwrap(), 8443),
+        );
+        assert!(parse_egress_proxy("169.254.169.1").is_err()); // no port
+        assert!(parse_egress_proxy("not-an-addr:443").is_err()); // not IPv4
+        assert!(parse_egress_proxy("169.254.169.1:0").is_ok()); // 0 is a valid u16
+        assert!(parse_egress_proxy("169.254.169.1:70000").is_err()); // out of range
+    }
+
+    #[test]
+    fn permitting_the_broker_port_widens_only_that_port() {
+        use crate::policy::{Egress, EgressRule, Policy};
+
+        // An Allow policy gains the broker port alongside what it had.
+        let mut policy = Policy::default();
+        policy.network.egress = Egress::Allow(vec![EgressRule {
+            host: "*".into(),
+            port: Some(443),
+        }]);
+        permit_broker_port(&mut policy, 8443);
+        match &policy.network.egress {
+            Egress::Allow(rules) => {
+                assert!(rules.iter().any(|r| r.port == Some(443)));
+                assert!(rules.iter().any(|r| r.port == Some(8443)));
+            }
+            _ => panic!("expected Allow"),
+        }
+
+        // AllowAll already permits every port, so it is left alone.
+        let mut open = Policy::default();
+        open.network.egress = Egress::AllowAll;
+        permit_broker_port(&mut open, 8443);
+        assert_eq!(open.network.egress, Egress::AllowAll);
+    }
+
+    #[test]
+    fn egress_proxy_is_threaded_into_the_inner_invocation() {
+        let cli = Cli::parse_from([
+            "bailey",
+            "run",
+            "--egress-proxy",
+            "169.254.169.1:8443",
+            "--",
+            "/bin/true",
+        ]);
+        let Command::Run(args) = cli.command else {
+            panic!("expected run")
+        };
+        let inner = inner_invocation(&args);
+        let joined: Vec<String> = inner
+            .iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect();
+        assert!(joined.iter().any(|a| a == "--egress-proxy"));
+        assert!(joined.iter().any(|a| a == "169.254.169.1:8443"));
+        assert!(joined.iter().any(|a| a == "--in-proxy-netns"));
+    }
 
     #[test]
     fn the_inner_invocation_confines_and_never_wraps_again() {

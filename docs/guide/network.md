@@ -89,6 +89,26 @@ a host with no IPv6, the namespace gets none rather than a route it cannot
 follow. This addresses the host-identity exposure above; it does not tighten the
 egress surface, which the policy's ports already govern.
 
+### Forcing egress through a broker with `--egress-proxy`
+
+Port rules cannot tell one host on 443 from another, so a session may reach any
+host there, and a userspace VPN turns that reach into a two-way channel.
+`--egress-proxy ADDR:PORT` closes that. It implies `--proxy-net`, maps the
+host's loopback into the namespace at ADDR so a broker listening on the host is
+reachable, and installs a netfilter rule that drops every outbound connection
+except one to ADDR:PORT.
+
+```sh
+bailey run --egress-proxy 169.254.169.1:8443 -- curl https://example.com
+# reaches the broker at 169.254.169.1:8443 and nothing else; 1.1.1.1:443 is dropped
+```
+
+The broker is whatever the caller runs there: it admits an allowlist of hosts
+and refuses the rest, so a session reaches the endpoints it needs and no relay
+it does not. The lockdown is the enforcement, and it is fail-closed: if the
+netfilter rule cannot be installed, or pasta or user namespaces are missing,
+the run is refused rather than left with open egress. `nft` must be present.
+
 ## Scoping
 
 Independently of the mode, on Linux 6.12 and later bailey asks Landlock to scope
