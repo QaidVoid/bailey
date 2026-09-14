@@ -51,6 +51,14 @@ syscalls with `EPERM`:
 These are not needed by normal applications and are common building blocks for
 sandbox escape, privilege escalation, and tampering with other processes.
 
+The `ioctl` syscall is not denied whole, since ordinary programs use it
+constantly. Only the btrfs family is refused, matched on the request's type
+byte. Landlock mediates the path operations that create a file, but not the
+ioctls with which btrfs creates a subvolume or snapshot, so on a btrfs
+filesystem those would otherwise plant a directory of files in any host
+directory the target may read. `FICLONE` shares the same type byte, so a
+reflink copy is refused with it and falls back to a full copy.
+
 ::: warning A denylist, not an allowlist
 This is a hardening layer. A complete allowlist would be stronger, and it is also
 the kind of thing that breaks a program six months later when a libc update starts

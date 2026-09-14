@@ -912,14 +912,47 @@ fn denied_syscalls() -> &'static [i64] {
     ]
 }
 
+/// Type bytes of the ioctl families that create a subvolume or a snapshot,
+/// `_IOC_TYPE(nr)`, in bits 8 to 15 of the request.
+///
+/// Landlock mediates the VFS path operations, so `mkdir`, `open(O_CREAT)` and
+/// `symlink` outside the granted tree are already denied. It does not mediate
+/// ioctls on a directory, and a filesystem with subvolumes creates them that
+/// way. A snapshot of a subvolume the target controls, taken into any host
+/// directory it may merely read that sits on the same filesystem, plants a
+/// directory of arbitrary files outside the sandbox. Denying these families
+/// here, where Landlock cannot reach, closes that. `0x94` is btrfs (and
+/// `FICLONE`, so a reflink copy is refused with it and falls back to a full
+/// copy); `0xbc` is bcachefs.
+const SUBVOL_IOCTL_TYPES: [u64; 2] = [0x94, 0xbc];
+
 fn build_seccomp_filter() -> anyhow::Result<seccompiler::BpfProgram> {
-    use seccompiler::{SeccompAction, SeccompFilter};
+    use seccompiler::{
+        SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter, SeccompRule,
+    };
 
     let mut rules = BTreeMap::new();
     for &nr in denied_syscalls() {
         // An empty rule vector matches the syscall unconditionally.
         rules.insert(nr, Vec::new());
     }
+
+    // ioctl carries too much that is ordinary to deny whole, so only the
+    // subvolume families are refused, each matched on the type byte of the
+    // request. The rules are alternatives: an ioctl of either type is denied,
+    // every other is left to the kernel.
+    let ioctl_rules = SUBVOL_IOCTL_TYPES
+        .iter()
+        .map(|&ty| {
+            Ok(SeccompRule::new(vec![SeccompCondition::new(
+                1,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::MaskedEq(0xff00),
+                ty << 8,
+            )?])?)
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    rules.insert(libc::SYS_ioctl, ioctl_rules);
 
     let filter = SeccompFilter::new(
         rules,
@@ -1070,6 +1103,64 @@ mod tests {
     #[test]
     fn seccomp_filter_builds() {
         assert!(build_seccomp_filter().is_ok());
+    }
+
+    /// Constructs an ioctl request number the way the kernel macros do, so the
+    /// test refuses the same encoding the filter matches on rather than a
+    /// hand-copied constant.
+    fn ioctl_nr(ty: u64, nr: u64, size: u64) -> libc::c_ulong {
+        const DIR_WRITE: u64 = 1;
+        ((DIR_WRITE << 30) | (size << 16) | (ty << 8) | nr) as libc::c_ulong
+    }
+
+    /// The escape is an ioctl Landlock never saw, so the proof is at the
+    /// syscall boundary: with the real filter applied, a subvolume ioctl is
+    /// stopped with EPERM before it reaches any filesystem, while an ordinary
+    /// ioctl is left to the kernel. Run in a child because a filter cannot be
+    /// lifted.
+    #[test]
+    fn the_filter_denies_subvolume_ioctls_and_spares_the_rest() {
+        let filter: seccompiler::BpfProgram = build_seccomp_filter().unwrap();
+
+        // btrfs SNAP_CREATE and SUBVOL_CREATE_V2, the pair the report used, and
+        // bcachefs SUBVOLUME_CREATE, the same class on the other filesystem.
+        let btrfs_snap_create = ioctl_nr(SUBVOL_IOCTL_TYPES[0], 1, 4096);
+        let btrfs_subvol_create_v2 = ioctl_nr(SUBVOL_IOCTL_TYPES[0], 24, 4096);
+        let bcachefs_subvol_create = ioctl_nr(SUBVOL_IOCTL_TYPES[1], 16, 4096);
+        // FIONREAD: type 'T' (0x54), an everyday ioctl that must still reach the
+        // kernel, which answers it on /dev/null with anything but the EPERM
+        // seccomp would have returned.
+        let fionread = libc::FIONREAD as libc::c_ulong;
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            seccompiler::apply_filter(&filter).unwrap();
+            let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY) };
+            let mut out: libc::c_int = 0;
+            let mut errno_of = |req: libc::c_ulong| -> i32 {
+                unsafe {
+                    *libc::__errno_location() = 0;
+                    libc::ioctl(fd, req, &mut out);
+                    *libc::__errno_location()
+                }
+            };
+            let denied = errno_of(btrfs_snap_create) == libc::EPERM
+                && errno_of(btrfs_subvol_create_v2) == libc::EPERM
+                && errno_of(bcachefs_subvol_create) == libc::EPERM;
+            // The benign ioctl must not be the one seccomp refused.
+            let benign_survived = errno_of(fionread) != libc::EPERM;
+            let code = if denied && benign_survived { 0 } else { 1 };
+            unsafe { libc::_exit(code) };
+        }
+
+        let mut status = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        let exited = libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0;
+        assert!(
+            exited,
+            "subvolume ioctls were not denied, or a benign ioctl was"
+        );
     }
 
     #[test]
