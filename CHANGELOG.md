@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.1.4](https://github.com/QaidVoid/bailey/compare/v0.1.3...v0.1.4) - 2026-09-14
+
+### ⛰️  Features
+
+- *(cli)* Add --egress-proxy to lock a session to a single broker - ([9656f22](https://github.com/QaidVoid/bailey/commit/9656f2259ec5952937725a3f41477b0dacbc5dbc))
+
+### 🐛 Bug Fixes
+
+- *(cli)* Drop the namespace's forwarded loopback to the host - ([8570d3c](https://github.com/QaidVoid/bailey/commit/8570d3cc2f0cecf4b3b9ee32c25039dda6c415ff))
+- *(world)* Keep a relocated grant covering its own source - ([b8a7eea](https://github.com/QaidVoid/bailey/commit/b8a7eea8996d95e069b2d5922112525ed99f8759))
+
 ## [0.1.3](https://github.com/QaidVoid/bailey/compare/v0.1.2...v0.1.3) - 2026-09-14
 
 ### 🐛 Bug Fixes
