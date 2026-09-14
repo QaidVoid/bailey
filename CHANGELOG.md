@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.3](https://github.com/QaidVoid/bailey/compare/v0.1.2...v0.1.3) - 2026-09-14
+
+### 🐛 Bug Fixes
+
+- *(enforce)* Validate the architecture so a denied syscall cannot slip past - ([51a30ab](https://github.com/QaidVoid/bailey/commit/51a30ab7936652be2adfaae1557e533228391900))
+- *(enforce)* Deny btrfs ioctls that Landlock does not mediate - ([587fc6f](https://github.com/QaidVoid/bailey/commit/587fc6f226717b8e16b8fb9c33ad1aa75d20d810))
+
 ## [0.1.2](https://github.com/QaidVoid/bailey/compare/v0.1.1...v0.1.2) - 2026-09-13
 
 ### ⛰️  Features
