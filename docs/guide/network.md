@@ -89,6 +89,15 @@ a host with no IPv6, the namespace gets none rather than a route it cannot
 follow. This addresses the host-identity exposure above; it does not tighten the
 egress surface, which the policy's ports already govern.
 
+pasta forwards the namespace's own `127.0.0.0/8` to the host's loopback, so
+without more a session could reach a host service on a permitted port. Under
+`--proxy-net` bailey drops that forwarded loopback with a netfilter rule, so a
+session cannot reach the host on `127.0.0.1` whatever port the policy allows.
+It is best-effort here and needs `nft`; the run says so if the rule cannot be
+installed. The default landlock-only mode shares the host network namespace,
+so there is no separate loopback to isolate and this rule does not apply;
+`--proxy-net` is what gives a session a loopback of its own to protect.
+
 ### Forcing egress through a broker with `--egress-proxy`
 
 Port rules cannot tell one host on 443 from another, so a session may reach any

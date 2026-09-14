@@ -454,21 +454,50 @@ fn permit_broker_port(policy: &mut crate::policy::Policy, port: u16) {
 }
 
 fn lock_egress_to_broker(addr: std::net::Ipv4Addr, port: u16) -> anyhow::Result<()> {
-    use std::io::Write;
-
     // A dedicated table, so it is this rule that is added and removed and never
     // another's. IPv6 has no accept rule, so the inet chain drops it entirely.
+    //
+    // Loopback is dropped, not accepted. pasta forwards the namespace's own
+    // 127.0.0.0/8 to the HOST's loopback, so an `oif lo accept` would let a
+    // session reach a host service on an allowed port. There is no loopback
+    // that stays inside the namespace to protect, so dropping it costs nothing
+    // and closes host-loopback reach.
     let ruleset = format!(
         "table inet bailey_egress {{\n\
          \tchain output {{\n\
          \t\ttype filter hook output priority 0; policy drop;\n\
-         \t\toif \"lo\" accept\n\
+         \t\tip daddr 127.0.0.0/8 drop\n\
+         \t\tip6 daddr ::1 drop\n\
          \t\tip daddr {addr} tcp dport {port} accept\n\
          \t\tct state established,related accept\n\
          \t}}\n\
          }}\n"
     );
 
+    run_nft(&ruleset).map_err(|err| {
+        anyhow::anyhow!("the egress lockdown could not be installed, so the run is refused: {err}")
+    })
+}
+
+/// Drops the namespace's forwarded loopback, so a session cannot reach a host
+/// service on `127.0.0.0/8`. Best-effort, for the plain `--proxy-net` path
+/// where egress is otherwise open: a policy-accept chain with the loopback
+/// destinations dropped. Under an egress proxy the stricter lockdown already
+/// covers this, so it is not called there.
+fn drop_host_loopback() -> anyhow::Result<()> {
+    let ruleset = "table inet bailey_loopback {\n\
+         \tchain output {\n\
+         \t\ttype filter hook output priority 0; policy accept;\n\
+         \t\tip daddr 127.0.0.0/8 drop\n\
+         \t\tip6 daddr ::1 drop\n\
+         \t}\n\
+         }\n";
+    run_nft(ruleset)
+}
+
+/// Feeds a ruleset to `nft -f -`, returning an error with nft's own message.
+fn run_nft(ruleset: &str) -> anyhow::Result<()> {
+    use std::io::Write;
     let mut child = std::process::Command::new("nft")
         .arg("-f")
         .arg("-")
@@ -476,18 +505,15 @@ fn lock_egress_to_broker(addr: std::net::Ipv4Addr, port: u16) -> anyhow::Result<
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
-        .map_err(|err| anyhow::anyhow!("--egress-proxy needs nft, which could not run: {err}"))?;
+        .map_err(|err| anyhow::anyhow!("nft could not run: {err}"))?;
     child
         .stdin
         .take()
-        .ok_or_else(|| anyhow::anyhow!("could not write the egress ruleset to nft"))?
+        .ok_or_else(|| anyhow::anyhow!("could not write the ruleset to nft"))?
         .write_all(ruleset.as_bytes())?;
     let output = child.wait_with_output()?;
     if !output.status.success() {
-        anyhow::bail!(
-            "the egress lockdown could not be installed, so the run is refused: nft: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+        anyhow::bail!("nft: {}", String::from_utf8_lossy(&output.stderr).trim());
     }
     Ok(())
 }
@@ -690,6 +716,14 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
         // address, so permitting its port here widens nothing a session can
         // reach; it only stops Landlock from refusing the one allowed hop.
         permit_broker_port(&mut resolved.policy, port);
+    } else if args.in_proxy_netns {
+        // Plain --proxy-net still forwards the namespace loopback to the host,
+        // so a session could reach a host service on an allowed port. Drop that
+        // reach. Best-effort here, matching --proxy-net's own degradation: the
+        // hard guarantee is --egress-proxy above.
+        if let Err(err) = drop_host_loopback() {
+            eprintln!("bailey: warning: host loopback stays reachable: {err}");
+        }
     }
 
     let target = Target {
