@@ -960,7 +960,75 @@ fn build_seccomp_filter() -> anyhow::Result<seccompiler::BpfProgram> {
         SeccompAction::Errno(libc::EPERM as u32),
         target_arch()?,
     )?;
-    Ok(filter.try_into()?)
+    Ok(guard_architecture(filter.try_into()?))
+}
+
+/// `AUDIT_ARCH_*` value for the architecture the filter was built for. seccomp
+/// reports it in `seccomp_data.arch`, and every rule's syscall number is only
+/// meaningful for this one.
+#[cfg(target_arch = "x86_64")]
+const NATIVE_AUDIT_ARCH: u32 = 0xc000_003e;
+#[cfg(target_arch = "aarch64")]
+const NATIVE_AUDIT_ARCH: u32 = 0xc000_00b7;
+
+/// Prepends an architecture check to a generated filter.
+///
+/// seccompiler compares the syscall number and never looks at
+/// `seccomp_data.arch`. A denied syscall reached through a foreign ABI carries
+/// a different number under a different architecture, matches no rule, and
+/// falls through to the allow action. On x86_64 both the i386 `int 0x80` entry
+/// and the x32 ABI do exactly this: measured, a filter that denies a syscall by
+/// its native number still runs it when it arrives as the i386 or x32 number.
+///
+/// The prologue refuses anything whose architecture is not the one the rules
+/// were written for. On x86_64 it also refuses the x32 numbering, which shares
+/// the native architecture but sets bit 30 of the number. A refused call
+/// returns `EPERM`, the same as any other denial, so a foreign ABI is closed
+/// rather than left to the incidental behaviour of the rest of the filter.
+fn guard_architecture(program: seccompiler::BpfProgram) -> seccompiler::BpfProgram {
+    use seccompiler::sock_filter;
+
+    // Classic BPF opcodes and seccomp offsets, which libc does not name.
+    const BPF_LD_W_ABS: u16 = 0x20;
+    const BPF_JMP_JEQ_K: u16 = 0x15;
+    const BPF_JMP_JGE_K: u16 = 0x35;
+    const BPF_RET_K: u16 = 0x06;
+    const ARCH_OFFSET: u32 = 4; // offsetof(seccomp_data, arch)
+    const NR_OFFSET: u32 = 0; // offsetof(seccomp_data, nr)
+    const X32_SYSCALL_BIT: u32 = 0x4000_0000;
+    const RET_ERRNO_EPERM: u32 = 0x0005_0000 | (libc::EPERM as u32);
+
+    let stmt = |code: u16, k: u32| sock_filter {
+        code,
+        jt: 0,
+        jf: 0,
+        k,
+    };
+    let jump = |code: u16, k: u32, jt: u8, jf: u8| sock_filter { code, jt, jf, k };
+
+    let mut prologue = vec![
+        // A = seccomp_data.arch
+        stmt(BPF_LD_W_ABS, ARCH_OFFSET),
+        // native arch: skip the refusal; otherwise fall into it
+        jump(BPF_JMP_JEQ_K, NATIVE_AUDIT_ARCH, 1, 0),
+        stmt(BPF_RET_K, RET_ERRNO_EPERM),
+    ];
+    // On x86_64 the x32 ABI shares the native arch and only differs by bit 30
+    // of the syscall number, so the arch check alone does not stop it.
+    #[cfg(target_arch = "x86_64")]
+    {
+        prologue.extend_from_slice(&[
+            // A = seccomp_data.nr
+            stmt(BPF_LD_W_ABS, NR_OFFSET),
+            // nr with the x32 bit set: fall into the refusal; otherwise skip it
+            jump(BPF_JMP_JGE_K, X32_SYSCALL_BIT, 0, 1),
+            stmt(BPF_RET_K, RET_ERRNO_EPERM),
+        ]);
+    }
+    let _ = NR_OFFSET;
+
+    prologue.extend(program);
+    prologue
 }
 
 fn target_arch() -> anyhow::Result<seccompiler::TargetArch> {
@@ -1182,5 +1250,94 @@ mod tests {
         ] {
             assert!(denied.contains(&nr), "syscall {nr} should be denied");
         }
+    }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod arch_guard_tests {
+    use super::*;
+
+    /// setns(-1, 0) through the i386 `int 0x80` entry (i386 nr 346). Returns
+    /// eax: EBADF means the kernel ran it, EPERM means the filter refused it.
+    unsafe fn setns_i386() -> i32 {
+        let mut ret: i32 = 346;
+        unsafe {
+            core::arch::asm!(
+                "xchg {tmp}, rbx",
+                "int 0x80",
+                "xchg {tmp}, rbx",
+                tmp = in(reg) -1i64,
+                inout("eax") ret,
+                in("ecx") 0,
+                in("edx") 0,
+                options(nostack),
+            );
+        }
+        ret
+    }
+
+    /// Runs a probe in a child under the real filter and returns its exit code.
+    /// A code in 0..256 is the probe's own; 256 + signal means it was killed.
+    fn under_filter(probe: fn()) -> i32 {
+        let filter: seccompiler::BpfProgram = build_seccomp_filter().unwrap();
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            seccompiler::apply_filter(&filter).unwrap();
+            probe();
+            unsafe { libc::_exit(0) };
+        }
+        let mut status = 0;
+        unsafe { libc::waitpid(pid, &mut status, 0) };
+        if libc::WIFSIGNALED(status) {
+            256 + libc::WTERMSIG(status)
+        } else {
+            libc::WEXITSTATUS(status)
+        }
+    }
+
+    #[test]
+    fn a_denied_syscall_is_refused_through_every_abi() {
+        // Native x86_64 setns is denied by a rule: EPERM.
+        let native = under_filter(|| {
+            let e = unsafe {
+                *libc::__errno_location() = 0;
+                libc::syscall(libc::SYS_setns, -1, 0);
+                *libc::__errno_location()
+            };
+            unsafe { libc::_exit(if e == libc::EPERM { 0 } else { 1 }) };
+        });
+        assert_eq!(native, 0, "native setns should be EPERM");
+
+        // i386 setns must now be EPERM, not EBADF (executed) and not a signal.
+        let i386 = under_filter(|| {
+            let eax = unsafe { setns_i386() };
+            unsafe { libc::_exit(if eax == -libc::EPERM { 0 } else { 1 }) };
+        });
+        assert_eq!(
+            i386, 0,
+            "i386 setns via int 0x80 must be refused with EPERM"
+        );
+
+        // x32 setns (native arch, nr | 0x40000000) must be EPERM too.
+        let x32 = under_filter(|| {
+            let e = unsafe {
+                *libc::__errno_location() = 0;
+                libc::syscall(libc::SYS_setns | 0x4000_0000, -1, 0);
+                *libc::__errno_location()
+            };
+            unsafe { libc::_exit(if e == libc::EPERM { 0 } else { 1 }) };
+        });
+        assert_eq!(x32, 0, "x32 setns must be refused with EPERM");
+    }
+
+    #[test]
+    fn a_native_allowed_syscall_still_works() {
+        // getpid is denied by nothing and native: it must run, not be refused.
+        let code = under_filter(|| {
+            let pid = unsafe { libc::syscall(libc::SYS_getpid) };
+            unsafe { libc::_exit(if pid > 0 { 0 } else { 1 }) };
+        });
+        assert_eq!(code, 0, "a native, undenied syscall must still run");
     }
 }

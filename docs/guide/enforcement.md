@@ -59,6 +59,15 @@ filesystem those would otherwise plant a directory of files in any host
 directory the target may read. `FICLONE` shares the same type byte, so a
 reflink copy is refused with it and falls back to a full copy.
 
+A syscall number only means something for the architecture it was made on, and
+the filter is written for the native one. A denied syscall reached through a
+foreign ABI arrives as a different number and would match no rule, so the
+filter first checks the architecture and refuses anything that is not native.
+On x86_64 that means the i386 `int 0x80` entry and the x32 ABI are both
+refused, since either would otherwise carry a denied syscall past the rules
+under a number they never named. A 32-bit program that relies on those entry
+points does not run here.
+
 ::: warning A denylist, not an allowlist
 This is a hardening layer. A complete allowlist would be stronger, and it is also
 the kind of thing that breaks a program six months later when a libc update starts
