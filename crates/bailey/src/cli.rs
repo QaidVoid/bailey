@@ -430,6 +430,11 @@ fn parse_egress_proxy(value: &str) -> anyhow::Result<(std::net::Ipv4Addr, u16)> 
     let port = port
         .parse::<u16>()
         .map_err(|_| anyhow::anyhow!("--egress-proxy port is not a port: {port:?}"))?;
+    // A Landlock rule on port 0 reads as any port, so a broker named that way
+    // would widen egress rather than bound it.
+    if port == 0 {
+        anyhow::bail!("--egress-proxy port 0 is not a port a broker listens on");
+    }
     Ok((addr, port))
 }
 
@@ -1695,7 +1700,9 @@ mod tests {
         );
         assert!(parse_egress_proxy("169.254.169.1").is_err()); // no port
         assert!(parse_egress_proxy("not-an-addr:443").is_err()); // not IPv4
-        assert!(parse_egress_proxy("169.254.169.1:0").is_ok()); // 0 is a valid u16
+        // A Landlock rule on port 0 reads as any port, so a broker named that
+        // way would widen egress instead of bounding it.
+        assert!(parse_egress_proxy("169.254.169.1:0").is_err());
         assert!(parse_egress_proxy("169.254.169.1:70000").is_err()); // out of range
     }
 

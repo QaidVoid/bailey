@@ -67,6 +67,29 @@ pub struct RunReport {
     pub skipped: Vec<(String, String)>,
 }
 
+/// Quote a value as a JSON string.
+///
+/// A path or an error message may hold a quote, a backslash or a control
+/// character, and pasting one between quotes produces something that is not
+/// JSON, or worse, JSON with a field nobody wrote.
+fn json_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 impl RunReport {
     fn applied(&mut self, layer: &str) {
         self.applied.push(layer.to_owned());
@@ -94,11 +117,17 @@ impl RunReport {
 
     /// Render the summary as JSON, for a caller that is not a person.
     pub fn to_json(&self, exit_code: i32) -> String {
-        let applied: Vec<String> = self.applied.iter().map(|l| format!("\"{l}\"")).collect();
+        let applied: Vec<String> = self.applied.iter().map(|l| json_string(l)).collect();
         let skipped: Vec<String> = self
             .skipped
             .iter()
-            .map(|(layer, reason)| format!("{{\"layer\":\"{layer}\",\"reason\":\"{reason}\"}}"))
+            .map(|(layer, reason)| {
+                format!(
+                    "{{\"layer\":{},\"reason\":{}}}",
+                    json_string(layer),
+                    json_string(reason)
+                )
+            })
             .collect();
         format!(
             "{{\"applied\":[{}],\"skipped\":[{}],\"exit_code\":{}}}",

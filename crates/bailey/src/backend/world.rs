@@ -389,7 +389,7 @@ fn short_digest(path: &Path) -> String {
     hasher
         .finalize()
         .iter()
-        .take(4)
+        .take(16)
         .map(|byte| format!("{byte:02x}"))
         .collect()
 }
