@@ -49,13 +49,27 @@ impl NetworkMode {
 /// a namespace with no route cannot serve a policy that allows egress or binds a
 /// port, so those fall back to Landlock's port rules.
 pub fn select(policy: &Policy, userns_available: bool) -> NetworkMode {
-    let needs_no_network =
-        matches!(policy.network.egress, Egress::DenyAll) && policy.network.bind_ports.is_empty();
+    // A policy that denies egress keeps the private namespace whether or not it
+    // binds a port. The namespace has loopback up, so a bound port is reachable
+    // from inside the sandbox, which is what a policy that refuses every
+    // outbound connection can coherently have meant. Falling back to the host's
+    // namespace to publish the port would hand the run UDP, QUIC, DNS and ICMP
+    // as well, none of which Landlock gates: the port would be served at the
+    // cost of everything else being unrestricted.
+    let needs_no_network = matches!(policy.network.egress, Egress::DenyAll);
     if needs_no_network && userns_available {
         NetworkMode::Isolated
     } else {
         NetworkMode::LandlockOnly
     }
+}
+
+/// Whether a bound port will only be reachable from inside the sandbox.
+///
+/// Worth saying out loud: the policy names a port, and in this mode nothing
+/// outside can connect to it.
+pub fn bind_is_loopback_only(policy: &Policy, mode: NetworkMode) -> bool {
+    mode == NetworkMode::Isolated && !policy.network.bind_ports.is_empty()
 }
 
 /// Report the confinement that is actually in force, when it is weaker than the
@@ -241,10 +255,28 @@ mod tests {
         assert_eq!(select(&policy, true), NetworkMode::LandlockOnly);
     }
 
+    /// Publishing a bound port used to cost the whole namespace, which handed
+    /// the run UDP, QUIC, DNS and ICMP as well: a policy that denied egress
+    /// could still send a UDP packet to the internet.
     #[test]
-    fn a_bound_port_stays_on_landlock() {
+    fn a_bound_port_keeps_the_private_namespace() {
         let policy = policy_with(NetworkPolicy {
             egress: Egress::DenyAll,
+            bind_ports: vec![27015],
+        });
+        assert_eq!(select(&policy, true), NetworkMode::Isolated);
+        assert!(bind_is_loopback_only(&policy, NetworkMode::Isolated));
+
+        // Without user namespaces there is no private namespace to keep.
+        assert_eq!(select(&policy, false), NetworkMode::LandlockOnly);
+        assert!(!bind_is_loopback_only(&policy, NetworkMode::LandlockOnly));
+    }
+
+    /// A policy that allows egress still needs the host's network.
+    #[test]
+    fn allowing_egress_still_uses_the_host_network() {
+        let policy = policy_with(NetworkPolicy {
+            egress: Egress::Allow(vec![]),
             bind_ports: vec![27015],
         });
         assert_eq!(select(&policy, true), NetworkMode::LandlockOnly);

@@ -140,7 +140,9 @@ is dropped, along with the protection.
 - **Host and CIDR rules in `egress_allow` are advisory.** Landlock matches on TCP
   port; the host field is not enforced, and bailey warns when you set one.
 - **UDP filtering.** There is no mode that allows some UDP and denies the rest.
-- **Ingress.** A sandbox in isolated mode has no address, so there is nothing to
-  reach it on. In landlock-only mode, `bind_ports` governs what it may listen on.
+- **Ingress.** A sandbox in isolated mode has no address, so nothing outside can
+  reach it; a port it binds is reachable from inside the sandbox and nowhere
+  else. In landlock-only mode, which is what allowing egress gives, `bind_ports`
+  governs what it may listen on and the port is reachable as usual.
 
 See [known limitations](/security/limitations) for the full list.

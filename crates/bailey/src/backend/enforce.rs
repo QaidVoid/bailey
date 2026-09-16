@@ -212,6 +212,12 @@ impl EnforceBackend {
         let inherited = network::Inherited::detect();
         let mode = network::select(policy, userns);
         network::report(mode, policy, inherited);
+        if network::bind_is_loopback_only(policy, mode) {
+            eprintln!(
+                "bailey: note: the bound ports are reachable only from inside the sandbox; \
+                 this policy denies egress, which keeps it in a network namespace of its own"
+            );
+        }
 
         let mut report = RunReport::default();
         report.applied("landlock");
@@ -257,7 +263,11 @@ impl EnforceBackend {
         }
 
         // Relocation only happens where a root is reconstructed to put it in.
-        let mut plan = LandlockPlan::from_policy(policy, self.isolate && userns);
+        let mut plan = LandlockPlan::build(
+            policy,
+            self.isolate && userns,
+            mode == NetworkMode::Isolated,
+        );
         plan.add_world_grants(&world);
 
         let isolation = if self.isolate {
@@ -491,7 +501,9 @@ impl LandlockPlan {
     /// which path a relocated grant is named by, and getting it wrong inverts
     /// the grant: with no root to pivot into, `at` names a host path the policy
     /// never granted, while the path it did grant goes unnamed.
-    fn from_policy(policy: &Policy, relocates: bool) -> Self {
+    /// `isolates_network` says whether the run gets a network namespace of its
+    /// own, which decides whether a bound port can be connected to.
+    fn build(policy: &Policy, relocates: bool, isolates_network: bool) -> Self {
         let mut filesystem = Vec::new();
         for rule in &policy.filesystem {
             if let Some(bits) = fs_access_bits(rule.access) {
@@ -514,11 +526,21 @@ impl LandlockPlan {
             }
         }
 
-        let (handle_connect, connect_ports) = match &policy.network.egress {
+        let (handle_connect, mut connect_ports) = match &policy.network.egress {
             Egress::AllowAll => (false, Vec::new()),
             Egress::DenyAll => (true, Vec::new()),
             Egress::Allow(rules) => (true, rules.iter().filter_map(|rule| rule.port).collect()),
         };
+        // A port the policy binds is one it means to be connected to. Denying
+        // egress denies every connect, including the one to the service this
+        // same policy just asked for, which leaves the port bound and useless.
+        // Inside a private namespace there is nowhere else such a connection
+        // could go, so permitting it widens nothing.
+        if isolates_network {
+            connect_ports.extend(policy.network.bind_ports.iter().copied());
+            connect_ports.sort_unstable();
+            connect_ports.dedup();
+        }
         let handle_bind = handle_connect || !policy.network.bind_ports.is_empty();
 
         Self {
@@ -1534,7 +1556,7 @@ mod tests {
             access: Access::READ | Access::WRITE,
         });
 
-        let plan = LandlockPlan::from_policy(&policy, true);
+        let plan = LandlockPlan::build(&policy, true, false);
         assert_eq!(plan.filesystem.len(), 2);
         // Default egress is DenyAll, so connect is handled with no allowed ports.
         assert!(plan.handle_connect);
@@ -1643,7 +1665,7 @@ mod tests {
         });
 
         // With a reconstructed root the grant is named where it lands.
-        let relocated = LandlockPlan::from_policy(&policy, true);
+        let relocated = LandlockPlan::build(&policy, true, false);
         assert!(
             relocated
                 .filesystem
@@ -1654,7 +1676,7 @@ mod tests {
         // Without one there is no such path, and naming `at` would grant a
         // host path the policy never mentioned while withholding the one it
         // did.
-        let plain = LandlockPlan::from_policy(&policy, false);
+        let plain = LandlockPlan::build(&policy, false, false);
         assert!(
             plain
                 .filesystem

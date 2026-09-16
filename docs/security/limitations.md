@@ -42,15 +42,19 @@ needs a policy of its own rather than a wider right.
 
 Where that matters, grant a narrower directory than the whole runtime directory.
 
-### Binding a port costs the network namespace
+### A bound port is reachable only from inside the sandbox
 
-The isolated network namespace is chosen only for a policy that denies egress
-and binds nothing. A policy that denies egress but binds a port keeps the host's
-network namespace, because a port bound inside a private one would not be
-reachable from the host, which is the point of binding it. Landlock then gates
-TCP ports and nothing else, so UDP, QUIC, DNS and ICMP are unrestricted for that
-run. The summary says `landlock only (TCP ports; other protocols unrestricted)`;
-what it does not say is that a `bind_ports` entry is what asked for it.
+A policy that denies egress keeps its own network namespace even when it binds a
+port. Loopback is up in there, so the service can be reached by anything else in
+the same sandbox, and the ports the policy binds are also the ports it may
+connect to, since a port bound and then not connectable is a port bound for
+nothing.
+
+Nothing outside can reach it. Publishing the port would mean using the host's
+network namespace, and that hands the run UDP, QUIC, DNS and ICMP as well, none
+of which Landlock gates: the port would be served at the cost of everything else
+being unrestricted. A policy that needs the port reachable from outside should
+allow egress, which keeps the host's namespace and says so in the run summary.
 
 ### Host and CIDR rules are advisory
 
