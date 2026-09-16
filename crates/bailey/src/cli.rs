@@ -373,6 +373,10 @@ fn cmd_doctor() -> anyhow::Result<i32> {
 
     println!("audit:");
     println!("  kernel BTF: {}", yes_no(caps.btf));
+    if !caps.btf {
+        degraded = true;
+        println!("    `bailey audit` needs it to load the eBPF programs");
+    }
     match &caps.helper {
         probe::HelperStatus::Ready(path) => {
             println!("  helper: ready ({})", path.display());
