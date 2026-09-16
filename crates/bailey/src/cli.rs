@@ -737,7 +737,49 @@ fn ipv6_global_present(if_inet6: &str) -> bool {
     })
 }
 
+/// Refuse to confine anything while running as root.
+///
+/// The user namespace maps the caller to itself, so as uid 0 the target is uid
+/// 0 on the host: its files are root-owned and ordinary permissions stop being
+/// a barrier, leaving Landlock as the only one. The model this is built on is
+/// an unprivileged caller, and a root run quietly produces something else.
+fn refuse_root() -> anyhow::Result<()> {
+    if unsafe { libc::geteuid() } != 0 {
+        return Ok(());
+    }
+    // Being uid 0 is not the same as being root. Inside a user namespace the
+    // caller is often mapped to 0 while owning nothing on the host: pasta does
+    // exactly that for the inner run. What matters is who 0 stands for
+    // outside, which the map says.
+    let map = std::fs::read_to_string("/proc/self/uid_map").unwrap_or_default();
+    if host_uid_of_root(&map) == Some(0) {
+        anyhow::bail!(
+            "bailey confines an unprivileged process and is running as real root; \
+             a target would be root on the host too. Run it as the user it is for"
+        );
+    }
+    Ok(())
+}
+
+/// Who uid 0 stands for outside this user namespace, read from a `uid_map`.
+///
+/// A line is `<inside> <outside> <count>`. The entry whose range covers 0 says
+/// what 0 really is; `None` when nothing does, which is not a root run either.
+fn host_uid_of_root(map: &str) -> Option<u32> {
+    for line in map.lines() {
+        let mut parts = line.split_whitespace();
+        let inside: u32 = parts.next()?.parse().ok()?;
+        let outside: u32 = parts.next()?.parse().ok()?;
+        let count: u32 = parts.next()?.parse().ok()?;
+        if inside == 0 && count >= 1 {
+            return Some(outside);
+        }
+    }
+    None
+}
+
 fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
+    refuse_root()?;
     let (program, program_args) = split_command(args.command.clone())?;
     let profile = select_profile(args.profile.as_deref(), &program)?;
     let mut resolved = resolve(&profile, &program, args.config.as_deref())?;
@@ -818,6 +860,7 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
 /// difference between a policy that applies to the commands someone remembered
 /// to prefix and one that applies to a directory.
 fn cmd_shell(args: ShellArgs) -> anyhow::Result<i32> {
+    refuse_root()?;
     let shell = resolve_shell(args.shell.as_deref())?;
     let dir = std::env::current_dir()?;
 
@@ -944,6 +987,7 @@ fn report_nesting() {
 }
 
 fn cmd_audit(args: AuditArgs) -> anyhow::Result<i32> {
+    refuse_root()?;
     let (program, program_args) = split_command(args.command)?;
     let profile = select_profile(args.profile.as_deref(), &program)?;
     let resolved = resolve(&profile, &program, args.config.as_deref())?;
@@ -1738,5 +1782,27 @@ mod netns_guard_tests {
         // The namespace this test runs in is not one it left.
         let mine = std::fs::read_link("/proc/self/ns/net").unwrap();
         assert!(!left_namespace(Some(&mine.to_string_lossy())));
+    }
+}
+
+#[cfg(test)]
+mod root_guard_tests {
+    use super::host_uid_of_root;
+
+    #[test]
+    fn a_mapped_root_is_not_real_root() {
+        // The initial namespace: 0 really is root.
+        assert_eq!(
+            host_uid_of_root("         0          0 4294967295\n"),
+            Some(0)
+        );
+        // What pasta gives the inner run: 0 stands for the caller.
+        assert_eq!(
+            host_uid_of_root("         0       1000          1\n"),
+            Some(1000)
+        );
+        // A map that does not cover 0 at all.
+        assert_eq!(host_uid_of_root("      1000       1000          1\n"), None);
+        assert_eq!(host_uid_of_root(""), None);
     }
 }

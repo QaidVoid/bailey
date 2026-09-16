@@ -362,6 +362,12 @@ impl EnforceBackend {
                 plan.apply()?;
                 seccompiler::apply_filter(&seccomp)
                     .map_err(|err| io::Error::other(format!("seccomp: {err}")))?;
+                // Last, so everything above still has what it needs. A target
+                // that keeps the capabilities of its user namespace can build
+                // another one through `clone`, which `unshare` was denied to
+                // prevent; without them it cannot, whatever syscall it reaches
+                // for.
+                drop_capabilities()?;
                 Ok(())
             });
         }
@@ -993,6 +999,55 @@ fn set_no_new_privs() -> io::Result<()> {
 ///
 /// Exceeding it raises SIGXFSZ, and a write past the limit fails with EFBIG
 /// for a process that handles or ignores the signal.
+/// Drop every capability, so the target cannot act on the namespace it is in.
+///
+/// The bounding set goes first, because a capability dropped from it cannot be
+/// regained by any later exec. The securebits then stop the kernel handing
+/// capabilities back across a `setuid` or an `execve`.
+fn drop_capabilities() -> io::Result<()> {
+    // SECBIT_NOROOT, SECBIT_NO_SETUID_FIXUP, SECBIT_NO_CAP_AMBIENT_RAISE and
+    // the lock bit of each, so none of it can be undone.
+    const SECUREBITS: libc::c_ulong = 0b1100_1111;
+    const CAP_LAST: libc::c_ulong = 40;
+    const PR_CAP_AMBIENT_CLEAR_ALL: libc::c_ulong = 4;
+    const CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+
+    unsafe {
+        libc::prctl(libc::PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
+        // Beyond the last capability this kernel knows, the call simply fails,
+        // which is the signal to stop rather than an error to report.
+        for cap in 0..=CAP_LAST {
+            if libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) != 0 {
+                break;
+            }
+        }
+        libc::prctl(libc::PR_SET_SECUREBITS, SECUREBITS, 0, 0, 0);
+    }
+
+    #[repr(C)]
+    struct CapHeader {
+        version: u32,
+        pid: i32,
+    }
+    #[repr(C)]
+    #[derive(Default, Clone, Copy)]
+    struct CapData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+
+    let header = CapHeader {
+        version: CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let data = [CapData::default(); 2];
+    if unsafe { libc::syscall(libc::SYS_capset, &header, data.as_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Pin `RLIMIT_CORE` to zero, hard as well as soft.
 fn set_no_core_dumps() -> io::Result<()> {
     let limit = libc::rlimit {
