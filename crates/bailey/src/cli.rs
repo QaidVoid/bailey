@@ -536,7 +536,8 @@ fn drop_host_loopback() -> anyhow::Result<()> {
 /// Feeds a ruleset to `nft -f -`, returning an error with nft's own message.
 fn run_nft(ruleset: &str) -> anyhow::Result<()> {
     use std::io::Write;
-    let mut child = std::process::Command::new("nft")
+    let nft = resolve_helper("nft")?;
+    let mut child = std::process::Command::new(&nft)
         .arg("-f")
         .arg("-")
         .stdin(std::process::Stdio::piped())
@@ -635,7 +636,7 @@ fn wrap_in_private_namespace(
     // point of the proxy is that egress is bounded, and continuing without the
     // namespace would leave it open while the caller believed it closed.
     let strict = args.egress_proxy.is_some();
-    let pasta = match resolve_target("pasta") {
+    let pasta = match resolve_helper("pasta") {
         Ok(path) => path,
         Err(_) if strict => {
             anyhow::bail!("--egress-proxy needs pasta, which is not on PATH; the run is refused")
@@ -1307,6 +1308,68 @@ fn split_command(mut command: Vec<String>) -> anyhow::Result<(PathBuf, Vec<Strin
 /// `bailey run curl` means what it appears to. A name that resolves to nothing
 /// is an error: silently building a policy for a file that does not exist tells
 /// the user about a sandbox they are not going to get.
+/// The id an unmapped owner reads as inside a user namespace.
+fn overflow_uid() -> u32 {
+    std::fs::read_to_string("/proc/sys/kernel/overflowuid")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(65534)
+}
+
+/// Directories a helper bailey runs itself may come from.
+///
+/// Fixed rather than taken from `PATH`: these programs run outside the sandbox
+/// with the caller's authority, so a writable directory on the caller's `PATH`
+/// would be host code execution on the next proxied run.
+const HELPER_DIRS: [&str; 6] = [
+    "/usr/sbin",
+    "/usr/bin",
+    "/sbin",
+    "/bin",
+    "/usr/local/sbin",
+    "/usr/local/bin",
+];
+
+/// Find a helper program in a trusted location, refusing one anyone else can
+/// write.
+///
+/// A file owned by root or by the caller, with no group or other write bit, is
+/// one only the system or the caller could have put there. Anything else is
+/// refused by name rather than run.
+pub fn resolve_helper(name: &str) -> anyhow::Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let caller = unsafe { libc::geteuid() };
+    let mut rejected = Vec::new();
+    for dir in HELPER_DIRS {
+        let candidate = Path::new(dir).join(name);
+        let Ok(meta) = std::fs::metadata(&candidate) else {
+            continue;
+        };
+        if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 {
+            continue;
+        }
+        // Inside a user namespace a file owned by host root has no id here and
+        // reads as the overflow uid. An owner this namespace cannot name is
+        // one nothing in it could have written, which is the property that
+        // matters.
+        let owner_ok = meta.uid() == 0 || meta.uid() == caller || meta.uid() == overflow_uid();
+        let writable_by_others = meta.permissions().mode() & 0o022 != 0;
+        if owner_ok && !writable_by_others {
+            return Ok(candidate);
+        }
+        rejected.push(candidate.display().to_string());
+    }
+    if rejected.is_empty() {
+        anyhow::bail!("`{name}` was not found in a trusted location");
+    }
+    anyhow::bail!(
+        "`{name}` was found at {} but is writable by someone other than its owner; refusing to run it",
+        rejected.join(", ")
+    )
+}
+
 fn resolve_target(name: &str) -> anyhow::Result<PathBuf> {
     if name.contains('/') {
         let path = PathBuf::from(name);
@@ -1804,5 +1867,26 @@ mod root_guard_tests {
         // A map that does not cover 0 at all.
         assert_eq!(host_uid_of_root("      1000       1000          1\n"), None);
         assert_eq!(host_uid_of_root(""), None);
+    }
+}
+
+#[cfg(test)]
+mod helper_resolution_tests {
+    use super::{HELPER_DIRS, resolve_helper};
+
+    #[test]
+    fn a_helper_is_never_taken_from_path() {
+        // Whatever PATH says, only the fixed directories are searched, so a
+        // writable entry on it cannot supply a program bailey runs itself.
+        assert!(!HELPER_DIRS.iter().any(|dir| dir.starts_with("/tmp")));
+        let missing = resolve_helper("bailey-no-such-helper-xyz");
+        assert!(missing.is_err());
+    }
+
+    #[test]
+    fn a_real_system_helper_still_resolves() {
+        // `sh` is in a system directory on any host this runs on.
+        let found = resolve_helper("sh").expect("sh should resolve");
+        assert!(HELPER_DIRS.iter().any(|dir| found.starts_with(dir)));
     }
 }
