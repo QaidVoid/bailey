@@ -6,8 +6,10 @@
 //! the enforcement `pre_exec`, before Landlock and seccomp are applied, and is
 //! fully unprivileged via the user namespace.
 
+use std::ffi::CString;
 use std::fs;
 use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
 use nix::mount::{MntFlags, MsFlags, mount, umount2};
@@ -336,10 +338,13 @@ fn mount_tmpfs(target: &Path, size_bytes: u64, mode: &str) -> io::Result<()> {
 fn remount_read_only(new_root: &Path, paths: &[PathBuf]) -> io::Result<()> {
     for path in paths {
         let relative = path.strip_prefix("/").unwrap_or(path);
-        let target = new_root.join(relative);
-        if !target.exists() {
+        // Checked for a planted link, then mounted by its real path: a
+        // `/proc/self/fd` name cannot be remounted, because the bind below
+        // creates a mount the descriptor does not refer to.
+        if resolve_beneath(new_root, relative)?.is_none() {
             continue;
         }
+        let target = new_root.join(relative);
         mount(
             Some(&target),
             &target,
@@ -376,10 +381,9 @@ fn conceal_all(new_root: &Path, conceal: &[Conceal]) -> io::Result<()> {
 
     for item in conceal {
         let relative = item.path.strip_prefix("/").unwrap_or(&item.path);
-        let target = new_root.join(relative);
-        if !target.exists() {
+        let Some((target, _held)) = resolve_beneath(new_root, relative)? else {
             continue;
-        }
+        };
         if item.is_dir {
             mount(
                 Some("tmpfs"),
@@ -415,19 +419,148 @@ fn conceal_all(new_root: &Path, conceal: &[Conceal]) -> io::Result<()> {
     Ok(())
 }
 
+/// Resolve an existing path beneath `root` without following a symlink.
+///
+/// The companion to [`make_beneath`] for steps that mount over something that
+/// is already there. A planted link would otherwise move the concealment or
+/// the read-only cover somewhere other than the path it was written for,
+/// leaving the one it names uncovered.
+///
+/// @returns `None` when the path is simply not there, which is not an error:
+/// a policy may name something this run did not bind.
+fn resolve_beneath(root: &Path, relative: &Path) -> io::Result<Option<(PathBuf, OwnedFd)>> {
+    let root_c = CString::new(root.as_os_str().as_encoded_bytes())
+        .map_err(|_| io::Error::other("the sandbox root holds a nul"))?;
+    let fd = unsafe {
+        libc::open(
+            root_c.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut dir = unsafe { OwnedFd::from_raw_fd(fd) };
+
+    let components: Vec<_> = relative.components().collect();
+    for (index, component) in components.iter().enumerate() {
+        let std::path::Component::Normal(name) = component else {
+            return Ok(None);
+        };
+        let Ok(name) = CString::new(name.as_encoded_bytes()) else {
+            return Ok(None);
+        };
+        let last = index + 1 == components.len();
+        let flags = if last {
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC
+        } else {
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC
+        };
+        let opened = unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags) };
+        if opened < 0 {
+            let error = io::Error::last_os_error();
+            return match error.kind() {
+                io::ErrorKind::NotFound => Ok(None),
+                _ => Err(error),
+            };
+        }
+        dir = unsafe { OwnedFd::from_raw_fd(opened) };
+    }
+
+    let path = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
+    Ok(Some((path, dir)))
+}
+
+/// Create a path beneath `root` without following a symlink on the way.
+///
+/// The private home is a directory the target writes and bailey reuses on the
+/// next run, and graft points are created inside it while the sandbox is being
+/// built: as the invoking user, before any policy applies. A link left there
+/// would otherwise be followed, and `create_dir_all` would make directories at
+/// its destination somewhere else on the host entirely.
+///
+/// Each component is opened with `O_NOFOLLOW`, so a link is an error rather
+/// than a redirect. The descriptor is returned with the path, because
+/// `/proc/self/fd` only names it while it is open, and it names what was
+/// opened rather than walking the components again.
+fn make_beneath(root: &Path, relative: &Path, is_dir: bool) -> io::Result<(PathBuf, OwnedFd)> {
+    fn name_of(component: std::path::Component<'_>) -> io::Result<CString> {
+        match component {
+            std::path::Component::Normal(name) => CString::new(name.as_encoded_bytes())
+                .map_err(|_| io::Error::other("a graft point name holds a nul")),
+            _ => Err(io::Error::other("a graft point must be a plain path")),
+        }
+    }
+
+    fn owned(fd: libc::c_int) -> io::Result<OwnedFd> {
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+
+    let root_c = CString::new(root.as_os_str().as_encoded_bytes())
+        .map_err(|_| io::Error::other("the sandbox root holds a nul"))?;
+    let mut dir = owned(unsafe {
+        libc::open(
+            root_c.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    })?;
+
+    let components: Vec<_> = relative.components().collect();
+    for (index, component) in components.iter().enumerate() {
+        let name = name_of(*component)?;
+        let last = index + 1 == components.len();
+
+        if last && !is_dir {
+            // A bind mount needs a mountpoint of a matching kind. `O_NOFOLLOW`
+            // refuses an existing link rather than truncating what it points at.
+            let made = owned(unsafe {
+                libc::openat(
+                    dir.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_CREAT | libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    0o644,
+                )
+            })?;
+            let path = PathBuf::from(format!("/proc/self/fd/{}", made.as_raw_fd()));
+            return Ok((path, made));
+        }
+
+        if unsafe { libc::mkdirat(dir.as_raw_fd(), name.as_ptr(), 0o755) } != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::AlreadyExists {
+                return Err(error);
+            }
+        }
+        // A link where a directory was expected is the planted-link case rather
+        // than a policy that names something odd, and only an errno crosses
+        // back to the parent, so it is named here.
+        dir = owned(unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        })
+        .inspect_err(|error| {
+            eprintln!(
+                "bailey: refusing to build {} through {:?}: {error}",
+                relative.display(),
+                name
+            );
+        })?;
+    }
+
+    let path = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
+    Ok((path, dir))
+}
+
 fn bind_into(new_root: &Path, bind: &BindMount) -> io::Result<()> {
     let relative = bind.at.strip_prefix("/").unwrap_or(&bind.at);
-    let target = new_root.join(relative);
-
-    if bind.is_dir {
-        fs::create_dir_all(&target)?;
-    } else {
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        // A bind mount needs an existing mountpoint of a matching kind.
-        let _ = fs::File::create(&target);
-    }
+    // Held until the mount is done: the path names the descriptor.
+    let (target, _held) = make_beneath(new_root, relative, bind.is_dir)?;
 
     mount(
         Some(&bind.source),
