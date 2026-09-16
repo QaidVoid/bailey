@@ -1,6 +1,29 @@
 # Changelog
 
-## [0.1.5](https://github.com/QaidVoid/bailey/compare/v0.1.4...v0.1.5) - 2026-09-16
+## [0.2.0](https://github.com/QaidVoid/bailey/compare/v0.1.4...v0.2.0) - 2026-09-16
+
+This release closes 20 findings from a security review. Four of them change
+behaviour, so a policy or a host that worked before may not now.
+
+### ⚠️ Behaviour changes
+
+- **bailey refuses to run as real root.** The user namespace maps the caller to
+  itself, so as uid 0 the target was uid 0 on the host and ordinary permissions
+  stopped being a barrier. Being uid 0 inside a user namespace is still fine,
+  which is what an inner run under pasta is.
+- **Helper programs come only from system directories.** `pasta` and `nft` are
+  resolved from a fixed list and refused if writable by anyone but their owner,
+  never from `PATH`. A writable `PATH` entry was host code execution as the
+  caller on the next proxied run.
+- **A bound port is no longer published to the host.** A policy that denies
+  egress keeps its own network namespace even when it binds a port, and the
+  port is reachable from inside the sandbox and nowhere else. Publishing it cost
+  the whole namespace, which left UDP, QUIC, DNS and ICMP unrestricted. Allow
+  egress if the port must be reachable from outside.
+- **A grant that cannot be installed fails the run.** Only a path that does not
+  exist is skipped. One that exists but cannot be opened used to be dropped
+  while the run still reported Landlock as applied.
+
 
 ### 🐛 Bug Fixes
 
