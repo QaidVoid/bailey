@@ -285,16 +285,28 @@ impl Store {
 
 /// Where the trust store lives.
 pub fn store_path() -> Option<PathBuf> {
+    // Inside a sandbox, `HOME` is the private home: a directory the target is
+    // granted read-write and that persists between runs. A store read from
+    // there is one the target could have written, naming a config it also
+    // wrote, so a nested run would apply a policy nobody ever accepted. There
+    // is no store to read in here.
+    if crate::backend::world::inside_sandbox() {
+        return None;
+    }
     if let Some(dir) = std::env::var_os("XDG_DATA_HOME")
         && !dir.is_empty()
     {
-        return Some(Path::new(&dir).join("bailey").join(STORE_NAME));
+        // A relative value would resolve against the working directory, which
+        // is where a project, and anything it contains, lives.
+        let dir = Path::new(&dir);
+        if dir.is_absolute() {
+            return Some(dir.join("bailey").join(STORE_NAME));
+        }
     }
-    std::env::var_os("HOME").map(|home| {
-        Path::new(&home)
-            .join(".local/share/bailey")
-            .join(STORE_NAME)
-    })
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute())
+        .map(|home| home.join(".local/share/bailey").join(STORE_NAME))
 }
 
 /// Whether `path` can be changed by someone other than the running user.

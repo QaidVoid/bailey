@@ -105,8 +105,11 @@ pub struct Layer {
 
 /// The directory user-written profiles live in.
 pub fn user_dir() -> Option<PathBuf> {
+    // A relative value resolves against the working directory, so a project
+    // could supply the profiles a run is built from.
     if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME")
         && !dir.is_empty()
+        && Path::new(&dir).is_absolute()
     {
         return Some(Path::new(&dir).join("bailey").join("profiles"));
     }
