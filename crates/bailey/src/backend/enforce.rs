@@ -1052,6 +1052,15 @@ fn denied_syscalls() -> &'static [i64] {
 /// copy); `0xbc` is bcachefs.
 const SUBVOL_IOCTL_TYPES: [u64; 2] = [0x94, 0xbc];
 
+/// Terminal requests that put bytes into the input queue of a shared tty.
+///
+/// `TIOCSTI` pushes a byte as though it had been typed, so a target that can
+/// reach the caller's terminal can run a command in the caller's shell after
+/// the sandbox exits. `TIOCLINUX` reaches the console selection buffer the same
+/// way. Current kernels gate `TIOCSTI` behind a capability and a sysctl, and
+/// the older ones this still supports do not.
+const TERMINAL_INJECTION_IOCTLS: [u64; 2] = [0x5412, 0x541c];
+
 fn build_seccomp_filter() -> anyhow::Result<seccompiler::BpfProgram> {
     use seccompiler::{
         SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter, SeccompRule,
@@ -1067,7 +1076,7 @@ fn build_seccomp_filter() -> anyhow::Result<seccompiler::BpfProgram> {
     // subvolume families are refused, each matched on the type byte of the
     // request. The rules are alternatives: an ioctl of either type is denied,
     // every other is left to the kernel.
-    let ioctl_rules = SUBVOL_IOCTL_TYPES
+    let mut ioctl_rules = SUBVOL_IOCTL_TYPES
         .iter()
         .map(|&ty| {
             Ok(SeccompRule::new(vec![SeccompCondition::new(
@@ -1078,6 +1087,17 @@ fn build_seccomp_filter() -> anyhow::Result<seccompiler::BpfProgram> {
             )?])?)
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
+    // The terminal is shared with the caller's shell, and these two write to
+    // it as though the user had typed. Whole request numbers rather than a
+    // family, so only these are refused.
+    for request in TERMINAL_INJECTION_IOCTLS {
+        ioctl_rules.push(SeccompRule::new(vec![SeccompCondition::new(
+            1,
+            SeccompCmpArgLen::Dword,
+            SeccompCmpOp::Eq,
+            request,
+        )?])?);
+    }
     rules.insert(libc::SYS_ioctl, ioctl_rules);
 
     let filter = SeccompFilter::new(
@@ -1403,6 +1423,14 @@ mod tests {
             exited,
             "subvolume ioctls were not denied, or a benign ioctl was"
         );
+    }
+
+    #[test]
+    fn terminal_injection_requests_are_named_whole() {
+        // A family mask would take ordinary terminal requests with it, so
+        // these two are matched as whole numbers.
+        assert_eq!(TERMINAL_INJECTION_IOCTLS, [0x5412, 0x541c]);
+        assert!(!TERMINAL_INJECTION_IOCTLS.contains(&0x5401));
     }
 
     #[test]
