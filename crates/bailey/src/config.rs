@@ -437,10 +437,6 @@ fn apply_layer(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> 
             *granted.entry(path).or_insert(Access::empty()) |= access;
         }
     }
-    for (at, source) in relocated {
-        acc.relocated.insert(source, at);
-    }
-
     for raw in &fs.deny {
         let Some(path) = resolve_path(raw, &layer.base) else {
             continue;
@@ -462,6 +458,12 @@ fn apply_layer(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> 
         // policy is finalized, so one left behind would place a later plain
         // grant at an `at` the resetting layer never mentions.
         acc.relocated.clear();
+    }
+    // After the reset, with this layer's grants: a layer that resets and
+    // relocates in one breath means to keep its own placement, and clearing
+    // after inserting would drop the relocation it just declared.
+    for (at, source) in relocated {
+        acc.relocated.insert(source, at);
     }
     for (path, access) in granted {
         // A grant in this layer overrides a denial from a lower one.
@@ -917,6 +919,29 @@ mod tests {
         let resolved = merge(&layers).unwrap();
         assert!(resolved.policy.denied.is_empty());
         assert_eq!(resolved.policy.filesystem[0].path, PathBuf::from("/a"));
+    }
+
+    /// A layer that resets and relocates in one breath keeps its own
+    /// placement. Clearing after inserting dropped it, which left a relocated
+    /// grant applied at its host path: the target then had no `/workspace` and
+    /// no `/state` at all.
+    #[test]
+    fn a_reset_keeps_the_resetting_layer_s_own_relocation() {
+        let layers = [
+            layer("/base", "[filesystem]\nwrite = [\"/lower\"]"),
+            layer(
+                "/base",
+                "[filesystem]\nreset = true\nwrite = [{ path = \"/a\", at = \"/workspace\" }]",
+            ),
+        ];
+        let resolved = merge(&layers).unwrap();
+        let rule = resolved
+            .policy
+            .filesystem
+            .iter()
+            .find(|rule| rule.path == Path::new("/a"))
+            .expect("the relocated grant survives its own reset");
+        assert_eq!(rule.at, Some(PathBuf::from("/workspace")));
     }
 
     #[test]
