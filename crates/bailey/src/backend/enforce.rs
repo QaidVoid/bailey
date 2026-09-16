@@ -705,6 +705,9 @@ fn build_isolation_plan(
 
     let mut read_only = policy.read_only.clone();
     read_only.extend(unwritable_beneath_implicit(policy, world, implicit_write));
+    read_only.extend(metadata_read_only(policy));
+    read_only.sort();
+    read_only.dedup();
 
     IsolationPlan {
         binds,
@@ -769,10 +772,34 @@ fn unwritable_beneath_implicit(
         .collect()
 }
 
+/// Read-only grants that no writable grant overlaps, so the path is read-only
+/// in effect and can be mounted read-only.
+///
+/// Landlock does not mediate chmod, chown, utimes or xattr, so without the
+/// mount those still succeed on a path the policy only grants read. A grant a
+/// writable grant overlaps in either direction is left alone: a writable
+/// ancestor keeps the path writable, which is the documented merge rule, and a
+/// writable descendant would be broken by remounting its parent.
+fn metadata_read_only(policy: &Policy) -> Vec<PathBuf> {
+    policy
+        .filesystem
+        .iter()
+        .filter(|rule| !rule.access.contains(policy::Access::WRITE))
+        .filter(|rule| {
+            !policy.filesystem.iter().any(|other| {
+                other.access.contains(policy::Access::WRITE)
+                    && (rule.path.starts_with(other.path.as_path())
+                        || other.path.starts_with(rule.path.as_path()))
+            })
+        })
+        .map(|rule| rule.visible().clone())
+        .collect()
+}
+
 fn fs_access_bits(access: policy::Access) -> Option<BitFlags<AccessFs>> {
     let mut bits = BitFlags::<AccessFs>::empty();
     if access.contains(policy::Access::READ) {
-        bits |= AccessFs::from_read(TARGET_ABI);
+        bits |= AccessFs::ReadFile | AccessFs::ReadDir;
     }
     if access.contains(policy::Access::WRITE) {
         bits |= AccessFs::from_write(TARGET_ABI);
@@ -1138,14 +1165,62 @@ mod tests {
     use crate::policy::{Access, DeviceRule, FsRule};
 
     #[test]
-    fn read_grant_maps_to_read_and_execute_bits() {
+    fn read_grants_read_without_execute() {
         let read = fs_access_bits(Access::READ).unwrap();
-        assert!(read.contains(AccessFs::from_read(TARGET_ABI)));
+        assert!(read.contains(AccessFs::ReadFile));
+        assert!(read.contains(AccessFs::ReadDir));
+        assert!(!read.contains(AccessFs::Execute));
 
         let exec = fs_access_bits(Access::EXECUTE).unwrap();
         assert!(exec.contains(AccessFs::Execute));
+        assert!(!exec.contains(AccessFs::ReadFile));
 
         assert!(fs_access_bits(Access::empty()).is_none());
+    }
+
+    #[test]
+    fn read_only_grants_with_no_writable_overlap_are_remounted() {
+        let mut policy = Policy::default();
+        policy.filesystem.push(FsRule {
+            path: PathBuf::from("/data"),
+            access: Access::READ,
+            at: None,
+        });
+        assert_eq!(metadata_read_only(&policy), vec![PathBuf::from("/data")]);
+
+        policy.filesystem.push(FsRule {
+            path: PathBuf::from("/data/logs"),
+            access: Access::WRITE,
+            at: None,
+        });
+        assert!(metadata_read_only(&policy).is_empty());
+    }
+
+    #[test]
+    fn a_relocated_read_only_grant_is_remounted_where_it_lands() {
+        let mut policy = Policy::default();
+        policy.filesystem.push(FsRule {
+            path: PathBuf::from("/host/project"),
+            access: Access::READ,
+            at: Some(PathBuf::from("/workspace")),
+        });
+        assert_eq!(
+            metadata_read_only(&policy),
+            vec![PathBuf::from("/workspace")]
+        );
+    }
+
+    #[test]
+    fn the_isolation_plan_remounts_a_read_only_grant() {
+        let mut policy = Policy::default();
+        policy.filesystem.push(FsRule {
+            path: PathBuf::from("/data"),
+            access: Access::READ,
+            at: None,
+        });
+        let world = World::derive(Path::new("/bin/true"), &policy, true);
+        let plan = build_isolation_plan(&policy, NetworkMode::Isolated, &world, &[]);
+        assert!(plan.read_only.contains(&PathBuf::from("/data")));
     }
 
     #[test]
