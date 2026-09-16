@@ -87,6 +87,39 @@ of one file inside it exposes the metadata of everything else in it.
 
 ## Environment
 
+### A deny does not cover another name for the same file
+
+`deny` takes a path out of the granted set and, where the denied path sits under
+a granted one, covers it in the mount namespace. Both work on paths, while the
+mechanisms underneath do not: Landlock rules apply to inodes reached by walking
+from a granted directory, and a mount covers one location rather than an inode.
+
+So a hard link to a denied file, made anywhere under a granted directory before
+the run, is still readable, and so is a bind mount of a denied directory placed
+under a granted path. Neither needs the target to do anything; the aliases exist
+already. A target cannot create such a link to a file it could not already read,
+so this limits what `deny` means rather than opening a way in.
+
+Where a file must be withheld and may have other names, do not grant the
+directory that holds them.
+
+### Watches follow whatever is visible
+
+`inotify_add_watch` is not an access Landlock understands, and the filter does
+not deny it. Anything the target can reach by path can be watched: under
+isolation that is what the policy put in the reconstructed root, and without it
+every path the user can traverse. A watch reports names, sizes and timing rather
+than contents, and is an aid to winning a race. `fanotify` needs a capability in
+the initial namespace and is out of reach.
+
+### Hooks run before the sandbox, as the caller
+
+`pre-launch` and `post-exit` hooks run with `sh -c` in the bailey process,
+before any layer of confinement is built, with the caller's environment. A
+trusted config is therefore more than a policy: it is also the commands it
+names, run unconfined as the user. Trusting a config that sets hooks is
+trusting whoever can write it to run programs as you.
+
 ### A passed variable is passed in full
 
 The environment is deny-by-default, but `pass` forwards a variable verbatim. If

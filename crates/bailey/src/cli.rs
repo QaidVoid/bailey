@@ -1104,6 +1104,40 @@ fn cmd_profile(args: ProfileArgs) -> anyhow::Result<i32> {
 /// Acceptance is a command rather than a prompt during a run. A question asked
 /// while someone is trying to get on with something else is answered
 /// reflexively, and a run has to work where nobody is present to answer at all.
+/// Print the commands a config would run outside the sandbox, if it has any.
+fn report_hooks(path: &Path) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(raw) = toml::from_str::<toml::Value>(&text) else {
+        return;
+    };
+    let Some(hooks) = raw.get("hooks").and_then(|hooks| hooks.as_table()) else {
+        return;
+    };
+    let mut named = Vec::new();
+    for when in ["pre-launch", "post-exit"] {
+        match hooks.get(when) {
+            Some(toml::Value::String(one)) => named.push((when, one.clone())),
+            Some(toml::Value::Array(many)) => {
+                for entry in many {
+                    if let Some(one) = entry.as_str() {
+                        named.push((when, one.to_string()));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if named.is_empty() {
+        return;
+    }
+    println!("this config runs commands outside the sandbox, as you:");
+    for (when, command) in named {
+        println!("  {when}: {command}");
+    }
+}
+
 fn cmd_trust(args: TrustArgs) -> anyhow::Result<i32> {
     let mut store = trust::Store::load();
 
@@ -1127,6 +1161,10 @@ fn cmd_trust(args: TrustArgs) -> anyhow::Result<i32> {
         .expect("clap requires a path unless --list is given");
     // `record` refuses when the store is unreachable, which is what keeps a
     // trust command run from inside a sandbox from looking like it worked.
+    // A config is not only a policy: its hooks are commands that run as the
+    // caller, unconfined, before the sandbox exists. Trusting the file is
+    // trusting those too, so they are named rather than left to be discovered.
+    report_hooks(&path);
     let recorded = store.record(&path).map_err(|err| anyhow::anyhow!(err))?;
     store.save().map_err(|err| anyhow::anyhow!(err))?;
     println!("trusted {}", recorded.display());
