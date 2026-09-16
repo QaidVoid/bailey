@@ -1,5 +1,57 @@
 # Changelog
 
+## [0.2.0](https://github.com/QaidVoid/bailey/compare/v0.1.4...v0.2.0) - 2026-09-16
+
+### ⚠️ Behaviour changes
+
+- **A read grant no longer carries execute.** The two are separate rights now.
+  A policy that granted `read` on a directory and relied on running something
+  from it must grant `execute` there as well, or the `execve` is refused.
+- **bailey refuses to run as real root.** As uid 0 the target was uid 0 on the
+  host and ordinary permissions stopped being a barrier. Being uid 0 inside a
+  user namespace is still fine, which is what a run under pasta is.
+- **Helper programs come only from system directories.** `pasta` and `nft` are
+  resolved from a fixed list and refused if writable by anyone but their owner,
+  never from `PATH`.
+- **A bound port is no longer published to the host.** A policy that denies
+  egress keeps its own network namespace even when it binds a port, so the port
+  is reachable from inside the sandbox and nowhere else. Allow egress if it must
+  be reachable from outside.
+- **A grant that cannot be installed fails the run.** Only a path that does not
+  exist is skipped; one that exists but cannot be opened used to be dropped
+  while the run still reported Landlock as applied.
+
+
+### 🐛 Bug Fixes
+
+- *(cli)* Create the egress namespace before pasta configures it - ([aff5641](https://github.com/QaidVoid/bailey/commit/aff5641a5807924e1b8442b5ba61c2cb165bcf3f))
+- *(cli)* Take helper programs only from trusted locations - ([0981949](https://github.com/QaidVoid/bailey/commit/0981949f8462191e21f84ec99d3654f67841708a))
+- *(config)* Keep the relocation of the layer that resets - ([d974f0a](https://github.com/QaidVoid/bailey/commit/d974f0a24189d3b23127c41112732a27b17beca0))
+- *(config)* Clear relocations when filesystem resets - ([4788184](https://github.com/QaidVoid/bailey/commit/47881840ec57ec037ba300ae385930f6c81ad07f))
+- *(config)* Refuse a negative or unrepresentable size - ([6efcef7](https://github.com/QaidVoid/bailey/commit/6efcef7e1ab12611e881f1da4538b85c31cb25b8))
+- *(enforce)* Say when a read grant is widened to write - ([9b10dd9](https://github.com/QaidVoid/bailey/commit/9b10dd93fa6e32096234415714ccf93fff1dcb7c))
+- *(enforce)* Honour a deny written where the target sees it - ([6bc2f73](https://github.com/QaidVoid/bailey/commit/6bc2f736ddadd6356834b54125f3dff5ca4970ae))
+- *(enforce)* Name a relocated grant by what will exist - ([53b9557](https://github.com/QaidVoid/bailey/commit/53b9557d6f591d40fc9027a618601d2bdb6e577d))
+- *(enforce)* Pin core dumps off and close same-uid reach - ([f018bd0](https://github.com/QaidVoid/bailey/commit/f018bd05b6f5c054333a3e1fdcfc4b89bdba0bf3))
+- *(enforce)* Refuse a grant that cannot be installed - ([708c47f](https://github.com/QaidVoid/bailey/commit/708c47f90536c2d4f9d680b08bbcc543e277694a))
+- *(isolation)* Build graft points without following a symlink - ([a80bb73](https://github.com/QaidVoid/bailey/commit/a80bb736342edb232e5d5a1a85a4c6b39c7e83af))
+- *(isolation)* Give the sandbox its own IPC namespace - ([b7430c8](https://github.com/QaidVoid/bailey/commit/b7430c8380ffcf599ae2b19d2e5af85e68a40ad4))
+- *(network)* Keep the private namespace when a port is bound - ([6b1c478](https://github.com/QaidVoid/bailey/commit/6b1c47871a960200bc06a493e99da996329f3f7d))
+- *(privilege)* Refuse to run as root and drop capabilities - ([cb9fbab](https://github.com/QaidVoid/bailey/commit/cb9fbab84b8cf0f1ed2a0f1f64f84f2a7863cb78))
+- *(seccomp)* Deny terminal input injection - ([bb68575](https://github.com/QaidVoid/bailey/commit/bb68575b8cb4f66baa0fdb9cd2861fffd4e7173c))
+- *(seccomp)* Deny descriptor passing and io_uring - ([458a426](https://github.com/QaidVoid/bailey/commit/458a426c5a32e80180949c6aad65776d8fc79765))
+- *(state)* Keep the private home and trust store to the owner - ([b7254ee](https://github.com/QaidVoid/bailey/commit/b7254ee0530b8130098453ca93d104a81997d23c))
+- *(trust)* Weigh the directories a config sits in - ([66573be](https://github.com/QaidVoid/bailey/commit/66573be74d6e9925df84e700950f5b28f85c8b6e))
+- *(trust)* Never read the store from inside a sandbox - ([ab377dd](https://github.com/QaidVoid/bailey/commit/ab377ddfba394dd3d31a2a909b9253fe8d05b477))
+- Stop a stale cgroup, an unaligned read, and a name - ([6c80b50](https://github.com/QaidVoid/bailey/commit/6c80b50875fbc7be8fe04abec39bc181f8be98a3))
+- Refuse a port of 0, escape the report, widen the digest - ([858174c](https://github.com/QaidVoid/bailey/commit/858174c316b5c0e385061b16dbfcc7d9d4066473))
+- Stop grants and egress reaching past the policy ([#15](https://github.com/QaidVoid/bailey/pull/15)) - ([e260672](https://github.com/QaidVoid/bailey/commit/e2606724898254e75fc3624e4259de9a94fd55dc))
+
+### 📚 Documentation
+
+- *(cli)* Say what the proxy namespace check does not do - ([28884bd](https://github.com/QaidVoid/bailey/commit/28884bdc345d9e9183e2d7e7f641d34ca599b225))
+- *(security)* Name the limits a policy cannot express - ([97d68e6](https://github.com/QaidVoid/bailey/commit/97d68e6ae612b2d78119aeb706f5745aceee7106))
+
 ## [0.1.4](https://github.com/QaidVoid/bailey/compare/v0.1.3...v0.1.4) - 2026-09-14
 
 ### ⛰️  Features
