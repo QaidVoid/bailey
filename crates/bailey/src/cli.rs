@@ -108,7 +108,7 @@ struct RunArgs {
     /// except one to ADDR:PORT, so the session reaches the broker and nothing
     /// else. If the rule cannot be applied the run refuses rather than fall back
     /// to open egress. `nft` must be present.
-    #[arg(long, value_name = "ADDR:PORT")]
+    #[arg(long, value_name = "ADDR:PORT", conflicts_with = "no_proxy_net")]
     egress_proxy: Option<String>,
     /// The target executable, followed by its own arguments.
     #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
@@ -579,7 +579,10 @@ fn wrap_in_private_namespace(
     if args.no_proxy_net || !want_proxy {
         return Ok(None);
     }
-    if matches!(policy.network.egress, Egress::DenyAll) {
+    // A policy that denies egress outright has nothing to hide behind a
+    // namespace, except when an egress proxy needs one to hold the session to
+    // its broker.
+    if matches!(policy.network.egress, Egress::DenyAll) && args.egress_proxy.is_none() {
         return Ok(None);
     }
 
@@ -709,6 +712,12 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
     // The lockdown goes on before the target is confined and run, so there is
     // no window in which the target has both a network and no egress rule.
     if let Some(proxy) = &args.egress_proxy {
+        if !args.in_proxy_netns {
+            anyhow::bail!(
+                "--egress-proxy installs its firewall rule inside a private network \
+                 namespace; refusing to change the host's"
+            );
+        }
         let (addr, port) = parse_egress_proxy(proxy)?;
         lock_egress_to_broker(addr, port)?;
         // Landlock gates egress by port, and the broker does not listen on the
