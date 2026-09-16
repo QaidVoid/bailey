@@ -410,15 +410,16 @@ fn apply_layer(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> 
     let mut relocated: BTreeMap<PathBuf, PathBuf> = BTreeMap::new();
     for (paths, access) in grants {
         for raw in paths {
-            let path = resolve_path(raw.path(), &layer.base);
-            if let Some(at) = raw.at() {
-                let at = resolve_path(at, &layer.base);
-                if !at.is_absolute() {
+            let Some(path) = resolve_path(raw.path(), &layer.base) else {
+                continue;
+            };
+            if let Some(raw_at) = raw.at() {
+                let Some(at) = resolve_path(raw_at, &layer.base) else {
                     return Err(ConfigError::Invalid {
                         path: layer.path.clone(),
-                        reason: format!("at must be an absolute path, got {}", at.display()),
+                        reason: format!("at must be an absolute path, got {raw_at}"),
                     });
-                }
+                };
                 // Two hierarchies at one location would leave whichever is
                 // mounted second covering the first, granting access to a path
                 // the target cannot reach.
@@ -441,7 +442,9 @@ fn apply_layer(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> 
     }
 
     for raw in &fs.deny {
-        let path = resolve_path(raw, &layer.base);
+        let Some(path) = resolve_path(raw, &layer.base) else {
+            continue;
+        };
         if granted.contains_key(&path) {
             return Err(ConfigError::Conflict {
                 path: layer.path.clone(),
@@ -462,12 +465,16 @@ fn apply_layer(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> 
         *acc.filesystem.entry(path).or_insert(Access::empty()) |= access;
     }
     for raw in &fs.deny {
-        let path = resolve_path(raw, &layer.base);
+        let Some(path) = resolve_path(raw, &layer.base) else {
+            continue;
+        };
         acc.filesystem.remove(&path);
         acc.denied.insert(path);
     }
     for raw in &fs.read_only {
-        acc.read_only.insert(resolve_path(raw, &layer.base));
+        if let Some(path) = resolve_path(raw, &layer.base) {
+            acc.read_only.insert(path);
+        }
     }
 
     if let Some(network) = &layer.raw.network {
@@ -486,9 +493,10 @@ fn apply_layer(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> 
             path: layer.path.clone(),
             reason,
         })?;
-        *acc.devices
-            .entry(resolve_path(&device.path, &layer.base))
-            .or_insert(Access::empty()) |= access;
+        let Some(path) = resolve_path(&device.path, &layer.base) else {
+            continue;
+        };
+        *acc.devices.entry(path).or_insert(Access::empty()) |= access;
     }
 
     if let Some(resources) = &layer.raw.resources {
@@ -537,8 +545,10 @@ fn apply_layer(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> 
         }
     }
 
-    if let Some(home) = &layer.raw.home {
-        acc.home = Some(resolve_path(home, &layer.base));
+    if let Some(home) = &layer.raw.home
+        && let Some(path) = resolve_path(home, &layer.base)
+    {
+        acc.home = Some(path);
     }
 
     if let Some(hooks) = &layer.raw.hooks {
@@ -704,15 +714,18 @@ fn parse_size(spec: &str) -> Result<u64, String> {
     Ok((number * multiplier) as u64)
 }
 
-fn resolve_path(raw: &str, base: &Path) -> PathBuf {
+fn resolve_path(raw: &str, base: &Path) -> Option<PathBuf> {
     let raw = expand_variables(raw);
+    if raw.trim().is_empty() {
+        return None;
+    }
     let expanded = expand_tilde(&raw);
     let joined = if expanded.is_absolute() {
         expanded
     } else {
         base.join(expanded)
     };
-    normalize_lexical(&joined)
+    Some(normalize_lexical(&joined))
 }
 
 /// Collapse `.` and `..` components without touching the filesystem, so that
@@ -1034,6 +1047,20 @@ mod tests {
         )];
         let resolved = merge(&layers).unwrap();
         assert_eq!(resolved.policy.filesystem[0].path, PathBuf::from("/thing"));
+    }
+
+    #[test]
+    fn a_grant_an_unset_variable_emptied_is_dropped() {
+        unsafe { std::env::remove_var("BAILEY_TEST_EMPTY_GRANT") };
+        let layers = [layer(
+            "/base",
+            "[filesystem]\nread = [\"${BAILEY_TEST_EMPTY_GRANT}\"]",
+        )];
+        let resolved = merge(&layers).unwrap();
+        assert!(
+            resolved.policy.filesystem.is_empty(),
+            "an empty expansion must not fall back to the config's own directory"
+        );
     }
 
     #[test]

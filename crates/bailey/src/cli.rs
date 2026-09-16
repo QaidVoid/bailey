@@ -99,8 +99,11 @@ struct RunArgs {
     no_proxy_net: bool,
     /// Internal: this run is already inside a pasta-provided namespace, so it
     /// confines the target where it is rather than wrapping it again.
-    #[arg(long, hide = true)]
-    in_proxy_netns: bool,
+    ///
+    /// Carries the network namespace the wrapper was in, so the inner run can
+    /// tell that it really moved out of it rather than take the flag's word.
+    #[arg(long, hide = true, value_name = "OUTER_NETNS")]
+    in_proxy_netns: Option<String>,
     /// Force all egress through a broker reachable only at ADDR:PORT.
     ///
     /// Implies `--proxy-net`. The private namespace is given ADDR as the host's
@@ -108,7 +111,7 @@ struct RunArgs {
     /// except one to ADDR:PORT, so the session reaches the broker and nothing
     /// else. If the rule cannot be applied the run refuses rather than fall back
     /// to open egress. `nft` must be present.
-    #[arg(long, value_name = "ADDR:PORT")]
+    #[arg(long, value_name = "ADDR:PORT", conflicts_with = "no_proxy_net")]
     egress_proxy: Option<String>,
     /// The target executable, followed by its own arguments.
     #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
@@ -373,6 +376,10 @@ fn cmd_doctor() -> anyhow::Result<i32> {
 
     println!("audit:");
     println!("  kernel BTF: {}", yes_no(caps.btf));
+    if !caps.btf {
+        degraded = true;
+        println!("    `bailey audit` needs it to load the eBPF programs");
+    }
     match &caps.helper {
         probe::HelperStatus::Ready(path) => {
             println!("  helper: ready ({})", path.display());
@@ -451,6 +458,37 @@ fn permit_broker_port(policy: &mut crate::policy::Policy, port: u16) {
         Egress::DenyAll => policy.network.egress = Egress::Allow(vec![rule]),
         Egress::AllowAll => {}
     }
+}
+
+/// Whether this run really left the namespace the wrapper was in.
+///
+/// A bare `--in-proxy-netns` is the caller's word, and a caller passing it from
+/// the host would have the egress rule land on the host's own tables. The
+/// wrapper says which namespace it was in, so the inner run can check it is
+/// somewhere else. Without that, or when the namespace cannot be read, the
+/// answer is no: the cost of believing a false yes is the host's firewall.
+fn left_namespace(outer: Option<&str>) -> bool {
+    let Some(outer) = outer else {
+        return false;
+    };
+    // Only a real namespace link is evidence of anything. A value that is not
+    // one is a caller writing something in the space, not a wrapper reporting
+    // where it was.
+    if !is_netns_link(outer) {
+        return false;
+    }
+    match std::fs::read_link("/proc/self/ns/net") {
+        Ok(mine) => is_netns_link(&mine.to_string_lossy()) && mine.to_string_lossy() != outer,
+        Err(_) => false,
+    }
+}
+
+/// Whether a string is the `net:[<inode>]` that `/proc/<pid>/ns/net` reads as.
+fn is_netns_link(value: &str) -> bool {
+    value
+        .strip_prefix("net:[")
+        .and_then(|rest| rest.strip_suffix(']'))
+        .is_some_and(|inode| !inode.is_empty() && inode.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn lock_egress_to_broker(addr: std::net::Ipv4Addr, port: u16) -> anyhow::Result<()> {
@@ -546,6 +584,13 @@ fn inner_invocation(args: &RunArgs) -> Vec<std::ffi::OsString> {
         inner.push("--json".into());
     }
     inner.push("--in-proxy-netns".into());
+    // What the wrapper is in now. The inner run is only inside a namespace of
+    // its own if what it reads there differs from this.
+    inner.push(
+        std::fs::read_link("/proc/self/ns/net")
+            .map(std::ffi::OsString::from)
+            .unwrap_or_else(|_| "unknown".into()),
+    );
     if let Some(proxy) = &args.egress_proxy {
         inner.push("--egress-proxy".into());
         inner.push(proxy.into());
@@ -579,7 +624,10 @@ fn wrap_in_private_namespace(
     if args.no_proxy_net || !want_proxy {
         return Ok(None);
     }
-    if matches!(policy.network.egress, Egress::DenyAll) {
+    // A policy that denies egress outright has nothing to hide behind a
+    // namespace, except when an egress proxy needs one to hold the session to
+    // its broker.
+    if matches!(policy.network.egress, Egress::DenyAll) && args.egress_proxy.is_none() {
         return Ok(None);
     }
 
@@ -699,7 +747,7 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
     // Wrap before the hooks and the backend, so the confinement, the cgroup,
     // and the pre-launch hooks all run in the inner process that pasta places
     // in the private namespace, never twice.
-    if !args.in_proxy_netns
+    if args.in_proxy_netns.is_none()
         && let Some(code) = wrap_in_private_namespace(&resolved.policy, &args)?
     {
         return Ok(code);
@@ -709,6 +757,13 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
     // The lockdown goes on before the target is confined and run, so there is
     // no window in which the target has both a network and no egress rule.
     if let Some(proxy) = &args.egress_proxy {
+        if !left_namespace(args.in_proxy_netns.as_deref()) {
+            anyhow::bail!(
+                "--egress-proxy installs its firewall rule inside a private network \
+                 namespace, and this process is still in the one it started from; \
+                 refusing to change it"
+            );
+        }
         let (addr, port) = parse_egress_proxy(proxy)?;
         lock_egress_to_broker(addr, port)?;
         // Landlock gates egress by port, and the broker does not listen on the
@@ -716,7 +771,7 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
         // address, so permitting its port here widens nothing a session can
         // reach; it only stops Landlock from refusing the one allowed hop.
         permit_broker_port(&mut resolved.policy, port);
-    } else if args.in_proxy_netns {
+    } else if args.in_proxy_netns.is_some() {
         // Plain --proxy-net still forwards the namespace loopback to the host,
         // so a session could reach a host service on an allowed port. Drop that
         // reach. Best-effort here, matching --proxy-net's own degradation: the
@@ -1659,5 +1714,29 @@ fe80000000000000869e56fffe032b71 04 40 20 80    wlan0
         let missing = nothing_observed(127);
         assert!(missing.contains("did not do its work"), "{missing}");
         assert!(missing.contains(world::SANDBOX_PATH), "{missing}");
+    }
+}
+
+#[cfg(test)]
+mod netns_guard_tests {
+    use super::{is_netns_link, left_namespace};
+
+    #[test]
+    fn only_a_real_namespace_link_is_evidence() {
+        assert!(is_netns_link("net:[4026531833]"));
+        assert!(!is_netns_link("unknown"));
+        assert!(!is_netns_link("net:[]"));
+        assert!(!is_netns_link("net:[abc]"));
+        assert!(!is_netns_link(""));
+    }
+
+    #[test]
+    fn a_missing_or_unusable_claim_is_refused() {
+        // Nothing said, and something said that is not a namespace.
+        assert!(!left_namespace(None));
+        assert!(!left_namespace(Some("unknown")));
+        // The namespace this test runs in is not one it left.
+        let mine = std::fs::read_link("/proc/self/ns/net").unwrap();
+        assert!(!left_namespace(Some(&mine.to_string_lossy())));
     }
 }

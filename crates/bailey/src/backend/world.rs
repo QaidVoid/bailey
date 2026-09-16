@@ -8,6 +8,8 @@
 //! back.
 
 use std::collections::BTreeMap;
+use std::ffi::{CStr, OsStr};
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use crate::backend::network::{Inherited, NetworkMode};
@@ -88,19 +90,30 @@ impl World {
         // the target executable is granted implicitly, and most programs live
         // under the home, so treating that as an opt-out would silently disable
         // the private home for nearly every run.
-        let asked_for_real_home = covered_by_grant(policy, &real_home);
+        let asked_for_real_home = real_home
+            .as_deref()
+            .is_some_and(|home| covered_by_grant(policy, home));
 
+        let configured_home = policy
+            .home
+            .clone()
+            .filter(|home| home.is_absolute() && home.as_path() != Path::new("/"));
         let home_host = if asked_for_real_home {
             None
         } else {
-            Some(policy.home.clone().unwrap_or_else(|| default_home(target)))
+            Some(configured_home.unwrap_or_else(|| default_home(target)))
         };
-        let home_inside = match (&home_host, isolated) {
-            // Mounted where the real home would be, so a program that hard-codes
-            // its own home path still lands inside the sandbox.
-            (Some(_), true) => real_home.clone(),
-            (Some(host), false) => host.clone(),
-            (None, _) => real_home.clone(),
+        // Mounted where the real home would be, so a program that hard-codes its
+        // own home path still lands inside the sandbox. Without a usable real
+        // home there is nowhere else to put it, so it stays at its own path.
+        let home_inside = match (&home_host, isolated, real_home.as_deref()) {
+            (Some(_), true, Some(real)) => real.to_path_buf(),
+            (Some(host), _, _) => host.clone(),
+            (None, _, Some(real)) => real.to_path_buf(),
+            // Unreachable: home_host is None only when a grant covers the real
+            // home. The fallback is deliberately not the root, so a future
+            // change here cannot turn the world grant into read-write on `/`.
+            (None, _, None) => default_home(target),
         };
 
         // The target keeps the directory it was invoked from. Outside isolation
@@ -297,10 +310,34 @@ fn covered_by_grant(policy: &Policy, path: &Path) -> bool {
         .any(|granted| path.starts_with(granted))
 }
 
-fn real_home() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"))
+/// The user's home directory, when there is one a sandbox can use.
+///
+/// A home of `/` is not usable: the private home would be mounted at the sandbox
+/// root and the world grant on it would make the whole hierarchy writable. An
+/// unset or relative `HOME` falls back to the password database.
+fn real_home() -> Option<PathBuf> {
+    if let Some(home) = std::env::var_os("HOME")
+        && let Some(path) = home_from(Some(home.as_os_str()))
+    {
+        return Some(path);
+    }
+    passwd_home()
+}
+
+fn home_from(value: Option<&OsStr>) -> Option<PathBuf> {
+    let path = PathBuf::from(value?);
+    (path.is_absolute() && path.as_path() != Path::new("/")).then_some(path)
+}
+
+fn passwd_home() -> Option<PathBuf> {
+    // SAFETY: getpwuid returns a pointer to storage owned by libc, read and
+    // copied here before anything else can call into it.
+    let entry = unsafe { libc::getpwuid(libc::geteuid()) };
+    if entry.is_null() || unsafe { (*entry).pw_dir }.is_null() {
+        return None;
+    }
+    let dir = unsafe { CStr::from_ptr((*entry).pw_dir) };
+    home_from(Some(OsStr::from_bytes(dir.to_bytes())))
 }
 
 /// `$XDG_DATA_HOME/bailey/<target>/home`, named after the target so the
@@ -346,12 +383,16 @@ fn short_digest(path: &Path) -> String {
 }
 
 fn data_home() -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_DATA_HOME")
-        && !dir.is_empty()
-    {
-        return PathBuf::from(dir);
+    if let Some(dir) = std::env::var_os("XDG_DATA_HOME") {
+        let path = PathBuf::from(&dir);
+        if !dir.is_empty() && path.is_absolute() {
+            return path;
+        }
     }
-    real_home().join(".local").join("share")
+    match real_home() {
+        Some(home) => home.join(".local").join("share"),
+        None => PathBuf::from("/tmp"),
+    }
 }
 
 #[cfg(test)]
@@ -387,7 +428,30 @@ mod tests {
         let policy = policy_granting(&["/usr"]);
         let world = World::derive(Path::new("/opt/game/game"), &policy, true);
         assert!(world.home_host.is_some());
-        assert_eq!(world.home_inside, real_home());
+        if let Some(home) = real_home() {
+            assert_eq!(world.home_inside, home);
+        }
+    }
+
+    #[test]
+    fn a_policy_home_of_root_is_ignored() {
+        let mut policy = policy_granting(&["/usr"]);
+        policy.home = Some(PathBuf::from("/"));
+        let world = World::derive(Path::new("/opt/game/game"), &policy, true);
+        let host = world.home_host.expect("a private home");
+        assert_ne!(host, PathBuf::from("/"));
+        assert_ne!(world.home_inside, PathBuf::from("/"));
+    }
+
+    #[test]
+    fn an_unusable_home_is_rejected() {
+        assert_eq!(home_from(Some(OsStr::new("/"))), None);
+        assert_eq!(home_from(Some(OsStr::new("relative"))), None);
+        assert_eq!(home_from(None), None);
+        assert_eq!(
+            home_from(Some(OsStr::new("/home/you"))),
+            Some(PathBuf::from("/home/you"))
+        );
     }
 
     #[test]
@@ -407,7 +471,9 @@ mod tests {
 
     #[test]
     fn granting_the_real_home_opts_out() {
-        let home = real_home();
+        let Some(home) = real_home() else {
+            return;
+        };
         let policy = policy_granting(&[home.to_str().unwrap()]);
         let world = World::derive(Path::new("/opt/game/game"), &policy, true);
         assert!(world.home_host.is_none());
