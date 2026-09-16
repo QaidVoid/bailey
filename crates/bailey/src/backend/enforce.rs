@@ -21,7 +21,7 @@ use std::process::Command;
 use enumflags2::BitFlags;
 use landlock::{
     ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, NetPort, PathBeneath, PathFd,
-    Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus, Scope,
+    PathFdError, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus, Scope,
 };
 
 use crate::backend::cgroup;
@@ -530,8 +530,21 @@ impl LandlockPlan {
                         .map_err(landlock_err)?;
                 }
                 // A granted path that does not exist is skipped rather than
-                // aborting the whole run.
-                Err(_) => continue,
+                // aborting the whole run. Anything else means the rule could
+                // not be installed for a reason the policy did not ask for,
+                // and carrying on would report a grant that is not there.
+                Err(PathFdError::OpenCall { source, .. })
+                    if source.kind() == std::io::ErrorKind::NotFound => {}
+                Err(PathFdError::OpenCall { source, .. }) => {
+                    // Only an errno crosses back to the parent from here, so
+                    // what went wrong is said on the way out.
+                    eprintln!("bailey: could not grant {}: {source}", path.display());
+                    return Err(source);
+                }
+                Err(error) => {
+                    eprintln!("bailey: could not grant {}: {error}", path.display());
+                    return Err(io::Error::from_raw_os_error(libc::EINVAL));
+                }
             }
         }
         for port in &self.connect_ports {
@@ -548,6 +561,21 @@ impl LandlockPlan {
         let status = created.restrict_self().map_err(landlock_err)?;
         if status.ruleset == RulesetStatus::NotEnforced {
             eprintln!("bailey: warning: Landlock is not enforced by this kernel");
+        }
+        // `PartiallyEnforced` is not the signal it reads as: best effort trims
+        // the rights of any rule that cannot carry them, such as directory
+        // rights on a file, so an ordinary run reports it on a kernel that
+        // supports everything asked of it. What does mean part of the policy
+        // is unexpressible is a kernel older than the ABI the rules are
+        // written against, which is worth saying once.
+        if let Some(current) = crate::backend::probe::landlock_abi()
+            && current < TARGET_ABI as u32
+        {
+            eprintln!(
+                "bailey: warning: this kernel speaks Landlock ABI {current}, and the policy is \
+                 written for {}, so the rights added after it are not enforced",
+                TARGET_ABI as u32
+            );
         }
         Ok(())
     }

@@ -85,7 +85,7 @@ pub fn probe(deep: bool) -> Capabilities {
 }
 
 /// Ask the kernel which Landlock ABI it implements.
-fn landlock_abi() -> Option<u32> {
+pub fn landlock_abi() -> Option<u32> {
     let version = unsafe {
         libc::syscall(
             SYS_LANDLOCK_CREATE_RULESET,
