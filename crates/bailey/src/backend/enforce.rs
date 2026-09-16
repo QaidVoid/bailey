@@ -291,6 +291,7 @@ impl EnforceBackend {
 
         if isolation.is_none() {
             report_unenforceable_denials(policy, nested);
+            report_widened_grants(policy, &self.implicit_write, nested);
         }
 
         // Without the isolation layer, the network namespace is entered on its
@@ -972,6 +973,38 @@ fn landlock_err(err: impl std::fmt::Display) -> io::Error {
 /// inside the mount namespace. With isolation off there is no mechanism for it,
 /// so the run says so rather than leaving the policy quietly weaker than it
 /// reads.
+/// Say when a narrower grant is widened by an implicit write root.
+///
+/// Landlock rights are additive, so a `read` grant beneath a directory the run
+/// grants for writing, such as the one a confined shell starts in, is writable
+/// however narrowly it was written. The isolation layer takes the right back by
+/// remounting the narrower path read-only; without a mount namespace there is
+/// no way to subtract it, so the only honest thing is to say so.
+fn report_widened_grants(policy: &Policy, implicit_write: &[PathBuf], nested: bool) {
+    let remedy = if nested {
+        "this run is inside another sandbox, which cannot build a second world"
+    } else {
+        "drop `--no-isolate` to keep it read-only"
+    };
+    for rule in &policy.filesystem {
+        if rule.access.contains(policy::Access::WRITE) {
+            continue;
+        }
+        let Some(root) = implicit_write
+            .iter()
+            .find(|root| rule.path.starts_with(root) && rule.path != **root)
+        else {
+            continue;
+        };
+        eprintln!(
+            "bailey: warning: `{}` is granted read-only but sits inside `{}`, which this \
+             run grants for writing, so it is writable. {remedy}.",
+            rule.path.display(),
+            root.display()
+        );
+    }
+}
+
 fn report_unenforceable_denials(policy: &Policy, nested: bool) {
     // Inside a sandbox there is no `--no-isolate` to drop: the mount namespace
     // cannot be rebuilt at all, so pointing at the flag would send someone after
