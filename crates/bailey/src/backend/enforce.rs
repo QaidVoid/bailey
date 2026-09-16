@@ -227,7 +227,8 @@ impl EnforceBackend {
             );
         }
 
-        let mut plan = LandlockPlan::from_policy(policy);
+        // Relocation only happens where a root is reconstructed to put it in.
+        let mut plan = LandlockPlan::from_policy(policy, self.isolate && userns);
         plan.add_world_grants(&world);
 
         let isolation = if self.isolate {
@@ -448,15 +449,27 @@ struct LandlockPlan {
 }
 
 impl LandlockPlan {
-    fn from_policy(policy: &Policy) -> Self {
+    /// Build the Landlock rules for a policy.
+    ///
+    /// `relocates` says whether a reconstructed root will be built. It decides
+    /// which path a relocated grant is named by, and getting it wrong inverts
+    /// the grant: with no root to pivot into, `at` names a host path the policy
+    /// never granted, while the path it did grant goes unnamed.
+    fn from_policy(policy: &Policy, relocates: bool) -> Self {
         let mut filesystem = Vec::new();
         for rule in &policy.filesystem {
             if let Some(bits) = fs_access_bits(rule.access) {
                 // The path as the target sees it. Landlock is applied after the
                 // pivot, so a relocated hierarchy must be named where it ended
                 // up: naming the host path would open nothing and the rule
-                // would be dropped as a path that does not exist.
-                filesystem.push((rule.visible().clone(), bits));
+                // would be dropped as a path that does not exist. Without the
+                // pivot there is no such path, and the host one is what exists.
+                let path = if relocates {
+                    rule.visible().clone()
+                } else {
+                    rule.path.clone()
+                };
+                filesystem.push((path, bits));
             }
         }
         for rule in &policy.devices {
@@ -1355,7 +1368,7 @@ mod tests {
             access: Access::READ | Access::WRITE,
         });
 
-        let plan = LandlockPlan::from_policy(&policy);
+        let plan = LandlockPlan::from_policy(&policy, true);
         assert_eq!(plan.filesystem.len(), 2);
         // Default egress is DenyAll, so connect is handled with no allowed ports.
         assert!(plan.handle_connect);
@@ -1422,6 +1435,42 @@ mod tests {
         assert!(
             exited,
             "subvolume ioctls were not denied, or a benign ioctl was"
+        );
+    }
+
+    #[test]
+    fn a_relocated_grant_follows_the_root_that_will_exist() {
+        let mut policy = Policy::default();
+        policy.filesystem.push(FsRule {
+            path: PathBuf::from("/host/data"),
+            access: Access::READ,
+            at: Some(PathBuf::from("/host/secret")),
+        });
+
+        // With a reconstructed root the grant is named where it lands.
+        let relocated = LandlockPlan::from_policy(&policy, true);
+        assert!(
+            relocated
+                .filesystem
+                .iter()
+                .any(|(path, _)| path == Path::new("/host/secret"))
+        );
+
+        // Without one there is no such path, and naming `at` would grant a
+        // host path the policy never mentioned while withholding the one it
+        // did.
+        let plain = LandlockPlan::from_policy(&policy, false);
+        assert!(
+            plain
+                .filesystem
+                .iter()
+                .any(|(path, _)| path == Path::new("/host/data"))
+        );
+        assert!(
+            !plain
+                .filesystem
+                .iter()
+                .any(|(path, _)| path == Path::new("/host/secret"))
         );
     }
 
