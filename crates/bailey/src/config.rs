@@ -458,6 +458,10 @@ fn apply_layer(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> 
         acc.filesystem.clear();
         acc.denied.clear();
         acc.read_only.clear();
+        // Relocations are applied to every rule with a matching path when the
+        // policy is finalized, so one left behind would place a later plain
+        // grant at an `at` the resetting layer never mentions.
+        acc.relocated.clear();
     }
     for (path, access) in granted {
         // A grant in this layer overrides a denial from a lower one.
@@ -913,6 +917,19 @@ mod tests {
         let resolved = merge(&layers).unwrap();
         assert!(resolved.policy.denied.is_empty());
         assert_eq!(resolved.policy.filesystem[0].path, PathBuf::from("/a"));
+    }
+
+    #[test]
+    fn a_reset_clears_relocations_too() {
+        // `path` is the host path and `at` is where the target sees it, so a
+        // relocation surviving a reset places a later plain grant somewhere
+        // the resetting layer never named.
+        let layers = [
+            layer("/base", "[filesystem]\nwrite = [{ path = \"/a\", at = \"/x\" }]"),
+            layer("/base", "[filesystem]\nreset = true\nwrite = [\"/a\"]"),
+        ];
+        let resolved = merge(&layers).unwrap();
+        assert_eq!(resolved.policy.filesystem[0].at, None);
     }
 
     #[test]
