@@ -32,6 +32,9 @@ pub enum Rejected {
     /// Users other than the owner can write the file, so a recorded hash is a
     /// race rather than a guarantee.
     Writable(String),
+    /// A directory holding the file can be written by someone else, who can
+    /// replace the file by renaming over it whatever its own mode says.
+    WritableParent { dir: String, who: String },
     /// The file could not be read in order to check it.
     Unreadable(String),
     /// The trust store itself cannot be read from where this run is standing,
@@ -47,6 +50,7 @@ impl Rejected {
             Rejected::Changed => "changed",
             Rejected::Owned(_) => "not yours",
             Rejected::Writable(_) => "writable",
+            Rejected::WritableParent { .. } => "exposed",
             Rejected::Unreadable(_) => "unreadable",
             Rejected::StoreUnreachable => "unknown",
         }
@@ -59,6 +63,9 @@ impl Rejected {
             Rejected::Changed => "it changed since you trusted it".into(),
             Rejected::Owned(owner) => format!("it is owned by {owner}, not by you"),
             Rejected::Writable(who) => format!("it is writable by {who}"),
+            Rejected::WritableParent { dir, who } => {
+                format!("{dir} can be written by {who}, who could replace it")
+            }
             Rejected::Unreadable(err) => format!("it could not be read: {err}"),
             Rejected::StoreUnreachable => "the trust store is not reachable from \
                  inside a sandbox, so nothing here is known to be trusted"
@@ -75,6 +82,7 @@ impl Rejected {
                 path.display()
             )),
             Rejected::Writable(_) => Some(format!("chmod go-w {}", path.display())),
+            Rejected::WritableParent { dir, .. } => Some(format!("chmod go-w {dir}")),
             // Deliberately no remedy: `bailey trust` from in here would write a
             // record into a private home that is discarded when the run ends,
             // which would look like it worked.
@@ -225,6 +233,12 @@ impl Store {
         if let Some(exposure) = exposure(&meta) {
             return Some(exposure);
         }
+        // A file nobody else may write still sits somewhere, and a directory
+        // another user may write is one they can rename a file out of and a
+        // file of their own into. The mode on the file says nothing about that.
+        if let Some(exposure) = exposed_parents(&path) {
+            return Some(exposure);
+        }
         let digest = match digest(&path) {
             Ok(digest) => digest,
             Err(err) => return Some(Rejected::Unreadable(err.to_string())),
@@ -323,6 +337,42 @@ pub fn exposure_of(path: &Path) -> Option<Rejected> {
 }
 
 /// Report how a file can be changed by someone other than the running user.
+/// Whether any directory holding `path` can be written by someone else.
+///
+/// Walked upwards to the root. A sticky directory is not counted: `/tmp` is
+/// world-writable by design, and the sticky bit is what stops one user
+/// replacing another's entry there.
+fn exposed_parents(path: &Path) -> Option<Rejected> {
+    let me = unsafe { libc::geteuid() };
+    let mut current = path.parent();
+    while let Some(dir) = current {
+        let Ok(meta) = fs::metadata(dir) else {
+            return None;
+        };
+        let mode = meta.mode();
+        let sticky = mode & 0o1000 != 0;
+        if !sticky {
+            let who = if meta.uid() != me && meta.uid() != 0 {
+                Some(owner(meta.uid()))
+            } else if mode & 0o002 != 0 {
+                Some("any user".to_string())
+            } else if mode & 0o020 != 0 {
+                Some(format!("group {}", group(meta.gid())))
+            } else {
+                None
+            };
+            if let Some(who) = who {
+                return Some(Rejected::WritableParent {
+                    dir: dir.display().to_string(),
+                    who,
+                });
+            }
+        }
+        current = dir.parent();
+    }
+    None
+}
+
 fn exposure(meta: &fs::Metadata) -> Option<Rejected> {
     // SAFETY: `geteuid` reads the calling process's effective user id and
     // cannot fail.
