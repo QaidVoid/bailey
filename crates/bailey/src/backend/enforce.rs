@@ -968,6 +968,20 @@ fn denied_syscalls() -> &'static [i64] {
         libc::SYS_process_vm_writev,
         libc::SYS_open_by_handle_at,
         libc::SYS_acct,
+        // Landlock is checked when a file is opened, not when a descriptor is
+        // duplicated, so a descriptor taken from bailey carries the access
+        // bailey had. Without a PID namespace the target can name bailey and
+        // ask for one, which reaches the trust store and the config that was
+        // just verified.
+        libc::SYS_pidfd_getfd,
+        // Landlock still mediates the filesystem operations a ring issues, but
+        // a ring does not go through `sys_ioctl`, so the subvolume denials
+        // below would be reachable through it. Nothing here needs io_uring.
+        libc::SYS_io_uring_setup,
+        libc::SYS_io_uring_enter,
+        libc::SYS_io_uring_register,
+        libc::SYS_chroot,
+        libc::SYS_quotactl,
     ]
 }
 
@@ -1336,6 +1350,23 @@ mod tests {
             exited,
             "subvolume ioctls were not denied, or a benign ioctl was"
         );
+    }
+
+    #[test]
+    fn descriptor_passing_and_rings_are_denied() {
+        // A duplicated descriptor carries the access the opener had, and a
+        // ring reaches ioctls without passing the ioctl rules below.
+        let denied = denied_syscalls();
+        for nr in [
+            libc::SYS_pidfd_getfd,
+            libc::SYS_io_uring_setup,
+            libc::SYS_io_uring_enter,
+            libc::SYS_io_uring_register,
+            libc::SYS_chroot,
+            libc::SYS_quotactl,
+        ] {
+            assert!(denied.contains(&nr), "syscall {nr} should be denied");
+        }
     }
 
     #[test]

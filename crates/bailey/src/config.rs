@@ -925,7 +925,10 @@ mod tests {
         // relocation surviving a reset places a later plain grant somewhere
         // the resetting layer never named.
         let layers = [
-            layer("/base", "[filesystem]\nwrite = [{ path = \"/a\", at = \"/x\" }]"),
+            layer(
+                "/base",
+                "[filesystem]\nwrite = [{ path = \"/a\", at = \"/x\" }]",
+            ),
             layer("/base", "[filesystem]\nreset = true\nwrite = [\"/a\"]"),
         ];
         let resolved = merge(&layers).unwrap();
