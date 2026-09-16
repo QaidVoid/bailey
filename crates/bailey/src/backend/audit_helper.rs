@@ -216,8 +216,10 @@ fn read_frames(stream: &mut impl Read) -> Trace {
                     dropped += 1;
                     continue;
                 }
-                let record: &AccessRecord = bytemuck::from_bytes(&record_buf);
-                events.push(to_event(record));
+                // Read rather than cast: the buffer is a `Vec<u8>`, whose
+                // alignment is one, and casting asserts the record's own.
+                let record: AccessRecord = bytemuck::pod_read_unaligned(&record_buf);
+                events.push(to_event(&record));
             }
             FRAME_SUMMARY => {
                 let mut lost = [0u8; 8];

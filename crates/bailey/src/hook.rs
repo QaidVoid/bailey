@@ -158,12 +158,29 @@ pub fn snippet(shell: Shell, ask: bool, wrap: bool) -> String {
     out
 }
 
+/// Whether a claimed name can be written into generated shell source.
+///
+/// The name comes from a profile's `applies_to` and is interpolated into a
+/// function definition, so anything a shell reads specially would change what
+/// the sourced file runs. A name that is not a plain program name is skipped
+/// rather than quoted: it would not be a function a shell could call anyway.
+fn is_shell_safe_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with(|c: char| c.is_ascii_digit())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+}
+
 fn fish_wrappers() -> String {
     let mut out = String::from(
         "\n# Programs your own profiles claim with `applies_to`. `command <name>`\n\
          # still reaches the program itself.\n",
     );
     for name in profiles::claimed_names() {
+        if !is_shell_safe_name(&name) {
+            continue;
+        }
         out.push_str(&format!(
             "function {name} -d \"bailey: claimed by one of your profiles\"\n    \
              command bailey run {name} $argv\nend\n"
@@ -178,6 +195,9 @@ fn bash_wrappers() -> String {
          # still reaches the program itself.\n",
     );
     for name in profiles::claimed_names() {
+        if !is_shell_safe_name(&name) {
+            continue;
+        }
         out.push_str(&format!(
             "{name}() {{ command bailey run {name} \"$@\"; }}\n"
         ));
@@ -223,5 +243,23 @@ mod tests {
             display_relative(Path::new("/other/bailey.toml"), Path::new("/work")),
             "/other/bailey.toml"
         );
+    }
+}
+
+#[cfg(test)]
+mod name_safety_tests {
+    use super::is_shell_safe_name;
+
+    #[test]
+    fn only_a_plain_program_name_is_written_into_shell_source() {
+        assert!(is_shell_safe_name("node"));
+        assert!(is_shell_safe_name("python3.11"));
+        assert!(is_shell_safe_name("my-tool_2"));
+        // Anything a shell reads specially, or that breaks the generated call.
+        assert!(!is_shell_safe_name("a; rm -rf /"));
+        assert!(!is_shell_safe_name("a b"));
+        assert!(!is_shell_safe_name("$(id)"));
+        assert!(!is_shell_safe_name("`id`"));
+        assert!(!is_shell_safe_name(""));
     }
 }

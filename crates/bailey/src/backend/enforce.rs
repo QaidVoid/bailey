@@ -1429,8 +1429,19 @@ fn try_create_cgroup(limits: &ResourceLimits) -> io::Result<PathBuf> {
              needed, or name one with BAILEY_CGROUP_ROOT",
         )
     })?;
+    // A pid is reused, so a leftover directory from an earlier run with the
+    // same number would be joined and written to rather than replaced. Created
+    // outright, so an existing one is an error rather than a surprise.
     let dir = base.join(format!("bailey.{}", std::process::id()));
-    std::fs::create_dir_all(&dir)?;
+    match std::fs::create_dir(&dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            // Left behind by a run that could not clean up. Its limits are not
+            // this run's, so it is emptied of settings by being replaced.
+            std::fs::remove_dir(&dir).and_then(|()| std::fs::create_dir(&dir))?;
+        }
+        Err(error) => return Err(error),
+    }
 
     if let Some(memory) = limits.memory_bytes {
         std::fs::write(dir.join("memory.max"), memory.to_string())?;
