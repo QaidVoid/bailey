@@ -785,6 +785,11 @@ fn metadata_read_only(policy: &Policy) -> Vec<PathBuf> {
         .filesystem
         .iter()
         .filter(|rule| !rule.access.contains(policy::Access::WRITE))
+        // A kernel filesystem cannot be remounted read-only from a user
+        // namespace: it is inherited with its flags locked, and the attempt
+        // fails the whole run. There is nothing to close there either, since
+        // its attributes are the kernel's rather than a file's.
+        .filter(|rule| !is_kernel_filesystem(&rule.path))
         .filter(|rule| {
             !policy.filesystem.iter().any(|other| {
                 other.access.contains(policy::Access::WRITE)
@@ -794,6 +799,33 @@ fn metadata_read_only(policy: &Policy) -> Vec<PathBuf> {
         })
         .map(|rule| rule.visible().clone())
         .collect()
+}
+
+/// Whether a path sits on a filesystem the kernel synthesises.
+///
+/// Read with `statfs`, so a path is judged by what it is really on rather than
+/// by matching its name.
+fn is_kernel_filesystem(path: &Path) -> bool {
+    // sysfs, proc, cgroup v1 and v2, devpts, debugfs, securityfs, tracefs, bpf.
+    const KERNEL_MAGIC: [i64; 9] = [
+        0x6265_6572,
+        0x9fa0,
+        0x0027_e0eb,
+        0x6367_7270,
+        0x1cd1,
+        0x6462_6720,
+        0x7363_6673,
+        0x7472_6163,
+        -0x3501_b5ef,
+    ];
+    let Ok(raw) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
+        return false;
+    };
+    let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(raw.as_ptr(), &mut buf) } != 0 {
+        return false;
+    }
+    KERNEL_MAGIC.contains(&(buf.f_type as i64))
 }
 
 fn fs_access_bits(access: policy::Access) -> Option<BitFlags<AccessFs>> {
