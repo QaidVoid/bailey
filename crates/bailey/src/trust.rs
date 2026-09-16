@@ -109,6 +109,19 @@ struct StoreFile {
     trusted: BTreeMap<String, String>,
 }
 
+/// Write a file only its owner can read, replacing any existing one.
+fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(text.as_bytes())
+}
+
 impl Store {
     /// Read the store from the user's data directory.
     ///
@@ -173,11 +186,24 @@ impl Store {
         let text = toml::to_string_pretty(&file).map_err(|err| err.to_string())?;
 
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
+            use std::os::unix::fs::DirBuilderExt;
+            // A store another local user can write is not a record of what
+            // this user trusts.
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)
+                .or_else(|err| {
+                    if err.kind() == std::io::ErrorKind::AlreadyExists {
+                        Ok(())
+                    } else {
+                        Err(err)
+                    }
+                })
                 .map_err(|err| format!("could not create `{}`: {err}", parent.display()))?;
         }
         let staging = path.with_extension("toml.new");
-        fs::write(&staging, text)
+        write_private(&staging, &text)
             .map_err(|err| format!("could not write `{}`: {err}", staging.display()))?;
         fs::rename(&staging, path)
             .map_err(|err| format!("could not replace `{}`: {err}", path.display()))

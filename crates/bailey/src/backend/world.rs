@@ -160,7 +160,10 @@ impl World {
             return Ok(());
         };
         if !home.exists() {
-            std::fs::create_dir_all(home)?;
+            // The private home is where a program keeps what the real home was
+            // withheld to protect, so it is not left at the caller's umask for
+            // every other local user to walk into.
+            create_private_dir(home)?;
             let where_ = if nested {
                 " (inside the sandbox this run is in)"
             } else {
@@ -338,6 +341,15 @@ fn passwd_home() -> Option<PathBuf> {
     }
     let dir = unsafe { CStr::from_ptr((*entry).pw_dir) };
     home_from(Some(OsStr::from_bytes(dir.to_bytes())))
+}
+
+/// Create a directory and its parents, readable only by its owner.
+fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
 }
 
 /// `$XDG_DATA_HOME/bailey/<target>/home`, named after the target so the
