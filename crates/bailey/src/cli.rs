@@ -465,13 +465,17 @@ fn permit_broker_port(policy: &mut crate::policy::Policy, port: u16) {
     }
 }
 
-/// Whether this run really left the namespace the wrapper was in.
+/// Whether this run left the namespace the wrapper said it was in.
 ///
-/// A bare `--in-proxy-netns` is the caller's word, and a caller passing it from
-/// the host would have the egress rule land on the host's own tables. The
-/// wrapper says which namespace it was in, so the inner run can check it is
-/// somewhere else. Without that, or when the namespace cannot be read, the
-/// answer is no: the cost of believing a false yes is the host's firewall.
+/// This catches a mistake, not an attack, and it is worth being plain about
+/// which. The value is the caller's to write: passing the namespace this
+/// process is really in is refused, and passing any other well-formed one is
+/// not, so a caller who means to reach the host's tables still can. Knowing
+/// which namespace this is cannot be settled by looking from inside it; it has
+/// to come from having created it. See the note on issue #24.
+///
+/// It is still worth keeping, because the mistake it catches is the likely one:
+/// a script or a caller that copies the flag without the wrapper behind it.
 fn left_namespace(outer: Option<&str>) -> bool {
     let Some(outer) = outer else {
         return false;
