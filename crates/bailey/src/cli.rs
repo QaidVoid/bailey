@@ -4,6 +4,8 @@
 //! and reconciliation together behind the `run`, `audit`, `show`, `profile`,
 //! and `trust` subcommands.
 
+use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -97,13 +99,6 @@ struct RunArgs {
     /// Never use a private network namespace, even where one was available.
     #[arg(long)]
     no_proxy_net: bool,
-    /// Internal: this run is already inside a pasta-provided namespace, so it
-    /// confines the target where it is rather than wrapping it again.
-    ///
-    /// Carries the network namespace the wrapper was in, so the inner run can
-    /// tell that it really moved out of it rather than take the flag's word.
-    #[arg(long, hide = true, value_name = "OUTER_NETNS")]
-    in_proxy_netns: Option<String>,
     /// Force all egress through a broker reachable only at ADDR:PORT.
     ///
     /// Implies `--proxy-net`. The private namespace is given ADDR as the host's
@@ -474,32 +469,6 @@ fn permit_broker_port(policy: &mut crate::policy::Policy, port: u16) {
 /// which namespace this is cannot be settled by looking from inside it; it has
 /// to come from having created it. See the note on issue #24.
 ///
-/// It is still worth keeping, because the mistake it catches is the likely one:
-/// a script or a caller that copies the flag without the wrapper behind it.
-fn left_namespace(outer: Option<&str>) -> bool {
-    let Some(outer) = outer else {
-        return false;
-    };
-    // Only a real namespace link is evidence of anything. A value that is not
-    // one is a caller writing something in the space, not a wrapper reporting
-    // where it was.
-    if !is_netns_link(outer) {
-        return false;
-    }
-    match std::fs::read_link("/proc/self/ns/net") {
-        Ok(mine) => is_netns_link(&mine.to_string_lossy()) && mine.to_string_lossy() != outer,
-        Err(_) => false,
-    }
-}
-
-/// Whether a string is the `net:[<inode>]` that `/proc/<pid>/ns/net` reads as.
-fn is_netns_link(value: &str) -> bool {
-    value
-        .strip_prefix("net:[")
-        .and_then(|rest| rest.strip_suffix(']'))
-        .is_some_and(|inode| !inode.is_empty() && inode.bytes().all(|b| b.is_ascii_digit()))
-}
-
 fn lock_egress_to_broker(addr: std::net::Ipv4Addr, port: u16) -> anyhow::Result<()> {
     // A dedicated table, so it is this rule that is added and removed and never
     // another's. IPv6 has no accept rule, so the inet chain drops it entirely.
@@ -569,49 +538,6 @@ fn run_nft(ruleset: &str) -> anyhow::Result<()> {
 /// The bailey invocation to run inside the private namespace, the outer one
 /// with the marker added so the inner run confines rather than wrapping again.
 ///
-/// Rebuilt from the parsed arguments rather than the raw argv, so the target
-/// after `--` cannot be mistaken for an option however it was spelled.
-fn inner_invocation(args: &RunArgs) -> Vec<std::ffi::OsString> {
-    let mut inner: Vec<std::ffi::OsString> = vec!["run".into()];
-    if let Some(config) = &args.config {
-        inner.push("--config".into());
-        inner.push(config.into());
-    }
-    if let Some(profile) = &args.profile {
-        inner.push("--profile".into());
-        inner.push(profile.into());
-    }
-    if args.isolate {
-        inner.push("--isolate".into());
-    }
-    if args.no_isolate {
-        inner.push("--no-isolate".into());
-    }
-    if args.quiet {
-        inner.push("--quiet".into());
-    }
-    if args.json {
-        inner.push("--json".into());
-    }
-    inner.push("--in-proxy-netns".into());
-    // What the wrapper is in now. The inner run is only inside a namespace of
-    // its own if what it reads there differs from this.
-    inner.push(
-        std::fs::read_link("/proc/self/ns/net")
-            .map(std::ffi::OsString::from)
-            .unwrap_or_else(|_| "unknown".into()),
-    );
-    if let Some(proxy) = &args.egress_proxy {
-        inner.push("--egress-proxy".into());
-        inner.push(proxy.into());
-    }
-    inner.push("--".into());
-    for part in &args.command {
-        inner.push(part.into());
-    }
-    inner
-}
-
 /// Re-run the target inside a pasta-provided network namespace when asked.
 ///
 /// Returns the child's exit code when it wrapped, or `None` to run the target
@@ -623,22 +549,33 @@ fn inner_invocation(args: &RunArgs) -> Vec<std::ffi::OsString> {
 /// interface it runs behind, a private address and a synthetic MAC in place of
 /// the host's. Egress is still gated by the policy's ports, since Landlock
 /// applies inside the namespace as it does outside.
+/// Which side of the private namespace this process ended up on.
+enum Wrapped {
+    /// The parent: the run happened in the child, and this is its status.
+    Parent(i32),
+    /// The child: this process created the network namespace, so it is the one
+    /// that may install a rule in it.
+    Creator,
+    /// No private namespace was made, so this process is where it started.
+    Unwrapped,
+}
+
 fn wrap_in_private_namespace(
     policy: &crate::policy::Policy,
     args: &RunArgs,
-) -> anyhow::Result<Option<i32>> {
+) -> anyhow::Result<Wrapped> {
     use crate::policy::Egress;
 
     // An egress proxy needs the private namespace, so it implies --proxy-net.
     let want_proxy = args.proxy_net || args.egress_proxy.is_some();
     if args.no_proxy_net || !want_proxy {
-        return Ok(None);
+        return Ok(Wrapped::Unwrapped);
     }
     // A policy that denies egress outright has nothing to hide behind a
     // namespace, except when an egress proxy needs one to hold the session to
     // its broker.
     if matches!(policy.network.egress, Egress::DenyAll) && args.egress_proxy.is_none() {
-        return Ok(None);
+        return Ok(Wrapped::Unwrapped);
     }
 
     // With an egress proxy a missing dependency is fatal, not a downgrade: the
@@ -648,14 +585,17 @@ fn wrap_in_private_namespace(
     let pasta = match resolve_helper("pasta") {
         Ok(path) => path,
         Err(_) if strict => {
-            anyhow::bail!("--egress-proxy needs pasta, which is not on PATH; the run is refused")
+            anyhow::bail!(
+                "--egress-proxy needs pasta, which is not in a trusted location; \
+                 the run is refused"
+            )
         }
         Err(_) => {
             eprintln!(
-                "bailey: warning: --proxy-net was asked for but pasta is not on \
-                 PATH, so the host address stays visible"
+                "bailey: warning: --proxy-net was asked for but pasta is not in a \
+                 trusted location, so the host address stays visible"
             );
-            return Ok(None);
+            return Ok(Wrapped::Unwrapped);
         }
     };
     if !isolation::available() {
@@ -668,11 +608,8 @@ fn wrap_in_private_namespace(
             "bailey: warning: --proxy-net needs user namespaces, which are \
              unavailable, so the host address stays visible"
         );
-        return Ok(None);
+        return Ok(Wrapped::Unwrapped);
     }
-
-    let exe = std::env::current_exe()?;
-    let inner = inner_invocation(args);
 
     if !args.quiet && !args.json {
         eprintln!(
@@ -709,14 +646,150 @@ fn wrap_in_private_namespace(
     } else {
         pasta_args.push("-4");
     }
-    pasta_args.push("--");
+    // The namespace is made here rather than by pasta, and pasta is pointed at
+    // it. Whoever installs the lockdown rule has to know which namespace it
+    // lands in, and that cannot be established by looking: every reference a
+    // caller could hand over is one a caller could choose. Creating it settles
+    // the question, so the child below installs the rule and nothing has to be
+    // asserted. See issue #24.
+    let ready = Relay::new()?;
+    let release = Relay::new()?;
 
-    let status = std::process::Command::new(&pasta)
-        .args(&pasta_args)
-        .arg(&exe)
-        .args(&inner)
-        .status()?;
-    Ok(Some(status.code().unwrap_or(1)))
+    // Safety: the child runs after `fork` in a process that is single threaded
+    // at this point, so the heap and every lock it inherits are consistent and
+    // it may go on running ordinary code rather than only what is
+    // async-signal-safe.
+    match unsafe { libc::fork() } {
+        -1 => Err(io::Error::last_os_error().into()),
+        0 => {
+            let ready = ready.into_writer();
+            let release = release.into_reader();
+            // A user and network namespace of this process's own, mapped to
+            // root inside so that `nft` keeps its capabilities across the exec
+            // that installs the rule.
+            if let Err(error) = network::enter_proxy_namespace() {
+                eprintln!("bailey: could not create the private namespace: {error}");
+                std::process::exit(1);
+            }
+            if ready.send().is_err() {
+                std::process::exit(1);
+            }
+            drop(ready);
+            // A closed pipe means the parent gave up, which is the failure
+            // case: the namespace has no networking and no rule, so the run
+            // must not continue into it.
+            if release.wait().is_err() {
+                eprintln!("bailey: the private namespace was never configured; the run is refused");
+                std::process::exit(1);
+            }
+            Ok(Wrapped::Creator)
+        }
+        child => {
+            let ready = ready.into_reader();
+            let release = release.into_writer();
+            if ready.wait().is_err() {
+                reap(child);
+                anyhow::bail!("the private namespace could not be created; the run is refused");
+            }
+            let status = std::process::Command::new(&pasta)
+                .args(&pasta_args)
+                .arg(child.to_string())
+                .status();
+            let configured = matches!(&status, Ok(status) if status.success());
+            if !configured {
+                // Dropping the release end tells the child to stop, so it never
+                // runs with a namespace pasta did not finish configuring.
+                drop(release);
+                reap(child);
+                match status {
+                    Ok(status) => anyhow::bail!(
+                        "pasta could not configure the private namespace (exit {}); \
+                         the run is refused",
+                        status.code().unwrap_or(-1)
+                    ),
+                    Err(error) => anyhow::bail!(
+                        "pasta could not be run to configure the private namespace: {error}"
+                    ),
+                }
+            }
+            release.send()?;
+            drop(release);
+            Ok(Wrapped::Parent(reap(child)))
+        }
+    }
+}
+
+/// One direction of a parent-and-child handshake over a pipe.
+///
+/// Both ends are held until the fork, then each side keeps the one it uses. A
+/// read that ends without a byte means the other side died, which every caller
+/// here treats as a refusal rather than as permission to carry on.
+struct Relay {
+    read: OwnedFd,
+    write: OwnedFd,
+}
+
+struct Reader(OwnedFd);
+struct Writer(OwnedFd);
+
+impl Relay {
+    fn new() -> io::Result<Self> {
+        let mut fds = [0 as libc::c_int; 2];
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            read: unsafe { OwnedFd::from_raw_fd(fds[0]) },
+            write: unsafe { OwnedFd::from_raw_fd(fds[1]) },
+        })
+    }
+
+    fn into_reader(self) -> Reader {
+        Reader(self.read)
+    }
+
+    fn into_writer(self) -> Writer {
+        Writer(self.write)
+    }
+}
+
+impl Reader {
+    fn wait(&self) -> io::Result<()> {
+        let mut byte = [0u8; 1];
+        let read = unsafe { libc::read(self.0.as_raw_fd(), byte.as_mut_ptr().cast(), 1) };
+        if read == 1 {
+            Ok(())
+        } else {
+            Err(io::Error::from(io::ErrorKind::UnexpectedEof))
+        }
+    }
+}
+
+impl Writer {
+    fn send(&self) -> io::Result<()> {
+        let byte = [1u8; 1];
+        let written = unsafe { libc::write(self.0.as_raw_fd(), byte.as_ptr().cast(), 1) };
+        if written == 1 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+}
+
+/// Wait for the child and report the status a shell would.
+fn reap(child: libc::pid_t) -> i32 {
+    let mut status = 0;
+    if unsafe { libc::waitpid(child, &mut status, 0) } < 0 {
+        return 1;
+    }
+    if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else if libc::WIFSIGNALED(status) {
+        128 + libc::WTERMSIG(status)
+    } else {
+        1
+    }
 }
 
 /// Whether the host holds a routable IPv6 address of its own.
@@ -799,21 +872,23 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
     // Wrap before the hooks and the backend, so the confinement, the cgroup,
     // and the pre-launch hooks all run in the inner process that pasta places
     // in the private namespace, never twice.
-    if args.in_proxy_netns.is_none()
-        && let Some(code) = wrap_in_private_namespace(&resolved.policy, &args)?
-    {
-        return Ok(code);
-    }
+    let made_the_namespace = match wrap_in_private_namespace(&resolved.policy, &args)? {
+        Wrapped::Parent(code) => return Ok(code),
+        Wrapped::Creator => true,
+        Wrapped::Unwrapped => false,
+    };
 
     // Inside the namespace now, whether by the wrap above or a re-exec into it.
     // The lockdown goes on before the target is confined and run, so there is
     // no window in which the target has both a network and no egress rule.
     if let Some(proxy) = &args.egress_proxy {
-        if !left_namespace(args.in_proxy_netns.as_deref()) {
+        // Only the process that created the namespace installs a rule in it.
+        // This is not a check on something a caller said; it is which branch of
+        // the fork above this process took, and a caller cannot choose that.
+        if !made_the_namespace {
             anyhow::bail!(
-                "--egress-proxy installs its firewall rule inside a private network \
-                 namespace, and this process is still in the one it started from; \
-                 refusing to change it"
+                "--egress-proxy installs its firewall rule in a network namespace of \
+                 this run's own, and none was created; the run is refused"
             );
         }
         let (addr, port) = parse_egress_proxy(proxy)?;
@@ -823,7 +898,7 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
         // address, so permitting its port here widens nothing a session can
         // reach; it only stops Landlock from refusing the one allowed hop.
         permit_broker_port(&mut resolved.policy, port);
-    } else if args.in_proxy_netns.is_some() {
+    } else if made_the_namespace {
         // Plain --proxy-net still forwards the namespace loopback to the host,
         // so a session could reach a host service on an allowed port. Drop that
         // reach. Best-effort here, matching --proxy-net's own degradation: the
@@ -1773,66 +1848,6 @@ mod tests {
         permit_broker_port(&mut open, 8443);
         assert_eq!(open.network.egress, Egress::AllowAll);
     }
-
-    #[test]
-    fn egress_proxy_is_threaded_into_the_inner_invocation() {
-        let cli = Cli::parse_from([
-            "bailey",
-            "run",
-            "--egress-proxy",
-            "169.254.169.1:8443",
-            "--",
-            "/bin/true",
-        ]);
-        let Command::Run(args) = cli.command else {
-            panic!("expected run")
-        };
-        let inner = inner_invocation(&args);
-        let joined: Vec<String> = inner
-            .iter()
-            .map(|s| s.to_string_lossy().into_owned())
-            .collect();
-        assert!(joined.iter().any(|a| a == "--egress-proxy"));
-        assert!(joined.iter().any(|a| a == "169.254.169.1:8443"));
-        assert!(joined.iter().any(|a| a == "--in-proxy-netns"));
-    }
-
-    #[test]
-    fn the_inner_invocation_confines_and_never_wraps_again() {
-        let cli = Cli::parse_from([
-            "bailey",
-            "run",
-            "--config",
-            "/p/policy.toml",
-            "--proxy-net",
-            "--",
-            "/bin/echo",
-            "-n",
-            "hi",
-        ]);
-        let Command::Run(args) = cli.command else {
-            panic!("expected a run command");
-        };
-
-        let inner: Vec<String> = inner_invocation(&args)
-            .into_iter()
-            .map(|part| part.to_string_lossy().into_owned())
-            .collect();
-
-        // The marker is present, so the inner run confines rather than wrapping.
-        assert!(inner.contains(&"--in-proxy-netns".to_string()), "{inner:?}");
-        // The wrapping flag is not carried in, or it would loop.
-        assert!(!inner.contains(&"--proxy-net".to_string()), "{inner:?}");
-        // The config crosses, and the target sits after `--`, so a leading dash
-        // in its own arguments cannot be read as a bailey option.
-        let sep = inner.iter().position(|p| p == "--").expect("a separator");
-        assert_eq!(&inner[sep + 1..], &["/bin/echo", "-n", "hi"]);
-        assert!(
-            inner[..sep].contains(&"/p/policy.toml".to_string()),
-            "{inner:?}"
-        );
-    }
-
     #[test]
     fn a_global_v6_address_is_what_marks_the_host_as_reachable() {
         // A global-scope address on wlan0 (scope 00), alongside loopback and a
@@ -1870,30 +1885,6 @@ fe80000000000000869e56fffe032b71 04 40 20 80    wlan0
         let missing = nothing_observed(127);
         assert!(missing.contains("did not do its work"), "{missing}");
         assert!(missing.contains(world::SANDBOX_PATH), "{missing}");
-    }
-}
-
-#[cfg(test)]
-mod netns_guard_tests {
-    use super::{is_netns_link, left_namespace};
-
-    #[test]
-    fn only_a_real_namespace_link_is_evidence() {
-        assert!(is_netns_link("net:[4026531833]"));
-        assert!(!is_netns_link("unknown"));
-        assert!(!is_netns_link("net:[]"));
-        assert!(!is_netns_link("net:[abc]"));
-        assert!(!is_netns_link(""));
-    }
-
-    #[test]
-    fn a_missing_or_unusable_claim_is_refused() {
-        // Nothing said, and something said that is not a namespace.
-        assert!(!left_namespace(None));
-        assert!(!left_namespace(Some("unknown")));
-        // The namespace this test runs in is not one it left.
-        let mine = std::fs::read_link("/proc/self/ns/net").unwrap();
-        assert!(!left_namespace(Some(&mine.to_string_lossy())));
     }
 }
 

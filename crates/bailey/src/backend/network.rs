@@ -153,6 +153,31 @@ pub fn report(mode: NetworkMode, policy: &Policy, inherited: Inherited) {
 /// root: nothing here needs privileged operations beyond creating the namespace,
 /// and keeping the uid unchanged keeps file ownership looking the same to the
 /// target.
+/// Create the network namespace an egress proxy is bounded by.
+///
+/// Mapped to root inside, where the target's own namespace is mapped to the
+/// caller's uid. The lockdown rule is installed by running `nft`, and a process
+/// that is not uid 0 in its user namespace loses its capabilities on `execve`,
+/// so the helper would arrive without the one capability it needs over the
+/// namespace it was started for. pasta mapped to root for the same reason when
+/// it was the one creating this namespace.
+///
+/// The target is unaffected: the isolation layer builds its own user namespace
+/// nested in this one and maps the caller's uid there, which is what a program
+/// that refuses to run as root, or authenticates over D-Bus, needs to see.
+pub fn enter_proxy_namespace() -> io::Result<()> {
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+
+    unshare(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNET | CloneFlags::CLONE_NEWIPC)
+        .map_err(errno)?;
+    fs::write("/proc/self/setgroups", "deny")?;
+    fs::write("/proc/self/gid_map", format!("0 {gid} 1"))?;
+    fs::write("/proc/self/uid_map", format!("0 {uid} 1"))?;
+
+    bring_loopback_up()
+}
+
 pub fn enter_isolated() -> io::Result<()> {
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
@@ -270,6 +295,24 @@ mod tests {
         // Without user namespaces there is no private namespace to keep.
         assert_eq!(select(&policy, false), NetworkMode::LandlockOnly);
         assert!(!bind_is_loopback_only(&policy, NetworkMode::LandlockOnly));
+    }
+
+    /// A proxied run makes its own network namespace before the backend is
+    /// reached, so the backend must not make a second one and throw away the
+    /// one pasta configured. The broker's port is added to the policy before
+    /// the mode is chosen, which is what keeps this true; a change that stops
+    /// doing so would take the egress rule with it.
+    #[test]
+    fn a_proxied_run_is_not_given_a_second_network_namespace() {
+        // What `permit_broker_port` leaves behind for a brokered run.
+        let policy = policy_with(NetworkPolicy {
+            egress: Egress::Allow(vec![EgressRule {
+                host: "*".to_string(),
+                port: Some(8443),
+            }]),
+            bind_ports: Vec::new(),
+        });
+        assert_eq!(select(&policy, true), NetworkMode::LandlockOnly);
     }
 
     /// A policy that allows egress still needs the host's network.

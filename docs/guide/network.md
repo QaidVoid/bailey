@@ -118,6 +118,13 @@ it does not. The lockdown is the enforcement, and it is fail-closed: if the
 netfilter rule cannot be installed, or pasta or user namespaces are missing,
 the run is refused rather than left with open egress. `nft` must be present.
 
+bailey creates the network namespace itself and then has pasta configure it,
+rather than the other way round. The rule is installed by the process that made
+the namespace, which is the only way to know which namespace it lands in: a
+process that has to be told cannot check the answer, because whatever it is told
+the caller chose. There is no flag that says "this run is already inside a
+namespace", and a caller cannot ask for the rule to be installed anywhere.
+
 ## Scoping
 
 Independently of the mode, on Linux 6.12 and later bailey asks Landlock to scope
