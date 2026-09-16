@@ -143,7 +143,10 @@ pub fn enter_isolated() -> io::Result<()> {
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
 
-    unshare(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNET).map_err(errno)?;
+    // The IPC namespace comes along here too: SysV and POSIX IPC objects are
+    // not files, so nothing in the filesystem policy can withhold them.
+    unshare(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNET | CloneFlags::CLONE_NEWIPC)
+        .map_err(errno)?;
     fs::write("/proc/self/setgroups", "deny")?;
     fs::write("/proc/self/gid_map", format!("{gid} {gid} 1"))?;
     fs::write("/proc/self/uid_map", format!("{uid} {uid} 1"))?;

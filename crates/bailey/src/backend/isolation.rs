@@ -167,7 +167,14 @@ pub fn enter(plan: &IsolationPlan) -> io::Result<()> {
     // UTS as well, so the target is not told the machine's name. Denying
     // /etc/hostname is not enough: `uname` is a syscall, and a program that
     // asks the kernel gets the real name however the filesystem is confined.
-    let mut flags = CloneFlags::CLONE_NEWNS | CloneFlags::CLONE_NEWPID | CloneFlags::CLONE_NEWUTS;
+    // SysV segments, message queues, semaphores and POSIX mqueues are not
+    // files, so no filesystem policy can reach them. Without this namespace
+    // they are shared with every process of the same user outside the sandbox,
+    // and `/proc/sysvipc` lists them.
+    let mut flags = CloneFlags::CLONE_NEWNS
+        | CloneFlags::CLONE_NEWPID
+        | CloneFlags::CLONE_NEWUTS
+        | CloneFlags::CLONE_NEWIPC;
     if plan.network {
         flags |= CloneFlags::CLONE_NEWNET;
     }
