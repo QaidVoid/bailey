@@ -699,6 +699,13 @@ fn parse_size(spec: &str) -> Result<u64, String> {
         .trim()
         .parse()
         .map_err(|_| format!("invalid size `{spec}`"))?;
+    // A negative or infinite size casts to a wrapped value rather than
+    // failing, and the strictest possible limit is what a typo would produce:
+    // `memory = "-1"` would mean every allocation fails, which reads as a bug
+    // in the program rather than in the policy.
+    if !number.is_finite() || number.is_sign_negative() {
+        return Err(format!("size `{spec}` must be zero or more"));
+    }
     let multiplier: f64 = match suffix.trim().to_ascii_lowercase().as_str() {
         "" | "b" => 1.0,
         "k" | "kb" => 1_000.0,
@@ -711,7 +718,11 @@ fn parse_size(spec: &str) -> Result<u64, String> {
         "tib" => 1_099_511_627_776.0,
         other => return Err(format!("unknown size suffix `{other}` in `{spec}`")),
     };
-    Ok((number * multiplier) as u64)
+    let bytes = number * multiplier;
+    if bytes > u64::MAX as f64 {
+        return Err(format!("size `{spec}` is larger than this can express"));
+    }
+    Ok(bytes as u64)
 }
 
 fn resolve_path(raw: &str, base: &Path) -> Option<PathBuf> {
@@ -902,6 +913,20 @@ mod tests {
         let resolved = merge(&layers).unwrap();
         assert!(resolved.policy.denied.is_empty());
         assert_eq!(resolved.policy.filesystem[0].path, PathBuf::from("/a"));
+    }
+
+    #[test]
+    fn a_negative_or_unrepresentable_size_is_refused() {
+        // These reached the run as the strictest possible limit, which reads
+        // as a broken program rather than a broken policy.
+        assert!(parse_size("-1").is_err());
+        assert!(parse_size("-5m").is_err());
+        assert!(parse_size("1e30").is_err());
+        assert!(parse_size("-0.5g").is_err());
+
+        assert_eq!(parse_size("0"), Ok(0));
+        assert_eq!(parse_size("4g"), Ok(4_000_000_000));
+        assert_eq!(parse_size("1kib"), Ok(1_024));
     }
 
     #[test]
