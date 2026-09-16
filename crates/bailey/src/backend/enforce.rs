@@ -644,6 +644,30 @@ fn sweep_stale_staging() {
     }
 }
 
+/// The host path behind one the target sees, following a relocated grant.
+fn to_host_path(policy: &Policy, path: &Path) -> PathBuf {
+    for rule in &policy.filesystem {
+        if let Some(at) = &rule.at
+            && let Ok(rest) = path.strip_prefix(at)
+        {
+            return rule.path.join(rest);
+        }
+    }
+    path.to_path_buf()
+}
+
+/// Where the target sees a host path, following a relocated grant.
+fn to_visible_path(policy: &Policy, path: &Path) -> PathBuf {
+    for rule in &policy.filesystem {
+        if let Some(at) = &rule.at
+            && let Ok(rest) = path.strip_prefix(&rule.path)
+        {
+            return at.join(rest);
+        }
+    }
+    path.to_path_buf()
+}
+
 fn build_isolation_plan(
     policy: &Policy,
     mode: NetworkMode,
@@ -652,7 +676,16 @@ fn build_isolation_plan(
 ) -> IsolationPlan {
     sweep_stale_staging();
 
-    let denied = |path: &Path| policy.denied.iter().any(|deny| path.starts_with(deny));
+    // A deny or a read-only island may be written either where the host keeps
+    // the path or where the target will see it, and a relocated grant makes
+    // those different. Each is put into the terms the step that uses it works
+    // in, or it matches nothing and is silently dropped.
+    let denied_paths: Vec<PathBuf> = policy
+        .denied
+        .iter()
+        .map(|path| to_host_path(policy, path))
+        .collect();
+    let denied = |path: &Path| denied_paths.iter().any(|deny| path.starts_with(deny));
 
     let relocation: BTreeMap<PathBuf, PathBuf> = policy
         .filesystem
@@ -731,8 +764,7 @@ fn build_isolation_plan(
         });
     }
 
-    let conceal = policy
-        .denied
+    let conceal = denied_paths
         .iter()
         .filter_map(|path| {
             // Concealment covers a denied path where it ends up, which is not
@@ -750,7 +782,13 @@ fn build_isolation_plan(
         })
         .collect();
 
-    let mut read_only = policy.read_only.clone();
+    // The remount happens inside the reconstructed root, so an island is named
+    // where the target sees it.
+    let mut read_only: Vec<PathBuf> = policy
+        .read_only
+        .iter()
+        .map(|path| to_visible_path(policy, path))
+        .collect();
     read_only.extend(unwritable_beneath_implicit(policy, world, implicit_write));
     read_only.extend(metadata_read_only(policy));
     read_only.sort();
@@ -1435,6 +1473,35 @@ mod tests {
         assert!(
             exited,
             "subvolume ioctls were not denied, or a benign ioctl was"
+        );
+    }
+
+    #[test]
+    fn a_deny_under_a_relocated_grant_is_concealed() {
+        let mut policy = Policy::default();
+        policy.filesystem.push(FsRule {
+            path: PathBuf::from("/host/data"),
+            access: Access::READ | Access::WRITE,
+            at: Some(PathBuf::from("/workspace")),
+        });
+        // Written where the target sees it, which is the only path an operator
+        // reading the policy could name.
+        policy.denied.push(PathBuf::from("/workspace/secret"));
+
+        assert_eq!(
+            to_host_path(&policy, Path::new("/workspace/secret")),
+            PathBuf::from("/host/data/secret")
+        );
+        // And back the other way, for an island that is remounted inside the
+        // reconstructed root.
+        assert_eq!(
+            to_visible_path(&policy, Path::new("/host/data/logs")),
+            PathBuf::from("/workspace/logs")
+        );
+        // A path under no relocation is left as it was written.
+        assert_eq!(
+            to_host_path(&policy, Path::new("/etc/passwd")),
+            PathBuf::from("/etc/passwd")
         );
     }
 
