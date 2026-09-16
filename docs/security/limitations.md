@@ -24,6 +24,34 @@ A full `egress = "deny"`, which is the default, has neither problem: the target
 gets its own network namespace with no route off the host and no access to your
 loopback, so every protocol fails.
 
+### UNIX sockets are not part of the egress policy
+
+The ruleset is written against Landlock ABI 6. A right the ruleset does not
+handle is not restricted at all, so the rights added after that ABI are invisible
+to a run however new the kernel is. The one that matters here is the check on
+connecting to a pathname UNIX socket, which arrived in ABI 9.
+
+So "egress denied" is about TCP. A socket in a directory the policy grants for
+writing can still be connected to, and the profiles that need a session bus
+grant the whole of `${XDG_RUNTIME_DIR}`, which is where the session bus,
+`ssh-agent`, `gpg-agent` and PipeWire all keep theirs. Raising the ABI alone
+would start refusing those connects and break the profiles that rely on them:
+what the grant is really saying is "let this program create its own socket
+here", and separating that from "let it connect to every socket already here"
+needs a policy of its own rather than a wider right.
+
+Where that matters, grant a narrower directory than the whole runtime directory.
+
+### Binding a port costs the network namespace
+
+The isolated network namespace is chosen only for a policy that denies egress
+and binds nothing. A policy that denies egress but binds a port keeps the host's
+network namespace, because a port bound inside a private one would not be
+reachable from the host, which is the point of binding it. Landlock then gates
+TCP ports and nothing else, so UDP, QUIC, DNS and ICMP are unrestricted for that
+run. The summary says `landlock only (TCP ports; other protocols unrestricted)`;
+what it does not say is that a `bind_ports` entry is what asked for it.
+
 ### Host and CIDR rules are advisory
 
 `egress_allow = [{ host = "example.com", port = 443 }]` enforces the port and
