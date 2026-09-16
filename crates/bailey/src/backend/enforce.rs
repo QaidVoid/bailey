@@ -330,6 +330,12 @@ impl EnforceBackend {
                 if let Some(bytes) = file_bytes {
                     set_file_size_limit(bytes)?;
                 }
+                // A process may raise its own soft limit as far as the hard
+                // one, so leaving the hard limit unlimited lets a target
+                // arrange its own core dump. Where that dump goes is the
+                // host's `core_pattern`, which may be a program that runs
+                // outside the sandbox with the target's memory.
+                set_no_core_dumps()?;
                 if stop_before_exec {
                     // Trace ourselves, so the kernel stops this process at
                     // `execve` rather than before it. Stopping earlier would
@@ -936,6 +942,18 @@ fn set_no_new_privs() -> io::Result<()> {
 ///
 /// Exceeding it raises SIGXFSZ, and a write past the limit fails with EFBIG
 /// for a process that handles or ignores the signal.
+/// Pin `RLIMIT_CORE` to zero, hard as well as soft.
+fn set_no_core_dumps() -> io::Result<()> {
+    let limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 fn set_file_size_limit(bytes: u64) -> io::Result<()> {
     let limit = libc::rlimit {
         rlim_cur: bytes as libc::rlim_t,
@@ -1010,6 +1028,13 @@ fn denied_syscalls() -> &'static [i64] {
         libc::SYS_io_uring_register,
         libc::SYS_chroot,
         libc::SYS_quotactl,
+        // Same-uid cross-process reach that neither Landlock nor the namespace
+        // covers.
+        libc::SYS_kcmp,
+        libc::SYS_process_madvise,
+        libc::SYS_process_mrelease,
+        // Bounded only by the ambient memlock limit, which is the host's.
+        libc::SYS_mlockall,
     ]
 }
 
@@ -1392,6 +1417,10 @@ mod tests {
             libc::SYS_io_uring_register,
             libc::SYS_chroot,
             libc::SYS_quotactl,
+            libc::SYS_kcmp,
+            libc::SYS_process_madvise,
+            libc::SYS_process_mrelease,
+            libc::SYS_mlockall,
         ] {
             assert!(denied.contains(&nr), "syscall {nr} should be denied");
         }
