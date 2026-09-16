@@ -2,9 +2,6 @@
 
 ## [0.2.0](https://github.com/QaidVoid/bailey/compare/v0.1.4...v0.2.0) - 2026-09-16
 
-This release closes 21 findings from a security review. Five of them change
-behaviour, so a policy or a host that worked before may not now.
-
 ### ⚠️ Behaviour changes
 
 - **A read grant no longer carries execute.** The two are separate rights now.
