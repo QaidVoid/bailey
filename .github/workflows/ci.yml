@@ -45,6 +45,39 @@ jobs:
       - name: Test
         run: cargo test
 
+  # The shipped binaries are musl, and musl changes what the code does, not
+  # just whether it builds: Rust std silently drops `O_PATH` from
+  # `OpenOptions` custom flags there, because musl's `O_ACCMODE` contains
+  # its bit. No glibc run can observe that degradation, so the unit tests
+  # run as the release target too (issue #32). The integration tests stay
+  # on the host job: they need a sandbox the runner provides, and what they
+  # exercise does not vary by target.
+  musl:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: musl
+
+      - name: Install the musl linker
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Check everything compiles for the release target
+        run: cargo check --all-targets --target x86_64-unknown-linux-musl
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+
+      - name: Unit tests on the release target
+        run: cargo test --target x86_64-unknown-linux-musl --lib
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+
   # The eBPF programs, checked for the BPF target.
   #
   # This compiles them but does not link them: linking needs bpf-linker, which
