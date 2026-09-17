@@ -14,14 +14,15 @@
 
 use std::collections::BTreeMap;
 use std::io;
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use enumflags2::BitFlags;
 use landlock::{
-    ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, NetPort, PathBeneath, PathFd,
-    PathFdError, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus, Scope,
+    ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, NetPort, PathBeneath, Ruleset,
+    RulesetAttr, RulesetCreatedAttr, RulesetStatus, Scope,
 };
 
 use crate::backend::cgroup;
@@ -600,7 +601,7 @@ impl LandlockPlan {
 
         let mut created = ruleset.create().map_err(landlock_err)?;
         for (path, access) in &self.filesystem {
-            match PathFd::new(path) {
+            match open_beneath(path) {
                 Ok(fd) => {
                     created = created
                         .add_rule(PathBeneath::new(fd, *access))
@@ -610,17 +611,12 @@ impl LandlockPlan {
                 // aborting the whole run. Anything else means the rule could
                 // not be installed for a reason the policy did not ask for,
                 // and carrying on would report a grant that is not there.
-                Err(PathFdError::OpenCall { source, .. })
-                    if source.kind() == std::io::ErrorKind::NotFound => {}
-                Err(PathFdError::OpenCall { source, .. }) => {
+                Err(source) if source.kind() == io::ErrorKind::NotFound => {}
+                Err(source) => {
                     // Only an errno crosses back to the parent from here, so
                     // what went wrong is said on the way out.
                     eprintln!("bailey: could not grant {}: {source}", path.display());
                     return Err(source);
-                }
-                Err(error) => {
-                    eprintln!("bailey: could not grant {}: {error}", path.display());
-                    return Err(io::Error::from_raw_os_error(libc::EINVAL));
                 }
             }
         }
@@ -969,6 +965,27 @@ fn is_kernel_filesystem(path: &Path) -> bool {
         return false;
     }
     KERNEL_MAGIC.contains(&(buf.f_type as i64))
+}
+
+/// Open a granted path so Landlock can name it, without opening what it is.
+///
+/// `O_PATH` is what a grant needs: naming a path is not the same as reading it,
+/// and a device such as `/dev/tty` opens only where there is a controlling
+/// terminal, so a plain read fails on a host that has none even though the
+/// grant is valid.
+///
+/// Opened here rather than with landlock's `PathFd` because `std`'s
+/// `OpenOptions` masks custom flags with `!O_ACCMODE`, and musl defines
+/// `O_ACCMODE` to include `O_SEARCH`, so on a musl build the `O_PATH` that
+/// helper asks for is dropped and the open becomes a plain read.
+fn open_beneath(path: &Path) -> io::Result<OwnedFd> {
+    let raw = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+        .map_err(|_| io::Error::other("a granted path holds a nul"))?;
+    let fd = unsafe { libc::open(raw.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 fn fs_access_bits(access: policy::Access) -> Option<BitFlags<AccessFs>> {
@@ -1561,6 +1578,31 @@ mod tests {
         // Default egress is DenyAll, so connect is handled with no allowed ports.
         assert!(plan.handle_connect);
         assert!(plan.connect_ports.is_empty());
+    }
+
+    #[test]
+    fn a_grant_is_named_by_an_fd_that_did_not_open_it() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::PermissionsExt;
+
+        // `O_PATH` is what makes a grant a name rather than a read: a device
+        // such as `/dev/tty` opens only where there is a controlling terminal,
+        // and a file the caller may not read is still a path a policy can
+        // grant. The flag is checked as well as the open, because the open
+        // alone would also succeed for a caller running as root.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("closed");
+        std::fs::write(&path, b"x").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let fd = open_beneath(&path).unwrap();
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0, "fcntl(F_GETFL) failed");
+        assert_ne!(
+            flags & libc::O_PATH,
+            0,
+            "the grant was opened without O_PATH"
+        );
     }
 
     #[test]
