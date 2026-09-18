@@ -191,19 +191,43 @@ fn a_process_limit_holds_without_a_cgroup() {
         .lines()
         .find(|line| line.starts_with("Max processes"))
         .unwrap_or_default();
-    assert!(
-        line.split_whitespace()
-            .filter(|field| *field == "7")
-            .count()
-            == 2,
-        "the process limit must reach the target, soft and hard: {line:?}"
-    );
-
     let reported = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        reported.contains("process limit"),
-        "the process limit must be reported as enforced: {reported}"
-    );
+    // The summary line rather than the whole of stderr: a host without user
+    // namespaces warns that it is "running without namespace isolation", which
+    // names the layer it is saying is absent.
+    let summary = reported
+        .lines()
+        .find(|line| line.starts_with("bailey: enforced:"))
+        .unwrap_or_default();
+
+    // The rlimit bounds what it should only inside a user namespace of the
+    // run's own, so which case this host is is what the summary says. Where
+    // unprivileged user namespaces are restricted, Ubuntu's default among them,
+    // the limit must stay off rather than count the caller's own processes.
+    let namespaced =
+        summary.contains("namespace isolation") || summary.contains("network namespace");
+    if namespaced {
+        assert!(
+            line.split_whitespace()
+                .filter(|field| *field == "7")
+                .count()
+                == 2,
+            "the process limit must reach the target, soft and hard: {line:?}"
+        );
+        assert!(
+            summary.contains("process limit"),
+            "the process limit must be reported as enforced: {reported}"
+        );
+    } else {
+        assert!(
+            !summary.contains("process limit"),
+            "without a user namespace the limit must not be claimed: {reported}"
+        );
+        assert!(
+            reported.contains("not enforced, resource limits"),
+            "without a user namespace the limit must be reported skipped: {reported}"
+        );
+    }
 }
 
 /// The limit is an rlimit, so unlike the cgroup limits it needs no delegated
