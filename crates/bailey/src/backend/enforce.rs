@@ -487,28 +487,25 @@ impl Confined {
 
 /// Open a granted path for Landlock without opening the file itself.
 ///
-/// This is `O_PATH`: it names the path for the rule below while performing
-/// no device open and requiring no permission on the file. That is what lets
-/// a grant on `/dev/tty` install when there is no controlling terminal, and
-/// what lets a grant on something unreadable install at all.
+/// `O_PATH` names the path while performing no device open and requiring no
+/// permission on the file, which is what lets a grant install on `/dev/tty`
+/// where there is no controlling terminal, and on anything unreadable.
 ///
-/// It is written against `libc::open` rather than `landlock::PathFd::new`
-/// on purpose. `PathFd` opens through `std::fs::OpenOptions`, which masks
-/// custom flags with `!O_ACCMODE`, and on musl targets `O_ACCMODE` contains
-/// the `O_PATH` bit, so std silently drops it and the open degrades to a
-/// plain `O_RDONLY`. Both shipped binaries are musl, so every grant there
-/// became a read open: `/dev/tty` failed with `ENXIO` under a daemon, and
-/// any granted-but-unreadable path would fail the whole run the same way.
+/// Written against `libc::open` rather than `landlock::PathFd::new`, which
+/// opens through `std::fs::OpenOptions`: that masks custom flags with
+/// `!O_ACCMODE`, and musl counts `O_PATH` within `O_ACCMODE`, so the flag is
+/// dropped and the open degrades to a plain read. Both shipped binaries are
+/// musl, where that failed every run with an unopenable grant.
 fn open_grant(path: &Path) -> io::Result<OwnedFd> {
     let raw = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("grant holds a nul byte: {}", path.display()),
         )
-    });
+    })?;
     // SAFETY: `raw` is a valid nul-terminated string, and the returned
     // descriptor, when non-negative, is owned from here on.
-    let fd = unsafe { libc::open(raw?.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+    let fd = unsafe { libc::open(raw.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
     if fd < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -1512,13 +1509,8 @@ mod tests {
 
     /// A grant descriptor must be path-only: reading through it fails.
     ///
-    /// This is what proves the `O_PATH` survived. `landlock::PathFd::new`
-    /// opens through `std::fs::OpenOptions`, which on musl targets silently
-    /// drops `O_PATH` (there `O_ACCMODE` contains its bit), degrading every
-    /// grant to a plain read open. A test that only opened the path would
-    /// pass on both; a read through a degraded descriptor succeeds, while a
-    /// read through a path-only one fails with `EBADF`, so this fails on the
-    /// old code exactly where the shipped binaries failed (issue #32).
+    /// This is what proves the `O_PATH` survived. A descriptor that lost it
+    /// still opens the path, so only the read tells the two apart.
     fn assert_path_only(fd: &OwnedFd) {
         use std::os::fd::AsFd;
         let file = std::fs::File::from(fd.as_fd().try_clone_to_owned().unwrap());
@@ -1537,12 +1529,11 @@ mod tests {
     }
 
     #[test]
-    fn a_tty_grant_installs_without_a_controlling_terminal() {
-        // The daemon case from issue #32: `/dev/tty` exists as a node but a
-        // plain open of it fails with `ENXIO` when there is no controlling
-        // terminal. The grant must still install, because naming the path
-        // performs no device open. Skipped only where the node itself is
-        // absent, which is about this host rather than the grant.
+    fn a_tty_grant_installs_without_opening_the_device() {
+        // The daemon case from issue #32: a plain open of `/dev/tty` fails
+        // with `ENXIO` where there is no controlling terminal, and naming it
+        // must not. Skipped where the node itself is absent, which is about
+        // the host rather than the grant.
         if !Path::new("/dev/tty").exists() {
             return;
         }
@@ -1670,10 +1661,8 @@ mod tests {
             let mut errno_of = |req: libc::c_ulong| -> i32 {
                 unsafe {
                     *libc::__errno_location() = 0;
-                    // `ioctl` takes the request as `c_ulong` on glibc and
-                    // `c_int` on musl. Every request number here fits in 32
-                    // bits, as all ioctl encodings do, so the cast is
-                    // lossless on either target.
+                    // The request is `c_ulong` on glibc and `c_int` on musl,
+                    // and an ioctl encoding fits in 32 bits either way.
                     libc::ioctl(fd, req as _, &mut out);
                     *libc::__errno_location()
                 }
