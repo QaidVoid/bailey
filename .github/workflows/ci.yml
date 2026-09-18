@@ -45,6 +45,30 @@ jobs:
       - name: Test
         run: cargo test
 
+  # The shipped binaries are musl, where the same source behaves differently:
+  # std drops `O_PATH` from a custom open flag because musl's `O_ACCMODE`
+  # contains its bit, which no glibc run can observe (issue #32). The
+  # integration tests stay on the host job, since what they exercise is the
+  # runner's sandbox rather than anything that varies by target.
+  musl:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: musl
+
+      - name: Check everything compiles for the release target
+        run: cargo check --all-targets --target x86_64-unknown-linux-musl
+
+      - name: Unit tests on the release target
+        run: cargo test --target x86_64-unknown-linux-musl --lib
+
   # The eBPF programs, checked for the BPF target.
   #
   # This compiles them but does not link them: linking needs bpf-linker, which
