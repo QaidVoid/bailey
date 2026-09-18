@@ -560,6 +560,48 @@ enum Wrapped {
     Unwrapped,
 }
 
+/// What pasta is asked for: a private network for egress, and nothing else.
+///
+/// No port is forwarded in either direction. pasta defaults every forwarding
+/// option to `auto`, which mirrors each port bound on the host into the
+/// namespace and each port bound in the namespace back out to the host. The
+/// namespace serves nothing, so the outbound half buys nothing. The inbound
+/// half is worse than nothing: the mirrored sockets appear in the namespace's
+/// own `/proc/net` tables, which hands a confined program an inventory of the
+/// host's services, loopback-only ones included. The netfilter rule already
+/// refuses to carry a connection to any of them, but the list by itself says
+/// what runs on this host and on which port.
+///
+/// `egress_addr` is the broker's namespace-visible address, when there is one.
+/// The host's loopback is mapped to it so a connection there reaches the
+/// broker; the plain `--proxy-net` path maps no host at all.
+///
+/// IPv6 only where the host has it: handing the namespace a v6 route the host
+/// cannot follow would leave a program stalling on v6 before it fell back.
+fn pasta_arguments(egress_addr: Option<&str>, host_has_ipv6: bool) -> Vec<String> {
+    let mut pasta_args: Vec<String> = ["--config-net", "--quiet", "--no-map-gw"]
+        .iter()
+        .map(|arg| (*arg).to_owned())
+        .collect();
+    for forwarding in ["-t", "-u", "-T", "-U"] {
+        pasta_args.push(forwarding.to_owned());
+        pasta_args.push("none".to_owned());
+    }
+    if let Some(addr) = egress_addr {
+        pasta_args.push("--map-host-loopback".to_owned());
+        pasta_args.push(addr.to_owned());
+    }
+    pasta_args.push("-a".to_owned());
+    pasta_args.push(PROXY_ADDRESS_V4.to_owned());
+    if host_has_ipv6 {
+        pasta_args.push("-a".to_owned());
+        pasta_args.push(PROXY_ADDRESS_V6.to_owned());
+    } else {
+        pasta_args.push("-4".to_owned());
+    }
+    pasta_args
+}
+
 fn wrap_in_private_namespace(
     policy: &crate::policy::Policy,
     args: &RunArgs,
@@ -624,28 +666,11 @@ fn wrap_in_private_namespace(
     //
     // IPv6 only where the host has it: handing the namespace a v6 route the host
     // cannot follow would leave a program stalling on v6 before it fell back.
-    let mut pasta_args: Vec<&str> = vec!["--config-net", "--quiet", "--no-map-gw"];
-    // Under an egress proxy the namespace must be able to reach the broker,
-    // which listens on the host's loopback. Map that loopback to the broker's
-    // namespace-visible address so a connection to it reaches the host; the
-    // netfilter rule installed inside the namespace then allows only that one
-    // destination. Kept off the plain --proxy-net path, which maps no host.
     let egress_addr = match &args.egress_proxy {
         Some(value) => Some(parse_egress_proxy(value)?.0.to_string()),
         None => None,
     };
-    if let Some(addr) = &egress_addr {
-        pasta_args.push("--map-host-loopback");
-        pasta_args.push(addr);
-    }
-    pasta_args.push("-a");
-    pasta_args.push(PROXY_ADDRESS_V4);
-    if host_has_ipv6() {
-        pasta_args.push("-a");
-        pasta_args.push(PROXY_ADDRESS_V6);
-    } else {
-        pasta_args.push("-4");
-    }
+    let pasta_args = pasta_arguments(egress_addr.as_deref(), host_has_ipv6());
     // The namespace is made here rather than by pasta, and pasta is pointed at
     // it. Whoever installs the lockdown rule has to know which namespace it
     // lands in, and that cannot be established by looking: every reference a
@@ -1808,6 +1833,43 @@ fn access_flags(access: Access) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// pasta forwards every bound port in both directions unless told not to,
+    /// and a forwarded host port shows up in the namespace's own `/proc/net`
+    /// tables. A confined program reading those gets a list of what this host
+    /// runs and where, loopback-only services included, without ever opening a
+    /// connection for the netfilter rule to refuse.
+    #[test]
+    fn a_private_network_forwards_no_port_in_either_direction() {
+        let args = pasta_arguments(Some("169.254.169.1"), true);
+
+        for forwarding in ["-t", "-u", "-T", "-U"] {
+            let at = args
+                .iter()
+                .position(|arg| arg == forwarding)
+                .unwrap_or_else(|| panic!("{forwarding} must be named, or it defaults to auto"));
+            assert_eq!(args[at + 1], "none", "{forwarding} must forward nothing");
+        }
+
+        // The broker is still reachable: that is the one thing the namespace
+        // is allowed to talk to, and it is a mapping rather than a forward.
+        let at = args
+            .iter()
+            .position(|arg| arg == "--map-host-loopback")
+            .expect("the broker's address is mapped");
+        assert_eq!(args[at + 1], "169.254.169.1");
+    }
+
+    /// Without an egress proxy no host address is mapped at all, and a host
+    /// with no IPv6 gets none rather than a route it cannot follow.
+    #[test]
+    fn a_plain_private_network_maps_no_host_and_no_absent_route() {
+        let args = pasta_arguments(None, false);
+
+        assert!(!args.iter().any(|arg| arg == "--map-host-loopback"));
+        assert!(args.iter().any(|arg| arg == "-4"));
+        assert!(!args.iter().any(|arg| arg == PROXY_ADDRESS_V6));
+    }
 
     #[test]
     fn an_egress_proxy_value_parses_into_an_address_and_port() {
