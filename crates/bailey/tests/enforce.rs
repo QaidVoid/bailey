@@ -161,6 +161,51 @@ fn a_file_cannot_grow_past_the_limit() {
     );
 }
 
+/// Where no cgroup was delegated, `pids_max` is met by `RLIMIT_NPROC` instead,
+/// which is only a bound at all because the run has a user namespace of its own.
+/// Skipped where a cgroup is available, since there the cgroup takes the limit
+/// and no rlimit is set.
+#[test]
+fn a_process_limit_holds_without_a_cgroup() {
+    if !landlock_available() {
+        eprintln!("skipping: Landlock unavailable");
+        return;
+    }
+    if bailey::backend::cgroup::usable_root(&["pids"]).is_some() {
+        eprintln!("skipping: a delegated cgroup takes the limit here");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("bailey.toml");
+    fs::write(&config, "[resources]\npids_max = 7\n").unwrap();
+
+    let output = Command::new(bailey())
+        .args(["run", "-c"])
+        .arg(&config)
+        .args(["/bin/cat", "/proc/self/limits"])
+        .output()
+        .unwrap();
+
+    let limits = String::from_utf8_lossy(&output.stdout);
+    let line = limits
+        .lines()
+        .find(|line| line.starts_with("Max processes"))
+        .unwrap_or_default();
+    assert!(
+        line.split_whitespace()
+            .filter(|field| *field == "7")
+            .count()
+            == 2,
+        "the process limit must reach the target, soft and hard: {line:?}"
+    );
+
+    let reported = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        reported.contains("process limit"),
+        "the process limit must be reported as enforced: {reported}"
+    );
+}
+
 /// The limit is an rlimit, so unlike the cgroup limits it needs no delegated
 /// cgroup. This asserts it is reported as applied rather than skipped, which is
 /// what tells an operator the guarantee actually holds on this host.

@@ -314,14 +314,26 @@ impl EnforceBackend {
         // process the target goes on to create.
         let cgroup = CgroupGuard::create(&policy.resources, self.always_cgroup);
         let procs = cgroup.procs_path();
+        // Where no cgroup bounds the process count, `RLIMIT_NPROC` can, but
+        // only on a run that makes a user namespace of its own: the count is
+        // per user within a namespace, so in the caller's it is the caller's
+        // own processes and the policy's number would refuse the first fork.
+        let pids_via_rlimit = policy
+            .resources
+            .pids_max
+            .filter(|_| procs.is_none() && (isolation.is_some() || network_only));
         // The file size limit is an rlimit rather than a cgroup control, so it
         // holds with or without a delegated cgroup and is reported on its own.
         // Folding it in here would report it skipped on a host with no cgroup,
-        // when it is the one limit that still applied.
-        let via_cgroup = ResourceLimits {
+        // when it is the one limit that still applied. A process limit met by
+        // the rlimit above is taken out for the same reason.
+        let mut via_cgroup = ResourceLimits {
             file_bytes: None,
             ..policy.resources.clone()
         };
+        if pids_via_rlimit.is_some() {
+            via_cgroup.pids_max = None;
+        }
         if via_cgroup == ResourceLimits::default() {
             // The policy asked for none, so there is nothing to report.
         } else if procs.is_some() {
@@ -337,6 +349,9 @@ impl EnforceBackend {
         }
         if policy.resources.file_bytes.is_some() {
             report.applied("file size limit");
+        }
+        if pids_via_rlimit.is_some() {
+            report.applied("process limit");
         }
 
         let mut command = Command::new(&target.program);
@@ -399,6 +414,12 @@ impl EnforceBackend {
                     isolation::enter(isolation)?;
                 } else if network_only {
                     network::enter_isolated()?;
+                }
+                // After the namespaces, where the count starts at this process:
+                // set before them it would charge the fork isolation makes to
+                // reach PID 1 against the policy's number.
+                if let Some(max) = pids_via_rlimit {
+                    set_process_limit(max)?;
                 }
                 plan.apply()?;
                 seccompiler::apply_filter(&seccomp)
@@ -1162,6 +1183,29 @@ fn set_no_core_dumps() -> io::Result<()> {
         rlim_max: 0,
     };
     if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &limit) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Bound the number of processes with `RLIMIT_NPROC`, standing in for the
+/// cgroup's `pids.max` where no cgroup was delegated.
+///
+/// The count behind this limit is kept per user within a user namespace, so it
+/// only means the policy's number on a run that made one: there the count
+/// begins at the target, and every process it goes on to start is charged to
+/// it. On a run that stayed in the caller's namespace the same number would
+/// count every process the caller already owns, which is why this is not set
+/// there at all.
+///
+/// The soft and hard limit are both set, since a process may raise its own
+/// soft limit as far as the hard one.
+fn set_process_limit(max: u64) -> io::Result<()> {
+    let limit = libc::rlimit {
+        rlim_cur: max as libc::rlim_t,
+        rlim_max: max as libc::rlim_t,
+    };
+    if unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &limit) } != 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())

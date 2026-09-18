@@ -121,6 +121,16 @@ This is best-effort throughout. Without such a cgroup, limits are skipped and th
 run's summary says so rather than failing the run. `bailey doctor` answers the
 same question before you start.
 
+One of them has a fallback. Where no cgroup was delegated, `pids_max` is applied
+as `RLIMIT_NPROC` instead, and the summary reports a `process limit`. The count
+behind that rlimit is kept per user within a user namespace, so it only means the
+policy's number on a run that makes one of its own, which is every run under
+`--isolate` and every run whose policy denies egress. A run that stays in the
+caller's namespace would be counting the caller's own processes, so the fallback
+is not applied there and the limit is reported skipped as before. `memory` and
+`cpu_percent` have no equivalent: `RLIMIT_AS` bounds address space rather than
+resident memory, and `RLIMIT_CPU` bounds total CPU seconds rather than a share.
+
 ## Order of application
 
 Inside the forked child, before exec:
