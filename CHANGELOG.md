@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.1](https://github.com/QaidVoid/bailey/compare/v0.2.0...v0.2.1) - 2026-09-18
+
+### ⛰️  Features
+
+- *(enforce)* Apply pids_max as an rlimit without a cgroup - ([2f453a6](https://github.com/QaidVoid/bailey/commit/2f453a6fc0bcd70d5937393e34779f1edf4ca4ae))
+
+### 🐛 Bug Fixes
+
+- *(enforce)* Open grant descriptors with a real O_PATH ([#34](https://github.com/QaidVoid/bailey/pull/34)) - ([45dde0c](https://github.com/QaidVoid/bailey/commit/45dde0ca381f0e858f90eb209bfb0231b9977449))
+- *(tests)* Read the host before expecting a process limit - ([be9060b](https://github.com/QaidVoid/bailey/commit/be9060b43b36b1022c7c8135bfdb68172c574d7b))
+
 ## [0.2.0](https://github.com/QaidVoid/bailey/compare/v0.1.4...v0.2.0) - 2026-09-16
 
 ### ⚠️ Behaviour changes
