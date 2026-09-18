@@ -564,3 +564,51 @@ fn the_target_keeps_the_callers_uid() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn a_denied_file_is_concealed_rather_than_failing_the_run() {
+    if !isolation_active() {
+        eprintln!("skipping: isolation unavailable on this host");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    fs::create_dir(&work).unwrap();
+    fs::write(work.join("token"), "topsecret").unwrap();
+
+    let config = dir.path().join("bailey.toml");
+    fs::write(
+        &config,
+        format!(
+            "[filesystem]\n\
+             read = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\", \"/etc\", \"{work}\"]\n\
+             write = [\"{work}\"]\n\
+             execute = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\"]\n\
+             deny = [\"{work}/token\"]\n",
+            work = work.display()
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(bailey())
+        .args(["run", "--isolate", "-c"])
+        .arg(&config)
+        .args(["/bin/sh", "-c"])
+        .arg(format!("cat {}/token", work.join("").display()))
+        .output()
+        .unwrap();
+
+    // Denying a file covers it with an empty one. Naming the cover by the
+    // descriptor that found the original fails the whole run instead, since
+    // the bind leaves that descriptor pointing at something else.
+    assert!(
+        output.status.success(),
+        "denying a file must not fail the run: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("topsecret"),
+        "a denied file must read empty, got: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}

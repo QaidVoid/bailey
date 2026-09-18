@@ -402,9 +402,13 @@ fn conceal_all(new_root: &Path, conceal: &[Conceal]) -> io::Result<()> {
                 None::<&str>,
             )
             .map_err(errno)?;
+            // Named by its real path, not by the descriptor: the bind above
+            // made a mount the descriptor does not refer to, so a remount of
+            // `/proc/self/fd/N` finds nothing there and fails the whole run.
+            // The same reason `remount_read_only` names its target this way.
             mount(
                 None::<&str>,
-                &target,
+                &new_root.join(relative),
                 None::<&str>,
                 MsFlags::MS_REMOUNT | MsFlags::MS_BIND | MsFlags::MS_RDONLY,
                 None::<&str>,
