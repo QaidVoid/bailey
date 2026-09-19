@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.2](https://github.com/QaidVoid/bailey/compare/v0.2.1...v0.2.2) - 2026-09-19
+
+### ⛰️  Features
+
+- *(isolation)* Give a granted /dev/pts an instance of its own - ([1d82f37](https://github.com/QaidVoid/bailey/commit/1d82f37acd06beec6c491d9a98765b81b3068379))
+
+### 🐛 Bug Fixes
+
+- *(isolation)* Name a concealed file's cover by its real path - ([11e7c1d](https://github.com/QaidVoid/bailey/commit/11e7c1d0338bbe93b47ee20d09dfaafbde06d456))
+- *(network)* Forward no port between the host and the namespace - ([a3d73c7](https://github.com/QaidVoid/bailey/commit/a3d73c78b4c2358ece3621b0a933096a4bfa7144))
+
 ## [0.2.1](https://github.com/QaidVoid/bailey/compare/v0.2.0...v0.2.1) - 2026-09-18
 
 ### ⛰️  Features
