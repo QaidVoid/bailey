@@ -908,6 +908,7 @@ fn build_isolation_plan(
             .map(|host| (host.clone(), world.home_inside.clone())),
         private_tmp: world.private_tmp,
         tmp_bytes: policy.resources.tmp_bytes.unwrap_or(DEFAULT_TMP_BYTES),
+        devpts: world.devpts,
         private_shm: world.private_shm,
         shm_bytes: policy.resources.shm_bytes.unwrap_or(DEFAULT_SHM_BYTES),
         cwd: world.cwd.clone(),

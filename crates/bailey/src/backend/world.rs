@@ -62,6 +62,8 @@ pub struct World {
     pub home_inside: PathBuf,
     /// Whether the target gets a private `/tmp`.
     pub private_tmp: bool,
+    /// Whether the target gets a devpts instance of its own.
+    pub devpts: bool,
     /// Whether the target gets a private `/dev/shm`.
     pub private_shm: bool,
     /// The directory the target starts in.
@@ -142,6 +144,10 @@ impl World {
             home_host,
             home_inside,
             private_tmp: isolated && !policy_touches(policy, Path::new("/tmp")),
+            // The other way round from /tmp and /dev/shm: those replace a
+            // shared thing the target would otherwise have, and this one is a
+            // capability it would otherwise not, so it waits to be granted.
+            devpts: isolated && policy_touches(policy, Path::new("/dev/pts")),
             private_shm: isolated && !policy_touches(policy, Path::new("/dev/shm")),
             cwd,
             kept_invocation_dir,

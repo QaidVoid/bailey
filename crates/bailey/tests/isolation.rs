@@ -612,3 +612,55 @@ fn a_denied_file_is_concealed_rather_than_failing_the_run() {
         String::from_utf8_lossy(&output.stdout)
     );
 }
+
+#[test]
+fn granting_dev_pts_gives_the_run_terminals_of_its_own() {
+    if !isolation_active() {
+        eprintln!("skipping: isolation unavailable on this host");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("bailey.toml");
+    // `script` allocates a pty and reports what it got. Binding the host's
+    // /dev/pts instead of mounting an instance leaves /dev/ptmx answering
+    // ENOENT, which is what a terminal reports as `forkpty(3) failed`.
+    fs::write(
+        &config,
+        "[filesystem]\n\
+         read = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\", \"/etc\"]\n\
+         execute = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\"]\n\
+         [[device]]\n\
+         path = \"/dev/pts\"\n\
+         access = \"rw\"\n\
+         [[device]]\n\
+         path = \"/dev/ptmx\"\n\
+         access = \"rw\"\n",
+    )
+    .unwrap();
+
+    let output = Command::new(bailey())
+        .args(["run", "--isolate", "-c"])
+        .arg(&config)
+        .args([
+            "/bin/sh",
+            "-c",
+            "python3 -c 'import pty,os; m,s=pty.openpty(); print(os.ttyname(s))'              && ls /dev/pts",
+        ])
+        .env("XDG_DATA_HOME", dir.path())
+        .output()
+        .unwrap();
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("/dev/pts/"),
+        "granting /dev/pts must let the run allocate a pty: {}{}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Its own instance, not the host's: a fresh one starts numbering at 0 and
+    // holds nothing else.
+    assert!(
+        !stdout.lines().any(|line| line.trim() == "1"),
+        "the run must not see the host's terminals: {stdout}"
+    );
+}

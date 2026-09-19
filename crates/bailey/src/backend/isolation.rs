@@ -78,6 +78,9 @@ pub struct IsolationPlan {
     pub private_tmp: bool,
     /// Size of the private `/tmp`, in bytes.
     pub tmp_bytes: u64,
+    /// Whether to give the target a devpts instance of its own, so it can
+    /// allocate pseudo-terminals.
+    pub devpts: bool,
     /// Whether to give the target a private `/dev/shm`.
     pub private_shm: bool,
     /// Size of the private `/dev/shm`, in bytes.
@@ -284,6 +287,41 @@ fn setup_root(plan: &IsolationPlan) -> io::Result<()> {
     // After the binds, so that a bind covering /dev does not hide it.
     if plan.private_shm {
         mount_tmpfs(&new_root.join("dev/shm"), plan.shm_bytes, "mode=1777")?;
+    }
+
+    // A devpts instance of the run's own, over whatever was bound at
+    // /dev/pts. Binding the host's is not enough and not even right: the
+    // kernel resolves /dev/ptmx through the devpts mounted at /dev/pts in the
+    // same mount namespace, and a bind into a reconstructed /dev breaks that
+    // association, so opening it returns ENOENT and every pty allocation
+    // fails. `forkpty(3) failed` is what a terminal makes of that. An
+    // instance of its own also keeps the run's terminals off the host's,
+    // which is the answer a sandbox wants anyway.
+    if plan.devpts {
+        let pts = new_root.join("dev/pts");
+        fs::create_dir_all(&pts)?;
+        mount(
+            Some("devpts"),
+            &pts,
+            Some("devpts"),
+            MsFlags::MS_NOSUID | MsFlags::MS_NOEXEC,
+            Some("newinstance,ptmxmode=0666,mode=0620"),
+        )
+        .map_err(errno)?;
+        // The multiplexer has to come from this instance. The node bound from
+        // the host answers for the host's.
+        let ptmx = new_root.join("dev/ptmx");
+        if !ptmx.exists() {
+            let _ = fs::File::create(&ptmx);
+        }
+        mount(
+            Some(&pts.join("ptmx")),
+            &ptmx,
+            None::<&str>,
+            MsFlags::MS_BIND,
+            None::<&str>,
+        )
+        .map_err(errno)?;
     }
 
     conceal_all(&new_root, &plan.conceal)?;
