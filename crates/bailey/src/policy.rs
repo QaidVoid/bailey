@@ -124,6 +124,13 @@ pub struct ResourceLimits {
     pub tmp_bytes: Option<u64>,
     /// Size of the private `/dev/shm`, in bytes.
     pub shm_bytes: Option<u64>,
+    /// A host directory to back the private `/tmp` with, instead of a tmpfs.
+    ///
+    /// When set, `/tmp` is a bind of this directory rather than a memory-backed
+    /// tmpfs, so a build's scratch is bounded by the disk it sits on rather
+    /// than by memory. It still masks the host's `/tmp`: a bind over `/tmp`
+    /// covers whatever was there, exactly as the tmpfs did.
+    pub tmp_dir: Option<std::path::PathBuf>,
 }
 
 /// Which environment variables reach the target.

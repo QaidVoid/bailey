@@ -274,12 +274,13 @@ impl EnforceBackend {
         let isolation = if self.isolate {
             if userns {
                 report.applied("namespace isolation");
-                Some(build_isolation_plan(
-                    policy,
-                    mode,
-                    &world,
-                    &self.implicit_write,
-                ))
+                let plan = build_isolation_plan(policy, mode, &world, &self.implicit_write);
+                // The bind source has to exist before it is bound at /tmp. It
+                // is created empty, which is what /tmp starts as anyway.
+                if let Some(dir) = &plan.tmp_dir {
+                    std::fs::create_dir_all(dir).map_err(BackendError::Io)?;
+                }
+                Some(plan)
             } else if nested {
                 // A second world cannot be built, and does not need to be: this
                 // process is already inside one that it cannot leave.
@@ -908,6 +909,7 @@ fn build_isolation_plan(
             .map(|host| (host.clone(), world.home_inside.clone())),
         private_tmp: world.private_tmp,
         tmp_bytes: policy.resources.tmp_bytes.unwrap_or(DEFAULT_TMP_BYTES),
+        tmp_dir: policy.resources.tmp_dir.clone(),
         devpts: world.devpts,
         private_shm: world.private_shm,
         shm_bytes: policy.resources.shm_bytes.unwrap_or(DEFAULT_SHM_BYTES),

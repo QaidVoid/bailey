@@ -287,6 +287,7 @@ struct RawResources {
     file_max: Option<String>,
     tmp_size: Option<String>,
     shm_size: Option<String>,
+    tmp_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -527,6 +528,9 @@ fn apply_layer(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> 
         }
         if let Some(size) = &resources.shm_size {
             acc.resources.shm_bytes = Some(size_value(size, &layer.path)?);
+        }
+        if let Some(dir) = &resources.tmp_dir {
+            acc.resources.tmp_dir = Some(std::path::PathBuf::from(dir));
         }
     }
 
@@ -896,6 +900,19 @@ mod tests {
         let resolved = merge(&layers).unwrap();
         assert!(resolved.policy.filesystem.is_empty());
         assert_eq!(resolved.policy.denied, vec![PathBuf::from("/a")]);
+    }
+
+    #[test]
+    fn a_tmp_dir_backs_tmp_with_disk_instead_of_a_tmpfs() {
+        let layers = [layer(
+            "/base",
+            "[resources]\ntmp_dir = \"/scratch/tmp\"\ntmp_size = \"512m\"",
+        )];
+        let resolved = merge(&layers).unwrap();
+        assert_eq!(
+            resolved.policy.resources.tmp_dir,
+            Some(PathBuf::from("/scratch/tmp"))
+        );
     }
 
     #[test]

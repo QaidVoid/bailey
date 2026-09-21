@@ -76,8 +76,10 @@ pub struct IsolationPlan {
     pub home: Option<(PathBuf, PathBuf)>,
     /// Whether to give the target a private `/tmp`.
     pub private_tmp: bool,
-    /// Size of the private `/tmp`, in bytes.
+    /// Size of the private `/tmp`, in bytes, when it is a tmpfs.
     pub tmp_bytes: u64,
+    /// A host directory to back `/tmp` with instead of a tmpfs, if any.
+    pub tmp_dir: Option<PathBuf>,
     /// Whether to give the target a devpts instance of its own, so it can
     /// allocate pseudo-terminals.
     pub devpts: bool,
@@ -241,7 +243,23 @@ fn setup_root(plan: &IsolationPlan) -> io::Result<()> {
     // namespace. It must precede the binds, because a granted path *under* /tmp
     // has to land inside this tmpfs rather than be covered by it.
     if plan.private_tmp {
-        mount_tmpfs(&new_root.join("tmp"), plan.tmp_bytes, "mode=1777")?;
+        let target = new_root.join("tmp");
+        if let Some(dir) = &plan.tmp_dir {
+            // A bind of a disk directory, which covers the host's /tmp just as
+            // the tmpfs would, but on disk. The directory is the caller's to
+            // create and to bound.
+            fs::create_dir_all(&target)?;
+            mount(
+                Some(dir),
+                &target,
+                None::<&str>,
+                MsFlags::MS_BIND | MsFlags::MS_REC,
+                None::<&str>,
+            )
+            .map_err(errno)?;
+        } else {
+            mount_tmpfs(&target, plan.tmp_bytes, "mode=1777")?;
+        }
     }
 
     // The private home goes before the binds, so that a granted path *inside*
