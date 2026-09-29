@@ -97,6 +97,33 @@ pub fn landlock_abi() -> Option<u32> {
     (version > 0).then_some(version as u32)
 }
 
+/// The uid an unmapped host uid reads as inside a user namespace.
+///
+/// Inside a user namespace a file owned by host root has no id here and reads
+/// as the overflow uid. An owner this namespace cannot name is one nothing in
+/// it could have written, which is the property that matters when deciding
+/// whether a program may be run with the caller's authority.
+pub fn overflow_uid() -> u32 {
+    std::fs::read_to_string("/proc/sys/kernel/overflowuid")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(65534)
+}
+
+/// Whether a file is one the caller may run with its own authority.
+///
+/// Owned by root, by the caller, or by a host id this namespace cannot name,
+/// and with no group or other write bit: one only the system or the caller
+/// could have put there. Anything else is refused by name rather than run.
+pub fn runnable_as_caller(meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let caller = unsafe { libc::geteuid() };
+    let owner_ok = meta.uid() == 0 || meta.uid() == caller || meta.uid() == overflow_uid();
+    owner_ok && meta.permissions().mode() & 0o022 == 0
+}
+
 /// Whether a run could be given resource limits: a cgroup this user may create
 /// runs in, whose children receive the controller files.
 fn cgroup_delegated() -> bool {
@@ -142,16 +169,22 @@ fn helper_status() -> HelperStatus {
 /// look separately, and disagreed: the backend fell back to the bare name, which
 /// `Command` resolves on `PATH`, while the probe gave up before that and had
 /// `doctor` report a helper missing that a run would have found and used.
+///
+/// The helper is run by bailey with the caller's authority, so every candidate
+/// is held to the same standard [`runnable_as_caller`] states, wherever it was
+/// found. One that fails it is skipped like one that is not there.
 pub fn locate_helper() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("BAILEY_BPF_HELPER") {
         let path = PathBuf::from(path);
-        return path.is_file().then_some(path);
+        if helper_is_trusted(&path) {
+            return Some(path);
+        }
     }
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {
         let candidate = dir.join(HELPER_BIN);
-        if candidate.is_file() {
+        if helper_is_trusted(&candidate) {
             return Some(candidate);
         }
     }
@@ -161,7 +194,14 @@ pub fn locate_helper() -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
     std::env::split_paths(&paths)
         .map(|dir| dir.join(HELPER_BIN))
-        .find(|candidate| candidate.is_file())
+        .find(|candidate| helper_is_trusted(candidate))
+}
+
+/// Whether a helper candidate is a file the caller may run with its authority.
+fn helper_is_trusted(candidate: &Path) -> bool {
+    std::fs::metadata(candidate)
+        .map(|meta| meta.is_file() && runnable_as_caller(&meta))
+        .unwrap_or(false)
 }
 
 #[cfg(test)]

@@ -31,6 +31,7 @@ use crate::backend::network::{self, NetworkMode};
 use crate::backend::world::{self, World};
 use crate::backend::{Backend, BackendError, Target};
 use crate::policy::{self, Egress, Policy, ResourceLimits};
+use crate::strings::quoted as json_string;
 
 /// Landlock ABI the backend targets. Best-effort compatibility degrades this
 /// gracefully on older kernels.
@@ -66,29 +67,6 @@ pub struct RunReport {
     /// the summary exists to surface what was taken away, not to restate the
     /// command line.
     pub skipped: Vec<(String, String)>,
-}
-
-/// Quote a value as a JSON string.
-///
-/// A path or an error message may hold a quote, a backslash or a control
-/// character, and pasting one between quotes produces something that is not
-/// JSON, or worse, JSON with a field nobody wrote.
-fn json_string(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 2);
-    out.push('"');
-    for ch in value.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }
 
 impl RunReport {
@@ -221,7 +199,13 @@ impl EnforceBackend {
         }
 
         let mut report = RunReport::default();
-        report.applied("landlock");
+        // Asked of the kernel rather than assumed: on a host without Landlock
+        // the ruleset still applies without error and enforces nothing, so
+        // claiming it here would report a boundary that is not there.
+        match crate::backend::probe::landlock_abi() {
+            Some(_) => report.applied("landlock"),
+            None => report.skipped("landlock", "the kernel does not provide Landlock"),
+        }
         report.applied("seccomp");
         match mode {
             NetworkMode::Isolated => report.applied("network namespace"),
@@ -425,11 +409,12 @@ impl EnforceBackend {
                 plan.apply()?;
                 seccompiler::apply_filter(&seccomp)
                     .map_err(|err| io::Error::other(format!("seccomp: {err}")))?;
-                // Last, so everything above still has what it needs. A target
-                // that keeps the capabilities of its user namespace can build
-                // another one through `clone`, which `unshare` was denied to
-                // prevent; without them it cannot, whatever syscall it reaches
-                // for.
+                // Last, so everything above still has what it needs. With no
+                // capabilities left, a user namespace a target reaches through
+                // `clone` maps nothing the target could not already name, and
+                // the mount syscalls it would need inside one are denied
+                // outright; `unshare` and `setns` are denied for the same
+                // reason.
                 drop_capabilities()?;
                 Ok(())
             });
@@ -608,7 +593,12 @@ impl LandlockPlan {
     /// built: a private home the target may write to, and, under isolation, the
     /// private `/tmp` and `/dev/shm` that replace the host's shared ones.
     fn add_world_grants(&mut self, world: &World) {
-        let read_write = AccessFs::from_read(TARGET_ABI) | AccessFs::from_write(TARGET_ABI);
+        // Read means exactly reading. `AccessFs::from_read` would also carry
+        // `Execute`, which the policy never asked for here: a run would be
+        // able to execute what it wrote into its private home, `/tmp`, or
+        // `/dev/shm` while `policy.toml` said it could not. Execute is a
+        // separate right, granted where the policy grants it.
+        let read_write = AccessFs::ReadFile | AccessFs::ReadDir | AccessFs::from_write(TARGET_ABI);
         if let Some(terminal) = &world.terminal {
             self.filesystem.push((terminal.clone(), read_write));
         }
@@ -703,15 +693,6 @@ impl LandlockPlan {
     }
 }
 
-/// Build the bind-mount and concealment set for isolation from the policy.
-///
-/// Nested paths under an already-included directory are skipped (they come
-/// along with the parent bind), and `/proc` is omitted because a fresh `/proc`
-/// is mounted in the new PID namespace.
-///
-/// A denied path is never bound. Where a denial sits beneath a path that is
-/// bound, it arrives with its parent and is covered over instead, which is what
-/// makes a nested denial enforceable: Landlock rules can only add access.
 /// Remove staging directories belonging to runs that are no longer alive.
 ///
 /// [`StagingGuard`] removes the directory on every path a run can return by, but
@@ -723,7 +704,9 @@ impl LandlockPlan {
 /// This can only ever remove an empty directory. On the host the staging path is
 /// a bare mountpoint, since the tmpfs and everything built on it live in the
 /// target's own mount namespace, so `remove_dir` refusing a non-empty directory
-/// is the guarantee that nothing else can be caught by this.
+/// is the guarantee that nothing else can be caught by this. A refusal is left
+/// unheard: the sweep is best-effort, and a leftover that will not go is said
+/// nowhere because every run retries it.
 fn sweep_stale_staging() {
     let Ok(entries) = std::fs::read_dir("/tmp") else {
         return;
@@ -771,6 +754,15 @@ fn to_visible_path(policy: &Policy, path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+/// Build the bind-mount and concealment set for isolation from the policy.
+///
+/// Nested paths under an already-included directory are skipped (they come
+/// along with the parent bind), and `/proc` is omitted because a fresh `/proc`
+/// is mounted in the new PID namespace.
+///
+/// A denied path is never bound. Where a denial sits beneath a path that is
+/// bound, it arrives with its parent and is covered over instead, which is what
+/// makes a nested denial enforceable: Landlock rules can only add access.
 fn build_isolation_plan(
     policy: &Policy,
     mode: NetworkMode,
@@ -1274,6 +1266,12 @@ fn denied_syscalls() -> &'static [i64] {
         libc::SYS_process_vm_writev,
         libc::SYS_open_by_handle_at,
         libc::SYS_acct,
+        // `memfd_create` makes an anonymous executable inode that no
+        // filesystem rule can name, so a `PathBeneath` rule on execute cannot
+        // reach it. With it denied there is nothing for `execveat` to name
+        // through `AT_EMPTY_PATH`, and everything the target runs comes off a
+        // path the policy granted.
+        libc::SYS_memfd_create,
         // Landlock is checked when a file is opened, not when a descriptor is
         // duplicated, so a descriptor taken from bailey carries the access
         // bailey had. Without a PID namespace the target can name bailey and
@@ -1359,6 +1357,39 @@ fn build_seccomp_filter() -> anyhow::Result<seccompiler::BpfProgram> {
         )?])?);
     }
     rules.insert(libc::SYS_ioctl, ioctl_rules);
+
+    // A namespace can be built one `clone` at a time, so the `CLONE_NEW*`
+    // flags are matched where they sit: in the low word of the first
+    // argument. Ordinary thread and process creation sets none of them, and
+    // is untouched.
+    const NAMESPACE_CLONE_FLAGS: [u64; 7] = [
+        libc::CLONE_NEWNS as u64,
+        libc::CLONE_NEWCGROUP as u64,
+        libc::CLONE_NEWUTS as u64,
+        libc::CLONE_NEWIPC as u64,
+        libc::CLONE_NEWUSER as u64,
+        libc::CLONE_NEWPID as u64,
+        libc::CLONE_NEWNET as u64,
+    ];
+    let clone_rules = NAMESPACE_CLONE_FLAGS
+        .iter()
+        .map(|&flag| {
+            Ok(SeccompRule::new(vec![SeccompCondition::new(
+                0,
+                SeccompCmpArgLen::Dword,
+                SeccompCmpOp::MaskedEq(flag),
+                flag,
+            )?])?)
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    rules.insert(libc::SYS_clone, clone_rules);
+    // `clone3` carries the same flags behind a pointer, which a seccomp
+    // filter cannot dereference, and denying it whole would break thread
+    // creation: a thread pool falls back only on `ENOSYS`, not on the `EPERM`
+    // this filter answers with. The `clone` rules above cover the caller it
+    // shares the ABI with, and the capability drop after everything else here
+    // is what leaves a namespace a target does build holding nothing it could
+    // not already reach.
 
     let filter = SeccompFilter::new(
         rules,
@@ -1600,6 +1631,47 @@ mod tests {
         assert!(!exec.contains(AccessFs::ReadFile));
 
         assert!(fs_access_bits(Access::empty()).is_none());
+    }
+
+    /// The areas the sandbox provides are granted for reading and writing,
+    /// not for running what the target puts there. `AccessFs::from_read`
+    /// carries `Execute`, and using it here made `/tmp` and `/dev/shm`
+    /// executable in every run while the policy said otherwise.
+    #[test]
+    fn world_grants_read_and_write_without_execute() {
+        let policy = Policy::default();
+        let world = World::derive(Path::new("/bin/true"), &policy, true);
+        assert!(world.private_tmp, "isolation gives the run a private /tmp");
+
+        let mut plan = LandlockPlan::build(&policy, true, false);
+        plan.add_world_grants(&world);
+        let tmp = plan
+            .filesystem
+            .iter()
+            .find(|(path, _)| path == &PathBuf::from("/tmp"))
+            .map(|(_, bits)| *bits)
+            .expect("the private /tmp is granted");
+        assert!(tmp.contains(AccessFs::ReadFile));
+        assert!(tmp.contains(AccessFs::WriteFile));
+        assert!(
+            !tmp.contains(AccessFs::Execute),
+            "a run must not execute what it wrote into /tmp"
+        );
+    }
+
+    /// `memfd_create` makes an anonymous executable inode no filesystem rule
+    /// can name, so it is denied outright rather than left to the grants.
+    #[test]
+    fn memfd_create_is_denied() {
+        assert!(denied_syscalls().contains(&libc::SYS_memfd_create));
+    }
+
+    /// The namespace flags are matched on `clone`'s first argument, and the
+    /// filter only proves it builds: a rule seccompiler rejected would surface
+    /// here rather than as every run failing to start.
+    #[test]
+    fn the_seccomp_filter_builds_with_the_clone_rules() {
+        assert!(build_seccomp_filter().is_ok());
     }
 
     #[test]

@@ -293,6 +293,10 @@ struct RawResources {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawHooks {
+    /// Retracts every hook a lower layer contributed, before this layer's
+    /// own are added.
+    #[serde(default)]
+    reset: bool,
     #[serde(default)]
     pre_launch: Vec<String>,
     #[serde(default)]
@@ -334,12 +338,20 @@ struct Accumulator {
 fn discover(target: &Path, explicit: Option<&Path>) -> Vec<Source> {
     let mut sources = Vec::new();
 
-    if let Some(global) = global_config_path()
-        && global.is_file()
-    {
-        // No trust record is needed for a file in your own config directory, but
-        // that argument is about who wrote it, and says nothing about who can
-        // write it now.
+    // Inside a sandbox, HOME is the private home the confined target writes
+    // to, so a config found there was planted by the thing being confined.
+    // Its hooks would run here, as the caller, before any confinement exists.
+    // The trust store makes the same refusal.
+    let global = if crate::backend::world::inside_sandbox() {
+        None
+    } else {
+        global_config_path().filter(|global| global.is_file())
+    };
+    if let Some(global) = global {
+        // No trust record is needed for a file in your own config directory,
+        // but that argument is about who wrote it, and says nothing about who
+        // can write it now. The exposure check refuses one the caller does
+        // not own, or that anyone else can write.
         let rejected = crate::trust::exposure_of(&global);
         sources.push(Source {
             path: global,
@@ -459,6 +471,11 @@ fn apply_layer(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> 
         // policy is finalized, so one left behind would place a later plain
         // grant at an `at` the resetting layer never mentions.
         acc.relocated.clear();
+        // Devices are grants like any other, carried in their own list only
+        // because they name nodes rather than trees. A profile that means to
+        // be the whole of what a run can reach is not, if a lower profile's
+        // device nodes come along with it.
+        acc.devices.clear();
     }
     // After the reset, with this layer's grants: a layer that resets and
     // relocates in one breath means to keep its own placement, and clearing
@@ -562,6 +579,12 @@ fn apply_layer(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> 
     }
 
     if let Some(hooks) = &layer.raw.hooks {
+        if hooks.reset {
+            // Hooks run as the caller before the target is confined, so a
+            // layer that means to start clean has to be able to retract what
+            // a lower layer left, not only add to it.
+            acc.hooks = Hooks::default();
+        }
         acc.hooks
             .pre_launch
             .extend(hooks.pre_launch.iter().cloned());
@@ -999,6 +1022,68 @@ mod tests {
         ];
         let resolved = merge(&layers).unwrap();
         assert!(resolved.policy.denied.is_empty());
+    }
+
+    /// Devices are grants carried in a list of their own, so a reset that
+    /// left them would hand every device a profile named to a layer that
+    /// meant to start from nothing.
+    #[test]
+    fn a_reset_clears_device_grants_too() {
+        let layers = [
+            layer(
+                "/base",
+                "[filesystem]\nread = [\"/a\"]\n[[device]]\npath = \"/dev/tty\"\naccess = \"rw\"",
+            ),
+            layer("/base", "[filesystem]\nreset = true\nread = [\"/a\"]"),
+        ];
+        let resolved = merge(&layers).unwrap();
+        assert!(resolved.policy.devices.is_empty());
+    }
+
+    /// Hooks run as the caller before the target is confined, so a layer
+    /// that means to start clean has to be able to retract what a lower
+    /// layer left rather than only add to it.
+    #[test]
+    fn a_hook_reset_retracts_lower_layers_hooks() {
+        let layers = [
+            layer(
+                "/base",
+                "[hooks]\npre_launch = [\"lower\"]\npost_exit = [\"lower-exit\"]",
+            ),
+            layer("/base", "[hooks]\nreset = true\npre_launch = [\"upper\"]"),
+        ];
+        let resolved = merge(&layers).unwrap();
+        assert_eq!(resolved.hooks.pre_launch, vec!["upper".to_owned()]);
+        assert!(resolved.hooks.post_exit.is_empty());
+    }
+
+    /// The global config is read from HOME, and inside a sandbox HOME is the
+    /// private home the confined target writes to. A config planted there
+    /// would run its hooks as the caller before any confinement exists, so
+    /// the layer is refused outright, the way the trust store is.
+    ///
+    /// Only the refusal is asserted: a concurrent test touching the same
+    /// variables can only ever take a source away, so an absence holds either
+    /// way, while asserting the layer's presence outside a sandbox would race
+    /// with them.
+    #[test]
+    fn the_global_config_is_not_read_inside_a_sandbox() {
+        let _env = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("bailey").join("config.toml");
+        std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+        std::fs::write(&global, "[filesystem]\nread = [\"/a\"]").unwrap();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()) };
+        unsafe { std::env::set_var("BAILEY_SANDBOX", "1") };
+
+        let sources = discover(Path::new("/bin/true"), None);
+        unsafe { std::env::remove_var("BAILEY_SANDBOX") };
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+
+        assert!(
+            !sources.iter().any(|source| source.origin == Origin::Global),
+            "a planted global config must not become a layer inside a sandbox"
+        );
     }
 
     #[test]

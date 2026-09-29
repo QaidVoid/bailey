@@ -338,9 +338,12 @@ fn toml_string_array(key: &str, values: &BTreeSet<String>) -> String {
     if values.is_empty() {
         return String::new();
     }
+    // Quoted, not pasted: a filename may hold a quote or a newline, and an
+    // unescaped one would end the array and let the rest of the line stand
+    // as whatever TOML it spelled.
     let items = values
         .iter()
-        .map(|value| format!("\"{value}\""))
+        .map(|value| crate::strings::quoted(value))
         .collect::<Vec<_>>()
         .join(", ");
     format!("{key} = [{items}]\n")
@@ -444,5 +447,29 @@ mod tests {
         let profile = generate_profile(&findings);
         assert!(profile.contains("read = [\"/game/data.pak\"]"));
         assert!(!profile.contains("egress"));
+    }
+
+    /// A filename may hold anything but `/` and NUL. One carrying a quote and
+    /// a newline would have ended the array and stood as TOML of its own
+    /// choosing, so the value is quoted in full and reads back as one path.
+    #[test]
+    fn a_finding_with_quotes_and_a_newline_round_trips_through_toml() {
+        let hostile = "/dev/shm/x\";\n[hooks]\npre_launch = [\"id\"]\n#";
+        let findings = vec![Finding {
+            kind: AccessKind::Read,
+            resource: Resource::Path(PathBuf::from(hostile)),
+            risk: Risk::Low,
+            unresolved: false,
+        }];
+        let profile = generate_profile(&findings);
+        let parsed: toml::Table =
+            toml::from_str(&profile).expect("a generated profile always parses as TOML");
+        let granted = parsed
+            .get("filesystem")
+            .and_then(|filesystem| filesystem.get("read"))
+            .and_then(toml::Value::as_array)
+            .expect("a read array");
+        assert_eq!(granted.len(), 1, "the hostile text must stay one entry");
+        assert_eq!(granted[0].as_str(), Some(hostile));
     }
 }

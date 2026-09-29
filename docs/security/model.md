@@ -52,7 +52,7 @@ sandbox helps.
 | Cannot reach host abstract UNIX sockets | Landlock scoping, network namespace | Enforced on Linux 6.12+ |
 | Cannot signal processes outside the sandbox | Landlock scoping, PID namespace | Enforced on Linux 6.12+ |
 | Cannot send UDP, QUIC, or DNS | Network namespace | Enforced when egress is denied |
-| Cannot load kernel modules, trace processes, or manipulate namespaces | seccomp | Enforced |
+| Cannot load kernel modules, trace processes, or create namespaces | seccomp, capability drop | Enforced: `unshare`, `setns`, and `clone` with a `CLONE_NEW*` flag are refused, and a `clone3` call runs with no capabilities, which is what leaves a namespace it does create empty |
 | Cannot exceed memory, process, or CPU limits | cgroup v2 | Best-effort, and see the caveat below |
 | Cannot read your environment variables | Built environment | Enforced; only named variables cross |
 | Cannot supply its own policy | Trust store | Enforced; a discovered config applies only once accepted |

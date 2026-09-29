@@ -105,6 +105,13 @@ pub struct Layer {
 
 /// The directory user-written profiles live in.
 pub fn user_dir() -> Option<PathBuf> {
+    // Inside a sandbox, HOME is the private home the confined target writes
+    // to, so a profile found there was planted by the thing being confined,
+    // and one can claim targets and carry hooks of its own. The trust store
+    // makes the same refusal.
+    if crate::backend::world::inside_sandbox() {
+        return None;
+    }
     // A relative value resolves against the working directory, so a project
     // could supply the profiles a run is built from.
     if let Some(dir) = std::env::var_os("XDG_CONFIG_HOME")
@@ -376,6 +383,7 @@ mod tests {
 
     #[test]
     fn a_user_profile_is_found_and_layered() {
+        let _env = crate::test_support::env_lock();
         let dir = tempfile::tempdir().unwrap();
         let profiles = dir.path().join("bailey/profiles");
         std::fs::create_dir_all(&profiles).unwrap();

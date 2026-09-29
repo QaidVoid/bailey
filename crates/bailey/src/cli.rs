@@ -1456,13 +1456,6 @@ fn split_command(mut command: Vec<String>) -> anyhow::Result<(PathBuf, Vec<Strin
 /// is an error: silently building a policy for a file that does not exist tells
 /// the user about a sandbox they are not going to get.
 /// The id an unmapped owner reads as inside a user namespace.
-fn overflow_uid() -> u32 {
-    std::fs::read_to_string("/proc/sys/kernel/overflowuid")
-        .ok()
-        .and_then(|value| value.trim().parse().ok())
-        .unwrap_or(65534)
-}
-
 /// Directories a helper bailey runs itself may come from.
 ///
 /// Fixed rather than taken from `PATH`: these programs run outside the sandbox
@@ -1480,14 +1473,12 @@ const HELPER_DIRS: [&str; 6] = [
 /// Find a helper program in a trusted location, refusing one anyone else can
 /// write.
 ///
-/// A file owned by root or by the caller, with no group or other write bit, is
-/// one only the system or the caller could have put there. Anything else is
-/// refused by name rather than run.
+/// A file held to [`crate::backend::probe::runnable_as_caller`] is one only
+/// the system or the caller could have put there. Anything else is refused by
+/// name rather than run.
 pub fn resolve_helper(name: &str) -> anyhow::Result<PathBuf> {
-    use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::PermissionsExt;
 
-    let caller = unsafe { libc::geteuid() };
     let mut rejected = Vec::new();
     for dir in HELPER_DIRS {
         let candidate = Path::new(dir).join(name);
@@ -1497,13 +1488,7 @@ pub fn resolve_helper(name: &str) -> anyhow::Result<PathBuf> {
         if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 {
             continue;
         }
-        // Inside a user namespace a file owned by host root has no id here and
-        // reads as the overflow uid. An owner this namespace cannot name is
-        // one nothing in it could have written, which is the property that
-        // matters.
-        let owner_ok = meta.uid() == 0 || meta.uid() == caller || meta.uid() == overflow_uid();
-        let writable_by_others = meta.permissions().mode() & 0o022 != 0;
-        if owner_ok && !writable_by_others {
+        if crate::backend::probe::runnable_as_caller(&meta) {
             return Ok(candidate);
         }
         rejected.push(candidate.display().to_string());
@@ -1552,11 +1537,7 @@ fn implicit_target_layer(target: &Path) -> String {
 
 /// Render a path as a TOML basic string.
 fn toml_string(path: &Path) -> String {
-    let escaped = path
-        .to_string_lossy()
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"");
-    format!("\"{escaped}\"")
+    crate::strings::quoted(&path.to_string_lossy())
 }
 
 fn absolute(path: &Path) -> PathBuf {
