@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 
 use nix::mount::{MntFlags, MsFlags, mount, umount2};
 use nix::sched::{CloneFlags, unshare};
+use nix::sys::statvfs::statvfs;
 use nix::unistd::{chdir, pivot_root};
 
 /// Hostname a target sees, in place of the machine's own.
@@ -409,16 +410,53 @@ fn remount_read_only(new_root: &Path, paths: &[PathBuf]) -> io::Result<()> {
             None::<&str>,
         )
         .map_err(errno)?;
+        let carried = statvfs(&target).map_err(errno)?.flags().bits();
         mount(
             None::<&str>,
             &target,
             None::<&str>,
-            MsFlags::MS_REMOUNT | MsFlags::MS_BIND | MsFlags::MS_REC | MsFlags::MS_RDONLY,
+            MsFlags::MS_REMOUNT
+                | MsFlags::MS_BIND
+                | MsFlags::MS_REC
+                | MsFlags::MS_RDONLY
+                | locked_flags(carried),
             None::<&str>,
         )
         .map_err(errno)?;
     }
     Ok(())
+}
+
+/// The flags of a mount that a remount inside a user namespace must repeat.
+///
+/// A mount inherited from a more privileged namespace has nosuid, nodev,
+/// noexec and its atime mode locked, and a remount that leaves one out is
+/// refused with EPERM. A read grant beneath a `nosuid,nodev` /tmp failed every
+/// run that way. `bits` is what `statvfs` reports for the mount.
+fn locked_flags(bits: libc::c_ulong) -> MsFlags {
+    // The kernel reports this on musl as well, but musl's headers do not name
+    // it, and both shipped binaries are musl.
+    const ST_RELATIME: libc::c_ulong = 0x1000;
+    let pairs = [
+        (libc::ST_NOSUID, MsFlags::MS_NOSUID),
+        (libc::ST_NODEV, MsFlags::MS_NODEV),
+        (libc::ST_NOEXEC, MsFlags::MS_NOEXEC),
+        (libc::ST_NOATIME, MsFlags::MS_NOATIME),
+        (libc::ST_NODIRATIME, MsFlags::MS_NODIRATIME),
+        (ST_RELATIME, MsFlags::MS_RELATIME),
+    ];
+    let mut flags = MsFlags::empty();
+    for (reported, carried) in pairs {
+        if bits & reported != 0 {
+            flags |= carried;
+        }
+    }
+    // A remount that names no atime mode gets relatime, so a strictatime
+    // mount has to say so or it too is refused.
+    if bits & (libc::ST_NOATIME | ST_RELATIME) == 0 {
+        flags |= MsFlags::MS_STRICTATIME;
+    }
+    flags
 }
 
 /// Cover each denied path that survived into the new root.
@@ -647,4 +685,29 @@ fn set_hostname(name: &str) -> io::Result<()> {
 
 fn errno(err: nix::errno::Errno) -> io::Error {
     io::Error::from_raw_os_error(err as i32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_nosuid_nodev_relatime_mount_keeps_all_three() {
+        let bits = libc::ST_NOSUID | libc::ST_NODEV | 0x1000;
+        assert_eq!(
+            locked_flags(bits),
+            MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_RELATIME
+        );
+    }
+
+    #[test]
+    fn a_noatime_mount_is_not_given_a_second_atime_mode() {
+        let flags = locked_flags(libc::ST_NOATIME | libc::ST_NOEXEC);
+        assert_eq!(flags, MsFlags::MS_NOATIME | MsFlags::MS_NOEXEC);
+    }
+
+    #[test]
+    fn a_strictatime_mount_says_so() {
+        assert_eq!(locked_flags(0), MsFlags::MS_STRICTATIME);
+    }
 }
