@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.3](https://github.com/QaidVoid/bailey/compare/v0.2.2...v0.2.3) - 2026-09-29
+
+### 🐛 Bug Fixes
+
+- *(cli)* Report brokered egress as broker, not host - ([ecff5d7](https://github.com/QaidVoid/bailey/commit/ecff5d7e41f5f9fc0e5564c0c85d5e829a71e0a7))
+- *(enforce)* Close the planted-config and denylist gaps - ([5d5c36a](https://github.com/QaidVoid/bailey/commit/5d5c36a2a11c7dc30171b9d6d24ad966065b5567))
+- *(isolation)* Keep locked mount flags on read-only remount - ([5ff43c4](https://github.com/QaidVoid/bailey/commit/5ff43c433b6f4edbc5e964d78b43928ed41c4f86))
+
 ## [0.2.2](https://github.com/QaidVoid/bailey/compare/v0.2.1...v0.2.2) - 2026-09-21
 
 ### ⛰️  Features
