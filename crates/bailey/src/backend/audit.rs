@@ -61,6 +61,7 @@ impl AuditBackend {
             // whether or not the policy sets limits.
             always_cgroup: true,
             implicit_write: Vec::new(),
+            egress_broker: false,
         };
         let confined = backend.spawn(&envelope, target)?;
         let code = audit_helper::record(&mut recorder, confined)?;

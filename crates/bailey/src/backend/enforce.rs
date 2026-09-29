@@ -139,6 +139,9 @@ pub struct EnforceBackend {
     /// found from the world; this is for the ones a command adds, such as a
     /// confined shell's launch directory.
     pub implicit_write: Vec<PathBuf>,
+    /// The run is already in a namespace whose egress is held to one broker,
+    /// so it neither makes a namespace of its own nor reports UDP as open.
+    pub egress_broker: bool,
 }
 
 /// How a run reports what it enforced.
@@ -189,7 +192,11 @@ impl EnforceBackend {
         // inherited and impossible to drop.
         let nested = world::inside_sandbox();
         let inherited = network::Inherited::detect();
-        let mode = network::select(policy, userns);
+        let mode = if self.egress_broker {
+            NetworkMode::Brokered
+        } else {
+            network::select(policy, userns)
+        };
         network::report(mode, policy, inherited);
         if network::bind_is_loopback_only(policy, mode) {
             eprintln!(
@@ -214,6 +221,9 @@ impl EnforceBackend {
             {
                 report.applied("network namespace (inherited)")
             }
+            NetworkMode::LandlockOnly if !userns && inherited == network::Inherited::Brokered => {
+                report.applied("egress broker (inherited)")
+            }
             NetworkMode::LandlockOnly if !userns && nested => report.skipped(
                 "network namespace",
                 "inside a sandbox that did not create one, so only TCP is restricted",
@@ -225,6 +235,7 @@ impl EnforceBackend {
                 "unprivileged user namespaces unavailable, so only TCP is restricted",
             ),
             NetworkMode::LandlockOnly => {}
+            NetworkMode::Brokered => report.applied("egress broker"),
         }
 
         let isolated = self.isolate && userns;

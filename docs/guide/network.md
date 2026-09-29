@@ -118,6 +118,18 @@ it does not. The lockdown is the enforcement, and it is fail-closed: if the
 netfilter rule cannot be installed, or pasta or user namespaces are missing,
 the run is refused rather than left with open egress. `nft` must be present.
 
+Inside the session, TCP to ADDR:PORT is the only way out. UDP, ICMP, and all of
+IPv6 are dropped, so there is no DNS and no path MTU discovery. A client names
+its destination to the broker, and the broker resolves and dials it from the
+host. When a client reaches the broker but times out waiting for its reply,
+the delay lies in the broker's lookup or dial, and the broker's own log is
+where that shows. The session also cannot list the rule,
+because `nft` inside it has no permission to read the table.
+
+A brokered run publishes `BAILEY_SANDBOX_NET=broker`, so a program or a nested
+run can tell it is in one. The run summary reports the lockdown as `egress
+broker` rather than warning that UDP is unrestricted.
+
 bailey creates the network namespace itself and then has pasta configure it,
 rather than the other way round. The rule is installed by the process that made
 the namespace, which is the only way to know which namespace it lands in: a

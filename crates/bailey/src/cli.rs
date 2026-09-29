@@ -954,6 +954,7 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
         },
         always_cgroup: false,
         implicit_write: Vec::new(),
+        egress_broker: args.egress_proxy.is_some(),
     };
     let code = backend.run(&resolved.policy, &target)?;
     if let Err(err) = resolved.hooks.run_post_exit(code) {
@@ -1011,6 +1012,7 @@ fn cmd_shell(args: ShellArgs) -> anyhow::Result<i32> {
         // The launch directory is granted for writing on the user's behalf, so
         // a narrower grant their config makes beneath it is kept narrow.
         implicit_write: vec![dir.clone()],
+        egress_broker: false,
     };
     let code = backend.run(&resolved.policy, &target)?;
     if let Err(err) = resolved.hooks.run_post_exit(code) {

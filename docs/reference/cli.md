@@ -227,7 +227,7 @@ Set by bailey, inside the sandbox:
 | Variable | Meaning |
 | --- | --- |
 | `BAILEY_SANDBOX` | `1` in every confined run |
-| `BAILEY_SANDBOX_NET` | `isolated` or `host`, the network the run was given |
+| `BAILEY_SANDBOX_NET` | `isolated`, `broker`, or `host`, the network the run was given |
 | `BAILEY_SANDBOX_DIR` | The directory a confined shell resolved its policy for |
 
 Set for hook commands:

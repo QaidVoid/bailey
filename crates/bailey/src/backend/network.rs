@@ -11,6 +11,10 @@
 //! Where the policy allows some egress, the namespace cannot be used without
 //! also providing connectivity into it, so enforcement falls back to Landlock's
 //! port rules and the run reports what that does not cover.
+//!
+//! A run given an egress broker is the exception: it is already in a namespace
+//! of its own whose netfilter rule admits only the broker, so every other
+//! destination and protocol is dropped there rather than left to Landlock.
 
 use std::fs;
 use std::io;
@@ -28,6 +32,10 @@ pub enum NetworkMode {
     /// Host network namespace, with Landlock rules over TCP ports. Other
     /// protocols are unrestricted.
     LandlockOnly,
+    /// Own network namespace whose netfilter rule admits TCP to one broker and
+    /// drops everything else: every other host and port, UDP, DNS, ICMP, and
+    /// all of IPv6. Landlock's port rules apply on top.
+    Brokered,
 }
 
 impl NetworkMode {
@@ -38,6 +46,9 @@ impl NetworkMode {
                 "isolated (own namespace, loopback only, no route off the host)"
             }
             NetworkMode::LandlockOnly => "landlock only (TCP ports; other protocols unrestricted)",
+            NetworkMode::Brokered => {
+                "brokered (own namespace, TCP to the broker only; UDP, DNS, ICMP dropped)"
+            }
         }
     }
 }
@@ -90,15 +101,22 @@ pub enum Inherited {
     IsolatedNamespace,
     /// Inside one that shares the host's network namespace.
     HostNamespace,
+    /// Inside one whose egress is held to a single broker.
+    Brokered,
 }
 
 impl Inherited {
     /// Read what the outer run published in this process's environment.
     pub fn detect() -> Self {
-        match std::env::var("BAILEY_SANDBOX_NET").as_deref() {
-            Ok("isolated") => Inherited::IsolatedNamespace,
-            Ok(_) => Inherited::HostNamespace,
-            Err(_) => Inherited::None,
+        Self::read(std::env::var("BAILEY_SANDBOX_NET").ok().as_deref())
+    }
+
+    fn read(published: Option<&str>) -> Self {
+        match published {
+            Some("isolated") => Inherited::IsolatedNamespace,
+            Some("broker") => Inherited::Brokered,
+            Some(_) => Inherited::HostNamespace,
+            None => Inherited::None,
         }
     }
 
@@ -107,6 +125,7 @@ impl Inherited {
         match mode {
             NetworkMode::Isolated => "isolated",
             NetworkMode::LandlockOnly => "host",
+            NetworkMode::Brokered => "broker",
         }
     }
 }
@@ -117,7 +136,17 @@ impl Inherited {
 /// A run that fully denies the network says nothing, in keeping with the rest of
 /// the tool: output means something needs attention.
 pub fn report(mode: NetworkMode, policy: &Policy, inherited: Inherited) {
-    if mode == NetworkMode::Isolated {
+    if matches!(mode, NetworkMode::Isolated | NetworkMode::Brokered) {
+        return;
+    }
+    if inherited == Inherited::Brokered {
+        if !matches!(policy.network.egress, Egress::DenyAll) {
+            eprintln!(
+                "bailey: note: the sandbox this run is inside holds egress to a \
+                 single broker, so only connections through it will succeed; \
+                 UDP, DNS, and ICMP are dropped"
+            );
+        }
         return;
     }
     if inherited == Inherited::IsolatedNamespace {
@@ -299,9 +328,9 @@ mod tests {
 
     /// A proxied run makes its own network namespace before the backend is
     /// reached, so the backend must not make a second one and throw away the
-    /// one pasta configured. The broker's port is added to the policy before
-    /// the mode is chosen, which is what keeps this true; a change that stops
-    /// doing so would take the egress rule with it.
+    /// one pasta configured. The backend is told the run is brokered and skips
+    /// the selection, but the policy it is given would not select a namespace
+    /// either, so losing that flag would still keep the egress rule.
     #[test]
     fn a_proxied_run_is_not_given_a_second_network_namespace() {
         // What `permit_broker_port` leaves behind for a brokered run.
@@ -313,6 +342,25 @@ mod tests {
             bind_ports: Vec::new(),
         });
         assert_eq!(select(&policy, true), NetworkMode::LandlockOnly);
+    }
+
+    /// A nested run inside a brokered session used to read it as the host's
+    /// network and warn that UDP was open, when the broker's rule drops it.
+    #[test]
+    fn a_nested_run_reads_back_what_the_outer_run_published() {
+        assert_eq!(
+            Inherited::read(Some(Inherited::publish(NetworkMode::Isolated))),
+            Inherited::IsolatedNamespace
+        );
+        assert_eq!(
+            Inherited::read(Some(Inherited::publish(NetworkMode::LandlockOnly))),
+            Inherited::HostNamespace
+        );
+        assert_eq!(
+            Inherited::read(Some(Inherited::publish(NetworkMode::Brokered))),
+            Inherited::Brokered
+        );
+        assert_eq!(Inherited::read(None), Inherited::None);
     }
 
     /// A policy that allows egress still needs the host's network.

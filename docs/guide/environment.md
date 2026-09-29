@@ -32,7 +32,7 @@ sandbox itself:
 | Variable | Meaning |
 | --- | --- |
 | `BAILEY_SANDBOX` | `1`, in every confined run |
-| `BAILEY_SANDBOX_NET` | `isolated` when the run has a network namespace of its own with no route off the host, `host` when it shares yours |
+| `BAILEY_SANDBOX_NET` | `isolated` when the run has a network namespace of its own with no route off the host, `broker` when its egress is held to an `--egress-proxy` broker, `host` when it shares yours |
 
 These are what let a bailey run *inside* a sandbox report what it inherited
 rather than guess, and what lets your prompt show that a shell is confined. They
