@@ -191,6 +191,34 @@ variables that point a program at it. Entries accumulate across layers and are
 cleared by `filesystem.reset = true`. A relay overlapping a grant is a
 resolution error, because the relay exists to keep the directory ungranted.
 
+## `[[forward]]`
+
+An array of tables, one per host TCP port carried onto the sandbox's own
+loopback. The target dials `127.0.0.1:port` the way it would dial a local
+daemon, and bailey carries the connection out to the host. The network
+namespace keeps its edge: nothing beyond the named ports is reachable.
+
+| Key | Type | Description |
+| --- | --- | --- |
+| `port` | integer | The port inside the sandbox; required, not 0 |
+| `host_port` | integer | The host port it lands on; defaults to `port` |
+
+```toml
+[[forward]]
+port = 9876
+
+[[forward]]
+port = 5432
+host_port = 15432
+```
+
+Entries accumulate across layers and are cleared by `filesystem.reset = true`.
+Two different host ports for one sandbox port is refused, as is a forward
+sharing a port the policy already binds. Isolation is required: the listeners
+are bound inside the target's own loopback and handed to bailey over a file
+descriptor before exec, which is what keeps them off the host. Egress stays
+denied; the forward is the one exception, and it carries only what dials it.
+
 ## `[resources]`
 
 | Key | Type | Description |

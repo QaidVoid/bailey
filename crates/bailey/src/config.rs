@@ -28,7 +28,7 @@ use serde::Deserialize;
 use crate::hooks::Hooks;
 use crate::policy::{
     Access, DeviceRule, Egress, EgressRule, EnvPolicy, FsRule, FuseMount, NetworkPolicy, Policy,
-    ResourceLimits, SocketRelay,
+    PortForward, ResourceLimits, SocketRelay,
 };
 use crate::trust::{Rejected, Store};
 
@@ -202,6 +202,8 @@ struct RawLayer {
     fuse: Vec<RawFuse>,
     #[serde(default)]
     socket: Vec<RawSocket>,
+    #[serde(default)]
+    forward: Vec<RawForward>,
     /// Which targets a profile claims. Parsed only so that a profile carrying
     /// the key is still a valid config layer; the value is read by
     /// `profiles::for_target`, from the file rather than from here.
@@ -236,6 +238,16 @@ struct RawSocket {
     /// Where the target sees it, when naming a custom one. Defaults to the
     /// host path, since a custom socket usually keeps its own name.
     at: Option<String>,
+}
+
+/// One host TCP port the target may reach on loopback.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawForward {
+    /// The port the target dials inside the sandbox.
+    port: u16,
+    /// The host port the connection lands on. Defaults to `port`.
+    host_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -364,6 +376,7 @@ struct Accumulator {
     home: Option<PathBuf>,
     fuse: Vec<FuseMount>,
     sockets: Vec<SocketRelay>,
+    forwards: Vec<PortForward>,
 }
 
 /// Discover the config layers for `target`, lowest precedence first.
@@ -526,6 +539,8 @@ fn apply_layer(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> 
         // Same standing: a socket relay is a promise to carry a host service
         // in, and one inherited from below would do it silently.
         acc.sockets.clear();
+        // A port forward is the same kind of promise, made about a TCP port.
+        acc.forwards.clear();
     }
     // After the reset, with this layer's grants: a layer that resets and
     // relocates in one breath means to keep its own placement, and clearing
@@ -588,6 +603,29 @@ fn apply_layer(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> 
 
     for socket in &layer.raw.socket {
         acc.sockets.push(build_socket(socket, &layer.path, &layer.base)?);
+    }
+
+    let mut forward_ports = std::collections::BTreeSet::new();
+    for forward in &layer.raw.forward {
+        if forward.port == 0 {
+            return Err(ConfigError::Invalid {
+                path: layer.path.clone(),
+                reason: "a forward on port 0 would mean any port, so a real \
+                         port is required"
+                    .into(),
+            });
+        }
+        if !forward_ports.insert(forward.port) {
+            return Err(ConfigError::Conflict {
+                path: layer.path.clone(),
+                target: forward.port.to_string(),
+                reason: "two forwards for the same port in one layer".into(),
+            });
+        }
+        acc.forwards.push(PortForward {
+            port: forward.port,
+            host_port: forward.host_port.unwrap_or(forward.port),
+        });
     }
 
     if let Some(resources) = &layer.raw.resources {
@@ -834,6 +872,7 @@ fn finalize(acc: Accumulator) -> Resolved {
             home: acc.home,
             fuse: acc.fuse,
             sockets: acc.sockets,
+            forwards: acc.forwards,
         },
         hooks: acc.hooks,
     }
@@ -1156,6 +1195,72 @@ mod tests {
             .map(|rule| rule.path.clone())
             .collect();
         assert_eq!(paths, vec![PathBuf::from("/a"), PathBuf::from("/b")]);
+    }
+
+    /// `host_port` defaults to the sandbox port, which is what nearly every
+    /// local daemon case wants: the target dials the port it knows.
+    #[test]
+    fn a_forward_defaults_to_the_same_port_on_the_host() {
+        let layers = [layer("/base", "[[forward]]\nport = 9876")];
+        let resolved = merge(&layers).unwrap();
+        assert_eq!(
+            resolved.policy.forwards,
+            vec![PortForward {
+                port: 9876,
+                host_port: 9876
+            }]
+        );
+    }
+
+    #[test]
+    fn a_forward_may_land_on_a_different_host_port() {
+        let layers = [layer(
+            "/base",
+            "[[forward]]\nport = 5432\nhost_port = 15432",
+        )];
+        let resolved = merge(&layers).unwrap();
+        assert_eq!(resolved.policy.forwards[0].host_port, 15432);
+    }
+
+    /// Port 0 would bind an arbitrary port, which the target cannot dial by
+    /// number, so the forward could never be used as written.
+    #[test]
+    fn a_forward_on_port_zero_is_refused() {
+        let layers = [layer("/base", "[[forward]]\nport = 0")];
+        assert!(merge(&layers).is_err());
+    }
+
+    #[test]
+    fn two_forwards_on_one_port_in_a_layer_are_refused() {
+        let layers = [layer(
+            "/base",
+            "[[forward]]\nport = 8080\nhost_port = 80\n[[forward]]\nport = 8080\nhost_port = 81",
+        )];
+        assert!(merge(&layers).is_err());
+    }
+
+    #[test]
+    fn a_reset_clears_forwards() {
+        // The filesystem reset is the layer-level one: fuse mounts, socket
+        // relays and forwards all clear with it, since inheriting any of them
+        // from below would carry a promise the profile never made.
+        let layers = [
+            layer("/base", "[[forward]]\nport = 9876"),
+            layer(
+                "/base",
+                "[filesystem]\nreset = true\n[[forward]]\nport = 6379",
+            ),
+        ];
+        let resolved = merge(&layers).unwrap();
+        assert_eq!(
+            resolved
+                .policy
+                .forwards
+                .iter()
+                .map(|f| f.port)
+                .collect::<Vec<_>>(),
+            vec![6379]
+        );
     }
 
     #[test]

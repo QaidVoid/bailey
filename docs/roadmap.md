@@ -44,6 +44,9 @@ the detail.
 - **Grants on the command line.** `--allow-read`, `--allow-write`,
   `--allow-exec`, `--read-only`, `--deny`, and `--allow-net` form the highest
   config layer, for one-off access without touching a file.
+- **One TCP port at a time.** A `[[forward]]` entry carries a host port onto
+  the sandbox's own loopback, so a tool that dials a local daemon reaches it
+  while the network namespace keeps refusing everything else.
 
 ## Decided against
 

@@ -100,13 +100,53 @@ same way it would hold any program that touches it; bailey refuses loudly as
 soon as the kernel answers, and cannot answer for the kernel before that.
 :::
 
-## Where relays and mounts end
+## Forwarding a local TCP port
 
-- Both need namespace isolation, which is the default. `--no-isolate` with
-  either in the policy refuses the run rather than dropping the feature.
+Some tools dial a TCP port on localhost the way a desktop service dials its
+socket: an MCP server that drives Blender listens on `127.0.0.1:9876`, a
+database insists on `127.0.0.1:5432`. A port forward carries one such port
+onto the sandbox's own loopback:
+
+```toml
+[[forward]]
+port = 9876
+```
+
+The target dials `127.0.0.1:9876` and reaches the host service. The port it
+dials and the port that answers need not match:
+
+```toml
+[[forward]]
+port = 5432
+host_port = 15432
+```
+
+The forward is a hole with a number on it. The network namespace still denies
+everything else; only the named port is carried, and only for connections the
+target itself dials. The listener lives on the sandbox's own loopback, bound
+inside the namespace and handed to bailey before exec, so the host never
+listens on it and nothing from outside the sandbox can reach it. Egress stays
+denied: a forward is not an internet allowance, and a policy with both a
+forward and `egress_allow` keeps the forward to its one port.
+
+::: warning A forward carries one connection at a time
+Each forwarded port serves its connections sequentially. A local daemon that
+holds one connection per client is the shape this is built for; a port shared
+by many concurrent clients queues them instead. Prefer the service's own
+socket relay (`[[socket]]`) when one exists.
+:::
+
+## Where relays, mounts, and forwards end
+
+- All three need namespace isolation, which is the default. `--no-isolate`
+  with any of them in the policy refuses the run rather than dropping the
+  feature.
 - A relay and a grant of the same hierarchy are refused together: the relay
   exists to keep a directory ungranted, and both at once is a contradiction.
 - A FUSE entry and `--no-isolate` are refused the same way, because a mount
   placed for the target needs a root to place it in.
-- On a machine without working relays or mounts, the refusal names what was
-  missing. Nothing is silently dropped from a policy.
+- A forward needs the network namespace of its own that isolation provides;
+  its listener is bound inside it and handed to bailey, which keeps it off
+  the host.
+- On a machine without working relays, mounts, or forwards, the refusal names
+  what was missing. Nothing is silently dropped from a policy.

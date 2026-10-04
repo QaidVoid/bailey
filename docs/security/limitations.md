@@ -193,6 +193,16 @@ is the browser's dispatcher, not the browser: a page can still be anything the
 web can be, and `xdg-open` is looked up in a trusted location and refused if
 someone other than its owner can write it.
 
+### A forwarded port is a door with one number on it
+
+The `[[forward]]` entry carries one host TCP port onto the sandbox's loopback.
+What dials it reaches the host service with the host service's own powers, so
+forward a service whose powers you would give the target directly. The forward
+is loopback IPv4 only, needs the network namespace that isolation provides, and
+carries no egress with it: everything else in the namespace stays refused. Each
+forwarded port serves its connections one at a time, so a many-client port
+queues rather than multiplexes.
+
 ## Isolation
 
 ### A private /tmp is skipped when the policy grants anything under /tmp

@@ -210,3 +210,104 @@ fn allowed_egress_reports_that_only_tcp_is_covered() {
         "a partial allowance must say what it does not cover: {stderr}"
     );
 }
+
+/// A forward carries one host port onto the sandbox's loopback, and a port
+/// the policy does not name stays unreachable even though the host serves it.
+#[test]
+fn forwarded_ports_carry_to_the_host_and_others_stay_dead() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    if python().is_none() || !netns_available() {
+        eprintln!("skipping: needs python3 and user namespaces");
+        return;
+    }
+
+    // The host services live on ports the test itself holds, so a sandbox
+    // that somehow shared the host stack would reach both of them.
+    fn held_server(stop: Arc<AtomicBool>) -> u16 {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    // Held but served with silence: a forwarded dial to this
+                    // port would hang, and an unforwarded one must not land.
+                    Ok((client, _)) => drop(client),
+                    Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+        });
+        port
+    }
+
+    fn echo_server(stop: Arc<AtomicBool>) -> u16 {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut client, _)) => {
+                        let mut buf = [0u8; 64];
+                        match client.read(&mut buf) {
+                            Ok(0) | Err(_) => {}
+                            Ok(n) => {
+                                let _ = client.write_all(&buf[..n]);
+                            }
+                        }
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+        });
+        port
+    }
+
+    let echo_stop = Arc::new(AtomicBool::new(false));
+    let hold_stop = Arc::new(AtomicBool::new(false));
+    let forwarded = echo_server(Arc::clone(&echo_stop));
+    let hidden = held_server(Arc::clone(&hold_stop));
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("bailey.toml");
+    fs::write(&config, format!("[[forward]]\nport = {forwarded}\n")).unwrap();
+
+    let program = format!(
+        "import socket\n\
+         s = socket.create_connection(('127.0.0.1', {forwarded}), timeout=5)\n\
+         s.sendall(b'ping-forward')\n\
+         s.shutdown(socket.SHUT_WR)\n\
+         print('echo-' + s.recv(64).decode())\n\
+         s.close()\n\
+         try:\n\
+         \x20   socket.create_connection(('127.0.0.1', {hidden}), timeout=2)\n\
+         \x20   print('reached-hidden')\n\
+         except OSError:\n\
+         \x20   print('hidden-refused')\n"
+    );
+    let output = Command::new(bailey())
+        .args(["run", "-c"])
+        .arg(&config)
+        .args([python().unwrap(), "-c", &program])
+        .output()
+        .unwrap();
+
+    echo_stop.store(true, Ordering::Relaxed);
+    hold_stop.store(true, Ordering::Relaxed);
+
+    let stdout = stdout_of(&output);
+    assert!(
+        stdout.contains("echo-ping-forward"),
+        "the forwarded port must carry to the host service: {stdout} stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("hidden-refused"),
+        "a host port the policy does not forward must stay unreachable: {stdout}"
+    );
+}

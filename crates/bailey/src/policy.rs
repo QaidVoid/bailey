@@ -198,6 +198,20 @@ pub struct SocketRelay {
     pub service: Option<String>,
 }
 
+/// A host TCP service the target may reach on loopback, one port at a time.
+///
+/// The target dials `127.0.0.1:port` inside its own network namespace, and
+/// bailey carries the connection to `127.0.0.1:host_port` on the host. Nothing
+/// else crosses: the namespace stays routeless, so UDP, DNS, and every other
+/// port stay dead, and the host's addressing stays invisible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortForward {
+    /// The port the target dials.
+    pub port: u16,
+    /// The host port the connection lands on.
+    pub host_port: u16,
+}
+
 /// A fully resolved, deny-by-default sandbox policy.
 ///
 /// Any access not explicitly granted here is denied. This is the single value
@@ -235,6 +249,8 @@ pub struct Policy {
     pub fuse: Vec<FuseMount>,
     /// Desktop service sockets relayed into the sandbox, in order.
     pub sockets: Vec<SocketRelay>,
+    /// Host TCP ports the target may reach on loopback, in order.
+    pub forwards: Vec<PortForward>,
 }
 
 impl Policy {

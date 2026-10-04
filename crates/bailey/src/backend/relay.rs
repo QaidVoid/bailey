@@ -12,6 +12,7 @@
 
 use std::io;
 use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -73,6 +74,66 @@ impl Relay {
     }
 }
 
+/// One end of a relayed connection: what a socket on either side can do.
+pub(crate) trait Duplex: Read + Write + Sized {
+    /// A second handle to the same connection.
+    fn try_duplicate(&self) -> io::Result<Self>;
+    /// Refuse further writes, which the peer reads as an end.
+    fn halt_writes(&self) -> io::Result<()>;
+}
+
+impl Duplex for UnixStream {
+    fn try_duplicate(&self) -> io::Result<Self> {
+        self.try_clone()
+    }
+
+    fn halt_writes(&self) -> io::Result<()> {
+        self.shutdown(std::net::Shutdown::Write)
+    }
+}
+
+impl Duplex for TcpStream {
+    fn try_duplicate(&self) -> io::Result<Self> {
+        self.try_clone()
+    }
+
+    fn halt_writes(&self) -> io::Result<()> {
+        self.shutdown(std::net::Shutdown::Write)
+    }
+}
+
+/// Carry bytes in both directions between two connected sockets.
+///
+/// Each direction propagates the end it sees: when one side stops writing, the
+/// other learns the request is complete. Without the shutdown, the pipe's own
+/// held descriptors would keep both sides waiting forever.
+pub(crate) fn pipe<A: Duplex, B: Duplex>(client: A, service: B)
+where
+    A: Send + 'static,
+    B: Send + 'static,
+{
+    let Ok(mut client_out) = client.try_duplicate() else {
+        return;
+    };
+    let Ok(mut service_out) = service.try_duplicate() else {
+        return;
+    };
+    let up = thread::spawn(move || {
+        let copied = io::copy(&mut client_out, &mut service_out);
+        let _ = service_out.halt_writes();
+        copied
+    });
+    let down = thread::spawn(move || {
+        let mut service = service;
+        let mut client = client;
+        let copied = io::copy(&mut service, &mut client);
+        let _ = client.halt_writes();
+        copied
+    });
+    let _ = up.join();
+    let _ = down.join();
+}
+
 /// Carry one connection between the sandbox side and the host socket.
 fn forward(client: UnixStream, host: PathBuf) {
     let Ok(service) = UnixStream::connect(&host) else {
@@ -80,31 +141,7 @@ fn forward(client: UnixStream, host: PathBuf) {
         // honest answer; a desktop program retries.
         return;
     };
-    let Ok(mut client_out) = client.try_clone() else {
-        return;
-    };
-    let Ok(mut service_out) = service.try_clone() else {
-        return;
-    };
-    // Each direction propagates the end it sees: when the client stops
-    // writing, the service learns the request is complete, and when the
-    // service stops answering, the client's read reaches an end. Without the
-    // shutdown, the relay's own held descriptors would keep both sides
-    // waiting forever.
-    let up = thread::spawn(move || {
-        let copied = io::copy(&mut client_out, &mut service_out);
-        let _ = service_out.shutdown(std::net::Shutdown::Write);
-        copied
-    });
-    let down = thread::spawn(move || {
-        let mut service = service;
-        let mut client = client;
-        let copied = io::copy(&mut service, &mut client);
-        let _ = client.shutdown(std::net::Shutdown::Write);
-        copied
-    });
-    let _ = up.join();
-    let _ = down.join();
+    pipe(client, service)
 }
 
 /// The most one URL may be, longer being a protocol error rather than a

@@ -14,7 +14,8 @@
 
 use std::collections::BTreeMap;
 use std::io;
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -27,12 +28,15 @@ use landlock::{
 
 use crate::backend::cgroup;
 use crate::backend::fuse;
+use crate::backend::forward;
 use crate::backend::isolation::{self, BindMount, Conceal, IsolationPlan};
 use crate::backend::network::{self, NetworkMode};
 use crate::backend::relay;
 use crate::backend::world::{self, World};
 use crate::backend::{Backend, BackendError, Target};
-use crate::policy::{self, Egress, FsRule, Policy, ResourceLimits};
+use crate::policy::{
+    self, Egress, FsRule, Policy, PortForward, ResourceLimits,
+};
 use crate::strings::quoted as json_string;
 
 /// Landlock ABI the backend targets. Best-effort compatibility degrades this
@@ -351,6 +355,56 @@ impl EnforceBackend {
             policy
         };
 
+        // A forward hands its listener across as a file descriptor, and that
+        // only makes sense when the listener is bound somewhere the host is
+        // not: inside the target's own loopback. Without the namespace the
+        // sandbox side would listen on the host's, and the parent would dial
+        // the same stack it already sits on.
+        let mut forward_announce: Option<UnixStream> = None;
+        let mut forward_child_end: Option<UnixStream> = None;
+        let mut forward_forwards: Option<Vec<PortForward>> = None;
+        if !policy.forwards.is_empty() {
+            if mode != NetworkMode::Isolated {
+                return Err(BackendError::Command(
+                    "the policy forwards ports, which need the target in a \
+                     network namespace of its own; run with isolation on, or \
+                     remove the [[forward]] entries"
+                        .into(),
+                ));
+            }
+            // The same file can arrive twice, explicit and discovered, and
+            // layers can name a forward again. An identical repeat collapses;
+            // two destinations for one inside port is a contradiction.
+            let mut forwards: Vec<PortForward> = Vec::new();
+            for forward in &policy.forwards {
+                match forwards.iter_mut().find(|named| named.port == forward.port) {
+                    Some(named) if named.host_port == forward.host_port => {}
+                    Some(named) => {
+                        return Err(BackendError::Command(format!(
+                            "two forwards dial out from port {}: one to host \
+                             port {}, one to {}",
+                            forward.port, named.host_port, forward.host_port
+                        )));
+                    }
+                    None => forwards.push(forward.clone()),
+                }
+            }
+            for forward in &forwards {
+                if policy.network.bind_ports.contains(&forward.port) {
+                    return Err(BackendError::Command(format!(
+                        "a forward and a bound port share {}; the forward's \
+                         listener needs the port inside the sandbox, the bind \
+                         needs it on the host, and one number cannot be both",
+                        forward.port
+                    )));
+                }
+            }
+            let (announce, child_end) = UnixStream::pair().map_err(BackendError::Io)?;
+            forward_child_end = Some(child_end);
+            forward_announce = Some(announce);
+            forward_forwards = Some(forwards);
+        }
+
         // Relocation only happens where a root is reconstructed to put it in.
         let mut plan = LandlockPlan::build(
             policy,
@@ -460,6 +514,11 @@ impl EnforceBackend {
         };
         let stop_before_exec = self.stop_before_exec;
         let file_bytes = policy.resources.file_bytes;
+        // The child end's descriptor number, valid in the forked child where
+        // fd numbers are preserved. Sending goes from the child end; the
+        // announce end below is the one the parent reads.
+        let forward_fd = forward_child_end.as_ref().map(|s| s.as_raw_fd());
+        let forward_ports = forward_forwards.clone().unwrap_or_default();
 
         // Safety: the closure runs in the forked child before exec. Bailey is
         // single-threaded at this point, so the usual fork-safety hazard of
@@ -510,6 +569,13 @@ impl EnforceBackend {
                 if let Some(max) = pids_via_rlimit {
                     set_process_limit(max)?;
                 }
+                // Inside the namespace now and before any policy: the forward
+                // listeners must bind the sandbox's own loopback, and Landlock
+                // comes after. The descriptors cross to the parent and are
+                // closed here at exec.
+                if let Some(fd) = forward_fd {
+                    forward::arm(fd, &forward_ports)?;
+                }
                 plan.apply()?;
                 seccompiler::apply_filter(&seccomp)
                     .map_err(|err| io::Error::other(format!("seccomp: {err}")))?;
@@ -529,12 +595,30 @@ impl EnforceBackend {
         }
 
         let child = command.spawn().map_err(BackendError::Io)?;
+        // The parent's copy of the child end must close before the handover is
+        // read, or the socket never reaches an end when the sandbox dies.
+        drop(forward_child_end);
+        let mut forward_guard: Option<forward::ForwardGuard> = None;
+        if let Some(announce) = forward_announce {
+            let forwards = forward_forwards.expect("announced forwards are set");
+            let guard = forward::ForwardGuard::receive(&announce, &forwards)
+                .map_err(BackendError::Io)?;
+            guard.serve();
+            for forward in &forwards {
+                report.applied(&format!(
+                    "forward 127.0.0.1:{} to host port {}",
+                    forward.port, forward.host_port
+                ));
+            }
+            forward_guard = Some(guard);
+        }
         Ok(Confined {
             child,
             cgroup,
             staging,
             fuse: fuse_guard,
             relay: relay_guard,
+            forward: forward_guard,
             report,
             summary: self.summary,
         })
@@ -588,6 +672,7 @@ pub struct Confined {
     staging: StagingGuard,
     fuse: fuse::FuseGuard,
     relay: Option<relay::RelayGuard>,
+    forward: Option<forward::ForwardGuard>,
     report: RunReport,
     summary: Summary,
 }
@@ -617,6 +702,9 @@ impl Confined {
         // The relay listeners close with the run, so a client inside cannot
         // reach past it.
         drop(self.relay);
+        // The forwarded listeners live on the sandbox's loopback, which stops
+        // existing with the last holder of the namespace.
+        drop(self.forward);
         let code = status.code().unwrap_or(-1);
         match self.summary {
             Summary::Text => self.report.print(code),
@@ -709,6 +797,10 @@ impl LandlockPlan {
         // could go, so permitting it widens nothing.
         if isolates_network {
             connect_ports.extend(policy.network.bind_ports.iter().copied());
+            // A forward is a dial the target means to make: its listener sits
+            // on the sandbox's own loopback, and egress denial would refuse
+            // the very connection the forward exists to carry.
+            connect_ports.extend(policy.forwards.iter().map(|f| f.port));
             connect_ports.sort_unstable();
             connect_ports.dedup();
         }
@@ -1783,7 +1875,7 @@ fn try_create_cgroup(limits: &ResourceLimits) -> io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::{Access, DeviceRule, FsRule};
+    use crate::policy::{Access, DeviceRule, Egress, FsRule, PortForward};
 
     /// A grant descriptor must be path-only: reading through it fails.
     ///
@@ -1872,6 +1964,36 @@ mod tests {
     #[test]
     fn the_seccomp_filter_builds_with_the_clone_rules() {
         assert!(build_seccomp_filter().is_ok());
+    }
+
+    /// A forward is a dial the target means to make, on a loopback that has
+    /// nothing else on it. Egress denial must not refuse the connection the
+    /// forward exists to carry.
+    #[test]
+    fn forward_ports_are_connectable_where_egress_is_denied() {
+        let mut policy = Policy::default();
+        policy.forwards.push(PortForward {
+            port: 9876,
+            host_port: 9876,
+        });
+        let plan = LandlockPlan::build(&policy, true, true);
+        assert!(plan.connect_ports.contains(&9876));
+    }
+
+    /// With egress allowed there is no connect rule at all, and a forward must
+    /// not introduce one: permitting connects for it would open every host
+    /// port, not just the one forwarded.
+    #[test]
+    fn forward_ports_do_not_introduce_connect_rules_where_egress_is_allowed() {
+        let mut policy = Policy::default();
+        policy.network.egress = Egress::AllowAll;
+        policy.forwards.push(PortForward {
+            port: 9876,
+            host_port: 9876,
+        });
+        let plan = LandlockPlan::build(&policy, true, false);
+        assert!(plan.connect_ports.is_empty());
+        assert!(!plan.handle_connect);
     }
 
     #[test]

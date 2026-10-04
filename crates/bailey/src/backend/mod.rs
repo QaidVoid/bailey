@@ -14,6 +14,7 @@ pub mod isolation;
 pub mod network;
 pub mod probe;
 pub mod relay;
+pub mod forward;
 pub mod world;
 
 use std::path::PathBuf;
