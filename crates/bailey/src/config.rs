@@ -27,7 +27,7 @@ use serde::Deserialize;
 
 use crate::hooks::Hooks;
 use crate::policy::{
-    Access, DeviceRule, Egress, EgressRule, EnvPolicy, FsRule, NetworkPolicy, Policy,
+    Access, DeviceRule, Egress, EgressRule, EnvPolicy, FsRule, FuseMount, NetworkPolicy, Policy,
     ResourceLimits,
 };
 use crate::trust::{Rejected, Store};
@@ -198,12 +198,25 @@ struct RawLayer {
     hooks: Option<RawHooks>,
     env: Option<RawEnv>,
     home: Option<String>,
+    #[serde(default)]
+    fuse: Vec<RawFuse>,
     /// Which targets a profile claims. Parsed only so that a profile carrying
     /// the key is still a valid config layer; the value is read by
     /// `profiles::for_target`, from the file rather than from here.
     #[serde(default)]
     #[allow(dead_code)]
     applies_to: Vec<String>,
+}
+
+/// One FUSE mount bailey performs itself, placed at `at` for the target.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFuse {
+    /// Shell command that performs the mount, run as the caller with
+    /// `BAILEY_MOUNTPOINT` naming the host directory to mount onto.
+    mount: String,
+    /// Where the mount appears to the target.
+    at: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -330,6 +343,7 @@ struct Accumulator {
     hooks: Hooks,
     env: EnvPolicy,
     home: Option<PathBuf>,
+    fuse: Vec<FuseMount>,
 }
 
 /// Discover the config layers for `target`, lowest precedence first.
@@ -485,6 +499,10 @@ fn apply_layer(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> 
         // be the whole of what a run can reach is not, if a lower profile's
         // device nodes come along with it.
         acc.devices.clear();
+        // FUSE mounts run commands as the caller, so one left behind from a
+        // lower layer is exactly the kind of inheritance a reset exists to
+        // refuse.
+        acc.fuse.clear();
     }
     // After the reset, with this layer's grants: a layer that resets and
     // relocates in one breath means to keep its own placement, and clearing
@@ -530,6 +548,19 @@ fn apply_layer(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> 
             continue;
         };
         *acc.devices.entry(path).or_insert(Access::empty()) |= access;
+    }
+
+    for fuse in &layer.raw.fuse {
+        let Some(at) = resolve_path(&fuse.at, &layer.base) else {
+            return Err(ConfigError::Invalid {
+                path: layer.path.clone(),
+                reason: format!("fuse mount at `{}` resolves to nothing", fuse.at),
+            });
+        };
+        acc.fuse.push(FuseMount {
+            command: fuse.mount.clone(),
+            at,
+        });
     }
 
     if let Some(resources) = &layer.raw.resources {
@@ -641,6 +672,7 @@ fn finalize(acc: Accumulator) -> Resolved {
             resources: acc.resources,
             env: acc.env,
             home: acc.home,
+            fuse: acc.fuse,
         },
         hooks: acc.hooks,
     }
@@ -1420,5 +1452,42 @@ mod tests {
             expand_flag_path("~/notes").unwrap(),
             PathBuf::from("/home/tester/notes")
         );
+    }
+
+    #[test]
+    fn fuse_mounts_accumulate_and_resolve_at() {
+        let layers = [
+            layer("/base", "[[fuse]]\nmount = \"one\"\nat = \"/mnt/a\""),
+            layer("/base", "[[fuse]]\nmount = \"two\"\nat = \"rel\""),
+        ];
+        let resolved = merge(&layers).unwrap();
+        assert_eq!(resolved.policy.fuse.len(), 2);
+        assert_eq!(resolved.policy.fuse[0].at, PathBuf::from("/mnt/a"));
+        assert_eq!(resolved.policy.fuse[1].at, PathBuf::from("/base/rel"));
+    }
+
+    /// FUSE mounts run commands as the caller, so one left behind from a lower
+    /// layer is exactly the inheritance a reset exists to refuse.
+    #[test]
+    fn a_reset_clears_fuse_mounts_too() {
+        let layers = [
+            layer("/base", "[[fuse]]\nmount = \"one\"\nat = \"/mnt/a\""),
+            layer(
+                "/base",
+                "[filesystem]\nreset = true\nread = [\"/a\"]\n[[fuse]]\nmount = \"two\"\nat = \"/mnt/b\"",
+            ),
+        ];
+        let resolved = merge(&layers).unwrap();
+        assert_eq!(resolved.policy.fuse.len(), 1);
+        assert_eq!(resolved.policy.fuse[0].command, "two");
+    }
+
+    #[test]
+    fn unknown_fuse_keys_are_refused() {
+        // The refusal happens at deserialize, before any merging.
+        let parsed: Result<RawLayer, _> = toml::from_str(
+            "[[fuse]]\nmount = \"one\"\nat = \"/mnt/a\"\nextra = \"x\"",
+        );
+        assert!(parsed.is_err());
     }
 }

@@ -9,6 +9,7 @@ pub mod audit;
 pub mod audit_helper;
 pub mod cgroup;
 pub mod enforce;
+pub mod fuse;
 pub mod isolation;
 pub mod network;
 pub mod probe;
@@ -45,6 +46,10 @@ pub enum BackendError {
     /// narrower than the policy says. The message carries the path and cause.
     #[error("{0}")]
     UnreadablePath(String),
+    /// A command bailey runs on the caller's behalf failed. The message
+    /// carries the command and cause.
+    #[error("{0}")]
+    Command(String),
 }
 
 /// A sandbox execution backend.

@@ -256,3 +256,108 @@ fn the_file_limit_is_reported_as_enforced() {
         "the file limit must be reported as enforced: {reported}"
     );
 }
+
+/// A `[[fuse]]` entry is mounted by bailey before the target starts and
+/// appears at its `at` inside the sandbox. The mount command here fills the
+/// mountpoint by hand, which stands in for a real FUSE filesystem: what the
+/// test proves is the wiring, that the command runs, the grant is placed, and
+/// the mount lands where the policy says.
+#[test]
+fn a_fuse_mount_is_performed_and_placed() {
+    if !landlock_available() {
+        eprintln!("skipping: Landlock unavailable");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("bailey.toml");
+    fs::write(
+        &config,
+        format!(
+            "[filesystem]\n\
+             read = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\", \"/etc\"]\n\
+             execute = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\"]\n\
+             [[fuse]]\n\
+             mount = \"mkdir -p \\\"$BAILEY_MOUNTPOINT\\\" && echo from-mount > \\\"$BAILEY_MOUNTPOINT/inside\\\"\"\n\
+             at = \"/mnt/data\"\n"
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(bailey())
+        .args(["run", "-c"])
+        .arg(&config)
+        .args(["/bin/sh", "-c", "cat /mnt/data/inside"])
+        .env("XDG_CONFIG_HOME", dir.path().join("no-config"))
+        .env("XDG_DATA_HOME", dir.path().join("no-store"))
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "the mount should be placed and readable: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "from-mount",
+        "the target reads the mount at its at"
+    );
+
+    // The fake mount leaves plain files where a real filesystem would have
+    // been mounted, so the unmount fails and the guard says so rather than
+    // deleting a tree it cannot prove is unmounted. A real FUSE unmount
+    // empties the staging directory, and teardown is then silent; the lib
+    // test `a_guard_tears_down_its_run_directory` covers that path.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("did not unmount"),
+        "a mount that will not go must be named: {stderr}"
+    );
+
+    // The stub's own leftover is the test's to remove: this tree provably
+    // holds nothing but the files the stub wrote.
+    for entry in fs::read_dir("/tmp").unwrap().flatten() {
+        let is_ours = entry
+            .path()
+            .join("0/inside")
+            .is_file()
+            && entry.file_name().to_str().unwrap().starts_with(".bailey-fuse.");
+        if is_ours {
+            fs::remove_dir_all(entry.path()).unwrap();
+        }
+    }
+}
+
+/// A `[[fuse]]` entry without namespace isolation cannot be placed, so the
+/// run refuses rather than silently dropping the mount the policy names.
+#[test]
+fn a_fuse_mount_without_isolation_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("bailey.toml");
+    fs::write(
+        &config,
+        "[filesystem]\n\
+         read = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\", \"/etc\"]\n\
+         execute = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\"]\n\
+         [[fuse]]\n\
+         mount = \"true\"\n\
+         at = \"/mnt/data\"\n",
+    )
+    .unwrap();
+
+    let output = Command::new(bailey())
+        .args(["run", "--no-isolate", "-c"])
+        .arg(&config)
+        .args(["/bin/sh", "-c", "true"])
+        .env("XDG_CONFIG_HOME", dir.path().join("no-config"))
+        .env("XDG_DATA_HOME", dir.path().join("no-store"))
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("fuse mounts"),
+        "the refusal should name the unplaceable mounts: {stderr}"
+    );
+}

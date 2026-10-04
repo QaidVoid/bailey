@@ -26,6 +26,7 @@ use landlock::{
 };
 
 use crate::backend::cgroup;
+use crate::backend::fuse;
 use crate::backend::isolation::{self, BindMount, Conceal, IsolationPlan};
 use crate::backend::network::{self, NetworkMode};
 use crate::backend::world::{self, World};
@@ -258,6 +259,36 @@ impl EnforceBackend {
             );
         }
 
+        // FUSE mounts run as the caller, before any confinement exists, and
+        // ride into the sandbox as relocated grants on the extended policy.
+        // Everything below sees that policy, so the mounts are bound, placed,
+        // and covered by Landlock like any other grant. A policy naming a
+        // mount without the isolation that places it is refused, the way a
+        // nested denial is.
+        let mut fuse_guard = fuse::FuseGuard::default();
+        let fuse_policy;
+        let policy = if !policy.fuse.is_empty() {
+            if !isolated {
+                return Err(BackendError::Command(
+                    "the policy names fuse mounts, which need namespace \
+                     isolation to be placed; run without --no-isolate, or \
+                     remove the [[fuse]] entries"
+                        .into(),
+                ));
+            }
+            fuse::sweep_stale();
+            let run_dir = fuse::run_dir();
+            let mounted = fuse::mount_all(&policy.fuse, &run_dir)?;
+            for mount in &mounted {
+                report.applied(&format!("fuse mount at {}", mount.at().display()));
+            }
+            fuse_guard = fuse::FuseGuard::new(run_dir, mounted.clone());
+            fuse_policy = policy_with_fuse(policy, &mounted);
+            &fuse_policy
+        } else {
+            policy
+        };
+
         // Relocation only happens where a root is reconstructed to put it in.
         let mut plan = LandlockPlan::build(
             policy,
@@ -440,10 +471,21 @@ impl EnforceBackend {
             child,
             cgroup,
             staging,
+            fuse: fuse_guard,
             report,
             summary: self.summary,
         })
     }
+}
+
+/// A copy of `policy` with a grant for every FUSE mount, placed where the
+/// target sees it.
+fn policy_with_fuse(policy: &Policy, mounted: &[fuse::Mounted]) -> Policy {
+    let mut extended = policy.clone();
+    extended
+        .filesystem
+        .extend(mounted.iter().map(|mount| mount.rule()));
+    extended
 }
 
 /// Removes the host-visible staging directory a reconstructed root was built
@@ -469,6 +511,7 @@ pub struct Confined {
     child: std::process::Child,
     cgroup: CgroupGuard,
     staging: StagingGuard,
+    fuse: fuse::FuseGuard,
     report: RunReport,
     summary: Summary,
 }
@@ -492,6 +535,9 @@ impl Confined {
         // namespace; on the host it is an empty directory, removed when the
         // guard drops.
         drop(self.staging);
+        // The mounts are on the host, so they come down after the target is
+        // gone and there is no one left to read them.
+        drop(self.fuse);
         let code = status.code().unwrap_or(-1);
         match self.summary {
             Summary::Text => self.report.print(code),

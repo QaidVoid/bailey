@@ -170,6 +170,18 @@ fn matches_name(pattern: &str, name: &str) -> bool {
     }
 }
 
+/// A FUSE filesystem bailey mounts itself, so the target can use one without
+/// ever holding the power to mount.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FuseMount {
+    /// Shell command that performs the mount. It runs as the caller before any
+    /// confinement exists, with `BAILEY_MOUNTPOINT` naming the host directory
+    /// to mount onto, exactly the standing a `pre_launch` hook has.
+    pub command: String,
+    /// Where the mount appears to the target.
+    pub at: PathBuf,
+}
+
 /// A fully resolved, deny-by-default sandbox policy.
 ///
 /// Any access not explicitly granted here is denied. This is the single value
@@ -203,6 +215,8 @@ pub struct Policy {
     /// Host directory to use as the target's private home, overriding the
     /// derived one.
     pub home: Option<PathBuf>,
+    /// FUSE mounts bailey performs before the target starts, in order.
+    pub fuse: Vec<FuseMount>,
 }
 
 impl Policy {
