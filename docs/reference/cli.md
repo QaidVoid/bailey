@@ -28,6 +28,12 @@ exit status.
 | Option | Description |
 | --- | --- |
 | `-c, --config <FILE>` | Explicit config file, highest precedence |
+| `--allow-read <PATH>` | Grant read access to a path, above every config layer. Repeatable |
+| `--allow-write <PATH>` | Grant write access to a path. Repeatable |
+| `--allow-exec <PATH>` | Grant execute access to a path. Repeatable |
+| `--read-only <PATH>` | Keep a path read-only inside an allowed writable parent. Repeatable |
+| `--deny <PATH>` | Deny a path outright, retracting any grant. Repeatable |
+| `--allow-net <PORT>` | Allow outbound TCP to this port, on any host. Repeatable |
 | `-p, --profile <NAME>` | Profile used as the base, bundled or your own. Defaults to one that claims the target, else `untrusted` |
 | `--no-isolate` | Run without namespace isolation, leaving Landlock and seccomp |
 | `--isolate` | Accepted and redundant: isolation is the default |
@@ -60,6 +66,12 @@ the same policy without being invoked through bailey.
 | --- | --- |
 | `--shell <PATH>` | The shell to run. Defaults to `$SHELL`, then `/bin/sh` |
 | `-c, --config <FILE>` | Explicit config file, highest precedence |
+| `--allow-read <PATH>` | Grant read access to a path, above every config layer. Repeatable |
+| `--allow-write <PATH>` | Grant write access to a path. Repeatable |
+| `--allow-exec <PATH>` | Grant execute access to a path. Repeatable |
+| `--read-only <PATH>` | Keep a path read-only inside an allowed writable parent. Repeatable |
+| `--deny <PATH>` | Deny a path outright, retracting any grant. Repeatable |
+| `--allow-net <PORT>` | Allow outbound TCP to this port, on any host. Repeatable |
 | `-p, --profile <NAME>` | Profile used as the base |
 | `--no-isolate` | Run without namespace isolation, leaving Landlock and seccomp |
 
@@ -67,6 +79,12 @@ The launch directory is granted read, write, and execute as the lowest layer, so
 a shell is useful in a directory with no config; any layer can retract it. The
 shell gets a private home derived from that directory, and its environment
 carries `BAILEY_SANDBOX` and `BAILEY_SANDBOX_DIR`.
+
+The quick-grant flags describe the highest config layer there is, above
+`--config`, and need no file and no trust step: you typed them, which is the
+same standing an explicit config has. A relative path resolves against the
+working directory, so `--allow-write .` means where you are. An unset variable
+in a flag path is an error rather than a grant that quietly matches nothing.
 
 What was enforced is printed before the shell takes the terminal, rather than on
 exit as `run` does. Exits with the shell's status. See

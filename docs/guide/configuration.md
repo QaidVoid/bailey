@@ -15,6 +15,10 @@ From lowest precedence to highest:
    target's directory *and* from your working directory, ordered by path depth so
    a closer file wins. A discovered file applies only after you have trusted it.
 4. **Explicit config.** A file passed with `--config`.
+5. **Command-line grants.** The `--allow-read`, `--allow-write`, `--allow-exec`,
+   `--read-only`, `--deny`, and `--allow-net` flags form a layer above
+   everything else, `--config` included. They need no file and no trust step:
+   you typed them, which is the same standing an explicit config has.
 
 Missing files are skipped. `bailey show <target>` lists the ones that were
 actually found, in order, says which walk found each, and marks any that did not

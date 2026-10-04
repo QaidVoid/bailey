@@ -158,6 +158,41 @@ The environment is deny-by-default, but `pass` forwards a variable verbatim. If
 you pass a variable that holds a credential, that credential is in the sandbox.
 Bailey does not inspect values.
 
+## Desktop relays and mounts
+
+### A relayed Wayland socket is your compositor
+
+The `[[socket]]` relay keeps the rest of the runtime directory out of reach,
+ssh-agent included, but a client that reaches the compositor through the relay
+can screenshot and inject input unless the compositor itself restricts it. That
+is a property of the Wayland protocol, not of the relay. Relay Wayland to
+programs you would let use your desktop; prefer the `url-open` broker when the
+only thing a program needs from your desktop is a browser.
+
+### A FUSE mount command runs before the sandbox, as the caller
+
+A `[[fuse]]` entry runs its command with `sh -c` in the bailey process, before
+any confinement exists, exactly where a `pre_launch` hook runs. Trusting a
+config with a `[[fuse]]` entry is trusting whoever can write it to run programs
+as you. The target never holds the mount syscalls: the seccomp filter denies
+them and the capability drop leaves nothing to mount with.
+
+### A hard-hung mount can hold the run at startup
+
+A mount whose server has gone away answers reads with an error once the
+connection is torn down, and hangs before that. Bailey refuses a run whose
+granted path cannot be read, naming the path and the error, but it cannot
+answer for the kernel before the kernel does: a mount that hangs `stat` hangs
+the run the same way it would hang any program touching it.
+
+### The URL broker opens only http and https
+
+The `url-open` relay validates the scheme, refuses anything else, and hands the
+URL to `xdg-open` as a single argument, never through a shell. What it grants
+is the browser's dispatcher, not the browser: a page can still be anything the
+web can be, and `xdg-open` is looked up in a trusted location and refused if
+someone other than its owner can write it.
+
 ## Isolation
 
 ### A private /tmp is skipped when the policy grants anything under /tmp

@@ -134,6 +134,63 @@ access = "rw"
 Device grants use filesystem semantics and accumulate across layers like
 filesystem grants.
 
+## `[[fuse]]`
+
+An array of tables, one per FUSE filesystem bailey mounts itself. Bailey runs
+the mount command as the caller before the target starts, with
+`BAILEY_MOUNTPOINT` naming the host directory to mount onto, and unmounts when
+the run ends. The target sees the filesystem at `at` and never holds the mount
+syscalls. See [desktop services and mounts](/guide/desktop).
+
+| Key | Type | Description |
+| --- | --- | --- |
+| `mount` | string | Shell command that performs the mount |
+| `at` | path | Where the mount appears to the target |
+
+```toml
+[[fuse]]
+mount = "rclone mount secret:project"
+at = "/mnt/project"
+```
+
+Entries accumulate across layers and are cleared by `filesystem.reset = true`.
+A failing mount command refuses the run. Isolation is required; `--no-isolate`
+with a `[[fuse]]` entry in the policy is an error.
+
+## `[[socket]]`
+
+An array of tables, one per desktop service socket relayed into the sandbox.
+Bailey listens on a socket of its own and carries connections to the real one,
+so a single service is reachable while the directory holding it, and every
+other socket in it, stays ungranted.
+
+Either name a `service`, or name both ends yourself, never both:
+
+| Key | Type | Description |
+| --- | --- | --- |
+| `service` | string | One of `wayland`, `x11`, `pulse`, `dbus`, `url-open` |
+| `host` | path | The host socket to relay, when naming a custom one |
+| `at` | path | Where the target sees it; defaults to `host` |
+
+```toml
+[[socket]]
+service = "wayland"
+
+[[socket]]
+service = "url-open"
+
+[[socket]]
+host = "${XDG_RUNTIME_DIR}/pipewire-0"
+at = "${XDG_RUNTIME_DIR}/pipewire-0"
+```
+
+Named services take their paths from the session the run is launched from, so
+`XDG_RUNTIME_DIR` must be set for them. The environment follows the relay: the
+target's `XDG_RUNTIME_DIR` is a per-run directory, and each service sets the
+variables that point a program at it. Entries accumulate across layers and are
+cleared by `filesystem.reset = true`. A relay overlapping a grant is a
+resolution error, because the relay exists to keep the directory ungranted.
+
 ## `[resources]`
 
 | Key | Type | Description |

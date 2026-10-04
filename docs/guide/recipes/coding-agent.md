@@ -71,6 +71,66 @@ full authority. The policy applies to what you launch through bailey, and the
 See [known limitations](/security/limitations) for the full list, and
 [project status](/roadmap) for what was deliberately not built.
 
+## One-off access, without editing the policy
+
+An agent's needs change day to day, and editing a trusted policy for each of
+them is its own leak. The quick-grant flags sit above every config layer for
+exactly one run:
+
+```sh
+bailey run --allow-read ~/reference.pdf /usr/bin/agent-cli
+bailey shell --allow-write /tmp/scratch --allow-net 8080
+```
+
+A relative path means the directory you are in, and an unset variable in a flag
+path is an error rather than a grant that quietly matches nothing. See the
+[CLI reference](/reference/cli).
+
+## Giving the agent a browser
+
+An agent that fetches documentation often wants to open a page for you to read.
+Granting the runtime directory to make that possible would also hand it
+ssh-agent. The `url-open` service gives it one line of protocol instead:
+
+```toml
+[[socket]]
+service = "url-open"
+```
+
+Inside the sandbox, the agent writes a URL to `$XDG_RUNTIME_DIR/url-open` and
+bailey opens it in your browser with `xdg-open`. Only `http` and `https` are
+accepted, and the agent never touches the browser, its profile, or its
+cookies:
+
+```sh
+printf 'https://docs.rs/landlock\n' | socat - UNIX-CONNECT:"$XDG_RUNTIME_DIR/url-open"
+```
+
+The same `[[socket]]` table carries Wayland, the session bus, PulseAudio, or any
+custom socket, one at a time, when an agent needs more of the desktop than a
+browser. See [desktop services and mounts](/guide/desktop).
+
+## A FUSE filesystem as the workspace
+
+When the project lives on a remote mount, let bailey do the mounting so the
+agent never needs to:
+
+```toml
+[filesystem]
+read = ["/mnt/project"]
+write = ["/mnt/project"]
+
+[[fuse]]
+mount = "rclone mount secret:project"
+at = "/mnt/project"
+```
+
+Bailey runs the mount as you, places it at `at` for the agent, and unmounts
+when the run ends. The agent reads and writes the filesystem; the mount
+syscalls stay denied to it. An existing FUSE mount needs no entry: grant the
+mountpoint and it binds in, and if the mount is dead the run refuses with the
+path named rather than starting without it.
+
 ## A narrower variation
 
 If the agent only needs to read and edit source, and you run the build yourself,

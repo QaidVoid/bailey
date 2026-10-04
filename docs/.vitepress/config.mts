@@ -56,6 +56,7 @@ export default defineConfig({
             { text: 'Configuration', link: '/guide/configuration' },
             { text: 'Trusting a config', link: '/guide/trusting-a-config' },
             { text: 'Profiles', link: '/guide/profiles' },
+            { text: 'Desktop services and mounts', link: '/guide/desktop' },
             { text: 'Auditing a program', link: '/guide/audit' },
             { text: 'Lifecycle hooks', link: '/guide/hooks' },
             { text: 'Knowing what was enforced', link: '/guide/diagnostics' },

@@ -69,6 +69,13 @@ and `XAUTHORITY` are passed only when `/tmp/.X11-unix` is granted.
 The variable without the socket is useless, and the socket without the variable
 is a program that cannot find its display, so bailey derives one from the other.
 
+When the policy
+[relays service sockets](/guide/desktop) instead of granting the directory, the
+same variables are set by a different road: `XDG_RUNTIME_DIR` names a per-run
+directory the target owns, the relayed sockets appear at their usual paths
+inside it, and each named service sets the variables that point a program at
+it.
+
 ## The private home
 
 Each target gets its own home directory at

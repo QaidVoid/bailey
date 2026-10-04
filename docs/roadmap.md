@@ -32,6 +32,18 @@ the detail.
   took away.
 - **Knowing what it costs.** The overhead is measured rather than asserted, by a
   script in the repository, and the numbers are [published](/reference/benchmarks).
+- **One service at a time.** A `[[socket]]` relay carries a single desktop
+  socket into the sandbox, so Wayland, the session bus, or audio can be granted
+  without the runtime directory they live in, ssh-agent included. The
+  `url-open` service brokers a URL to the host browser over one validated line.
+- **FUSE without the mount syscalls.** A `[[fuse]]` entry runs its mount as the
+  caller and unmounts with the run, so the target uses a FUSE filesystem while
+  the seccomp filter keeps denying `mount(2)`. A grant whose path cannot be
+  read, as with a dead mount, refuses the run rather than silently dropping
+  the grant.
+- **Grants on the command line.** `--allow-read`, `--allow-write`,
+  `--allow-exec`, `--read-only`, `--deny`, and `--allow-net` form the highest
+  config layer, for one-off access without touching a file.
 
 ## Decided against
 
@@ -43,12 +55,6 @@ Each of these was specified, investigated, and dropped.
   deliberately triggered denial produced zero records: the hook could never have
   fired. Removed rather than carried as config that does nothing.
   [`bailey audit`](/guide/audit) answers the same question.
-- **A user-mode network stack** for policies that allow some egress. It would
-  genuinely help, putting the host's loopback out of reach and allowing UDP and
-  ICMP to be switched off, but it needs an external binary, interface
-  configuration inside the sandbox, and a synchronised attach, for a gain that
-  applies only once egress has been deliberately allowed. What that mode does not
-  cover is [documented](/guide/network) instead.
 
 ## Not planned
 
