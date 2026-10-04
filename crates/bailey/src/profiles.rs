@@ -338,8 +338,13 @@ mod tests {
                 .iter()
                 .map(|layer| (layer.label.as_str(), layer.toml.as_str()))
                 .collect();
-            crate::config::resolve_with_bases(&borrowed, std::path::Path::new("/bin/true"), None)
-                .unwrap_or_else(|err| panic!("profile `{}` does not resolve: {err}", profile.name));
+            crate::config::resolve_with_bases(
+                &borrowed,
+                std::path::Path::new("/bin/true"),
+                None,
+                &[],
+            )
+            .unwrap_or_else(|err| panic!("profile `{}` does not resolve: {err}", profile.name));
         }
     }
 
@@ -353,9 +358,13 @@ mod tests {
             .iter()
             .map(|layer| (layer.label.as_str(), layer.toml.as_str()))
             .collect();
-        let resolved =
-            crate::config::resolve_with_bases(&borrowed, std::path::Path::new("/bin/true"), None)
-                .unwrap();
+        let resolved = crate::config::resolve_with_bases(
+            &borrowed,
+            std::path::Path::new("/bin/true"),
+            None,
+            &[],
+        )
+        .unwrap();
 
         assert!(
             matches!(&resolved.policy.network.egress, crate::policy::Egress::Allow(rules)

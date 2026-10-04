@@ -91,7 +91,7 @@ pub struct Resolved {
 /// on the command line. Missing config files are skipped; only files that exist
 /// contribute to the result.
 pub fn resolve(target: &Path, explicit: Option<&Path>) -> Result<Resolved, ConfigError> {
-    resolve_with_bases(&[], target, explicit)
+    resolve_with_bases(&[], target, explicit, &[])
 }
 
 /// Resolve configuration with `bases` applied as the lowest-precedence layers.
@@ -99,10 +99,16 @@ pub fn resolve(target: &Path, explicit: Option<&Path>) -> Result<Resolved, Confi
 /// Each base is a `(label, toml)` pair, typically a bundled profile. Bases are
 /// applied in order beneath all discovered config, so user config always
 /// overrides them. The label is used only in error messages.
+///
+/// `overrides` are `(label, toml)` pairs applied above everything, discovered
+/// config included. They carry what a caller asked for on the command line,
+/// which stands above every file for the same reason `explicit` is never
+/// trust-gated: the user typed it, at the moment they typed it.
 pub fn resolve_with_bases(
     bases: &[(&str, &str)],
     target: &Path,
     explicit: Option<&Path>,
+    overrides: &[(&str, &str)],
 ) -> Result<Resolved, ConfigError> {
     let base_dir = target_dir(target);
     let mut layers = Vec::new();
@@ -114,6 +120,9 @@ pub fn resolve_with_bases(
             continue;
         }
         layers.push(load_layer(&source.path)?);
+    }
+    for (label, text) in overrides {
+        layers.push(parse_layer(label, text, &base_dir)?);
     }
     merge(&layers)
 }
@@ -772,6 +781,38 @@ fn resolve_path(raw: &str, base: &Path) -> Option<PathBuf> {
     Some(normalize_lexical(&joined))
 }
 
+/// Resolve a path written in a quick-grant command-line flag the way a path
+/// written in config is: `${VAR}` and a leading `~` expand, then the result is
+/// made absolute against the working directory and lexically normalized.
+///
+/// Unlike a grant in a config file, an unset variable is an error rather than a
+/// grant that quietly matches nothing. A flag names exactly one path, and one
+/// dropped in expansion would leave the run narrower than the command line
+/// says, which is the kind of silence this tool exists to refuse.
+pub fn expand_flag_path(raw: &str) -> Result<PathBuf, String> {
+    let (expanded, had_unset) = expand_variables_tracked(raw);
+    if expanded.trim().is_empty() {
+        return Err(format!(
+            "`{raw}` expands to nothing, and an unset ${{VAR}} in a quick grant is an error"
+        ));
+    }
+    if had_unset {
+        return Err(format!(
+            "`{raw}` names a variable that is not set, and a quick grant must name a real path"
+        ));
+    }
+    let expanded = expand_tilde(&expanded);
+    let joined = if expanded.is_absolute() {
+        expanded
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(expanded),
+            Err(_) => expanded,
+        }
+    };
+    Ok(normalize_lexical(&joined))
+}
+
 /// Collapse `.` and `..` components without touching the filesystem, so that
 /// equivalent spellings of a path resolve to the same key during merge.
 fn normalize_lexical(path: &Path) -> PathBuf {
@@ -799,14 +840,24 @@ fn normalize_lexical(path: &Path) -> PathBuf {
 /// expands to nothing, which leaves a path that matches nothing rather than one
 /// that matches something unintended.
 fn expand_variables(raw: &str) -> String {
+    expand_variables_tracked(raw).0
+}
+
+/// The same expansion, reporting whether any named variable was unset.
+///
+/// A config grant that matches nothing is a documented silence; a flag grant
+/// that silently names a different path is a lie on the command line, so
+/// [`expand_flag_path`] refuses where this would drop.
+fn expand_variables_tracked(raw: &str) -> (String, bool) {
     let mut out = String::with_capacity(raw.len());
+    let mut had_unset = false;
     let mut rest = raw;
     while let Some(start) = rest.find("${") {
         out.push_str(&rest[..start]);
         let after = &rest[start + 2..];
         let Some(end) = after.find('}') else {
             out.push_str(&rest[start..]);
-            return out;
+            return (out, had_unset);
         };
         let name = &after[..end];
         match std::env::var_os(name) {
@@ -820,12 +871,12 @@ fn expand_variables(raw: &str) -> String {
                     out.push_str(&cwd.to_string_lossy());
                 }
             }
-            None => {}
+            None => had_unset = true,
         }
         rest = &after[end + 1..];
     }
     out.push_str(rest);
-    out
+    (out, had_unset)
 }
 
 /// Expand a value written in config the way a path written in config is.
@@ -1261,5 +1312,113 @@ mod tests {
         assert_eq!(parse_size("2GiB").unwrap(), 2 * 1024 * 1024 * 1024);
         assert_eq!(parse_size("1 MB").unwrap(), 1_000_000);
         assert!(parse_size("2Gigs").is_err());
+    }
+
+    /// Command-line grants sit above every file, `--config` included, which is
+    /// the whole point of typing them: the caller narrows or widens a policy
+    /// for one run without editing anything.
+    #[test]
+    fn an_override_deny_retracts_an_explicit_config_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("given.toml");
+        std::fs::write(&config, "[filesystem]\nread = [\"/granted\"]").unwrap();
+        let resolved = resolve_with_bases(
+            &[],
+            Path::new("/bin/true"),
+            Some(&config),
+            &[("command-line grants", "[filesystem]\ndeny = [\"/granted\"]")],
+        )
+        .unwrap();
+        assert!(
+            resolved.policy.filesystem.is_empty(),
+            "the override retracts the file's grant"
+        );
+        assert_eq!(resolved.policy.denied, vec![PathBuf::from("/granted")]);
+    }
+
+    #[test]
+    fn an_override_grant_overrides_an_explicit_config_denial() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("given.toml");
+        std::fs::write(&config, "[filesystem]\ndeny = [\"/kept-out\"]").unwrap();
+        let resolved = resolve_with_bases(
+            &[],
+            Path::new("/bin/true"),
+            Some(&config),
+            &[("command-line grants", "[filesystem]\nread = [\"/kept-out\"]")],
+        )
+        .unwrap();
+        assert!(resolved.policy.denied.is_empty());
+        assert_eq!(resolved.policy.filesystem[0].path, PathBuf::from("/kept-out"));
+    }
+
+    /// Egress is a scalar where later layers replace earlier ones, so a
+    /// `--allow-net` flag replaces whatever a file chose. That is the
+    /// documented precedence, not an accident to preserve.
+    #[test]
+    fn an_override_replaces_the_config_s_egress_choice() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("given.toml");
+        std::fs::write(&config, "[network]\negress = \"allow\"").unwrap();
+        let resolved = resolve_with_bases(
+            &[],
+            Path::new("/bin/true"),
+            Some(&config),
+            &[(
+                "command-line grants",
+                "[network]\negress_allow = [{ host = \"*\", port = 443 }]",
+            )],
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.policy.network.egress,
+            Egress::Allow(vec![EgressRule {
+                host: "*".into(),
+                port: Some(443)
+            }])
+        );
+    }
+
+    #[test]
+    fn flag_paths_resolve_against_the_working_directory() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            expand_flag_path("assets").unwrap(),
+            normalize_lexical(&cwd.join("assets"))
+        );
+        assert_eq!(
+            expand_flag_path("/absolute/path").unwrap(),
+            PathBuf::from("/absolute/path")
+        );
+    }
+
+    #[test]
+    fn flag_paths_expand_variables() {
+        unsafe { std::env::set_var("BAILEY_TEST_FLAG_PATH", "/opt/flag") };
+        assert_eq!(
+            expand_flag_path("${BAILEY_TEST_FLAG_PATH}/bin").unwrap(),
+            PathBuf::from("/opt/flag/bin")
+        );
+    }
+
+    /// A flag names exactly one path, so a variable that is unset is refused
+    /// rather than left to point the grant somewhere else.
+    #[test]
+    fn a_flag_path_with_an_unset_variable_is_refused() {
+        let err = expand_flag_path("${BAILEY_TEST_UNSET_VAR}/bin").unwrap_err();
+        assert!(err.contains("is not set"), "{err}");
+        let err = expand_flag_path("${BAILEY_TEST_UNSET_VAR}").unwrap_err();
+        assert!(err.contains("expands to nothing"), "{err}");
+        assert!(expand_flag_path("").is_err());
+    }
+
+    #[test]
+    fn flag_paths_expand_a_leading_tilde() {
+        let _env = crate::test_support::env_lock();
+        unsafe { std::env::set_var("HOME", "/home/tester") };
+        assert_eq!(
+            expand_flag_path("~/notes").unwrap(),
+            PathBuf::from("/home/tester/notes")
+        );
     }
 }

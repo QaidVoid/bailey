@@ -65,11 +65,137 @@ enum Command {
     Man,
 }
 
+/// One-off grants given on the command line.
+///
+/// They form the highest-precedence layer, above `--config`, and need no
+/// config file and no trust step: the caller typed them, which is the same
+/// standing an explicit config has. Paths resolve the way config paths do,
+/// with one difference: relative paths resolve against the working directory,
+/// because `--allow-write .` means "from where I am", not "from where the
+/// target lives".
+#[derive(Debug, Default, clap::Args)]
+pub struct QuickGrants {
+    /// Grant read access to a path.
+    #[arg(long, value_name = "PATH")]
+    pub allow_read: Vec<String>,
+    /// Grant write access to a path.
+    #[arg(long, value_name = "PATH")]
+    pub allow_write: Vec<String>,
+    /// Grant execute access to a path.
+    #[arg(long, value_name = "PATH")]
+    pub allow_exec: Vec<String>,
+    /// Keep a path read-only inside an allowed writable parent. Needs
+    /// isolation to hold.
+    #[arg(long, value_name = "PATH")]
+    pub read_only: Vec<String>,
+    /// Deny a path outright, retracting any grant a config made. Needs
+    /// isolation to hold.
+    #[arg(long, value_name = "PATH")]
+    pub deny: Vec<String>,
+    /// Allow outbound TCP to this port, on any host. Enforcement matches the
+    /// port only; a config layer's egress choice is replaced.
+    #[arg(long, value_name = "PORT", value_parser = clap::value_parser!(u16).range(1..))]
+    pub allow_net: Vec<u16>,
+}
+
+impl QuickGrants {
+    /// Whether any grant was asked for.
+    pub fn is_empty(&self) -> bool {
+        self.allow_read.is_empty()
+            && self.allow_write.is_empty()
+            && self.allow_exec.is_empty()
+            && self.read_only.is_empty()
+            && self.deny.is_empty()
+            && self.allow_net.is_empty()
+    }
+
+    /// The layer these flags describe, as TOML, or `None` when no flag was
+    /// given.
+    pub fn layer(&self) -> anyhow::Result<Option<String>> {
+        if self.is_empty() {
+            return Ok(None);
+        }
+        let resolve_all = |paths: &[String]| -> anyhow::Result<Vec<PathBuf>> {
+                paths
+                    .iter()
+                    .map(|raw| {
+                        config::expand_flag_path(raw)
+                            .map_err(|err| anyhow::anyhow!("--allow path: {err}"))
+                    })
+                    .collect()
+            };
+        let read = resolve_all(&self.allow_read)?;
+        let write = resolve_all(&self.allow_write)?;
+        let execute = resolve_all(&self.allow_exec)?;
+        let read_only = resolve_all(&self.read_only)?;
+        let deny = resolve_all(&self.deny)?;
+
+        let mut granted = std::collections::BTreeSet::new();
+        for path in read.iter().chain(&write).chain(&execute) {
+            granted.insert(path.clone());
+        }
+        for path in &deny {
+            if granted.contains(path) {
+                anyhow::bail!(
+                    "`{}` is both granted and denied on the command line",
+                    path.display()
+                );
+            }
+        }
+
+        let list = |paths: &[PathBuf]| -> String {
+            paths
+                .iter()
+                .map(|path| crate::strings::quoted(&path.to_string_lossy()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+
+        let mut out = String::new();
+        let mut fs_keys = Vec::new();
+        if !read.is_empty() {
+            fs_keys.push(format!("read = [{}]", list(&read)));
+        }
+        if !write.is_empty() {
+            fs_keys.push(format!("write = [{}]", list(&write)));
+        }
+        if !execute.is_empty() {
+            fs_keys.push(format!("execute = [{}]", list(&execute)));
+        }
+        if !read_only.is_empty() {
+            fs_keys.push(format!("read_only = [{}]", list(&read_only)));
+        }
+        if !deny.is_empty() {
+            fs_keys.push(format!("deny = [{}]", list(&deny)));
+        }
+        if !fs_keys.is_empty() {
+            out.push_str("[filesystem]\n");
+            for key in &fs_keys {
+                out.push_str(key);
+                out.push('\n');
+            }
+        }
+        if !self.allow_net.is_empty() {
+            let rules = self
+                .allow_net
+                .iter()
+                .map(|port| format!("{{ host = \"*\", port = {port} }}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!("[network]\negress_allow = [{rules}]\n"));
+        }
+        Ok(Some(out))
+    }
+}
+
 #[derive(Debug, clap::Args)]
 struct RunArgs {
     /// Explicit config file, taking highest precedence.
     #[arg(short, long)]
     config: Option<PathBuf>,
+    /// One-off grants, taking precedence over every config file.
+    #[command(flatten)]
+    quick_grants: QuickGrants,
     /// Profile to use as the base. Defaults to a profile that claims this
     /// target, or to the untrusted floor.
     #[arg(short, long)]
@@ -118,6 +244,9 @@ struct ShellArgs {
     /// Explicit config file, taking highest precedence.
     #[arg(short, long)]
     config: Option<PathBuf>,
+    /// One-off grants, taking precedence over every config file.
+    #[command(flatten)]
+    quick_grants: QuickGrants,
     /// Profile to use as the base. Defaults to a profile that claims the shell,
     /// or to the untrusted floor.
     #[arg(short, long)]
@@ -159,6 +288,9 @@ struct ShowArgs {
     /// Explicit config file, taking highest precedence.
     #[arg(short, long)]
     config: Option<PathBuf>,
+    /// One-off grants, taking precedence over every config file.
+    #[command(flatten)]
+    quick_grants: QuickGrants,
     /// Profile to use as the base. Defaults to a profile that claims this
     /// target, or to the untrusted floor.
     #[arg(short, long)]
@@ -890,7 +1022,7 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
     refuse_root()?;
     let (program, program_args) = split_command(args.command.clone())?;
     let profile = select_profile(args.profile.as_deref(), &program)?;
-    let mut resolved = resolve(&profile, &program, args.config.as_deref())?;
+    let mut resolved = resolve(&profile, &program, args.config.as_deref(), &args.quick_grants)?;
     report_untrusted(&program, args.config.as_deref());
     warn_if_target_denied(&resolved.policy, &program);
 
@@ -976,7 +1108,7 @@ fn cmd_shell(args: ShellArgs) -> anyhow::Result<i32> {
     let dir = std::env::current_dir()?;
 
     let profile = select_profile(args.profile.as_deref(), &shell)?;
-    let mut resolved = resolve_for_shell(&profile, &shell, &dir, args.config.as_deref())?;
+    let mut resolved = resolve_for_shell(&profile, &shell, &dir, args.config.as_deref(), &args.quick_grants)?;
     report_untrusted(&shell, args.config.as_deref());
     report_nesting();
     warn_if_home_granted(&dir);
@@ -1044,6 +1176,7 @@ fn resolve_for_shell(
     shell: &Path,
     dir: &Path,
     explicit: Option<&Path>,
+    grants: &QuickGrants,
 ) -> anyhow::Result<Resolved> {
     let implicit_shell = implicit_target_layer(shell);
     let implicit_dir = implicit_dir_layer(dir);
@@ -1057,7 +1190,26 @@ fn resolve_for_shell(
             .iter()
             .map(|layer| (layer.label.as_str(), layer.toml.as_str())),
     );
-    Ok(config::resolve_with_bases(&bases, shell, explicit)?)
+    let overrides = override_layers(grants)?;
+    let override_refs: Vec<(&str, &str)> = overrides
+        .iter()
+        .map(|(label, text)| (*label, text.as_str()))
+        .collect();
+    Ok(config::resolve_with_bases(
+        &bases,
+        shell,
+        explicit,
+        &override_refs,
+    )?)
+}
+
+/// The command-line grants as `(label, toml)` pairs, empty when none were
+/// given.
+fn override_layers(grants: &QuickGrants) -> anyhow::Result<Vec<(&'static str, String)>> {
+    match grants.layer()? {
+        Some(text) => Ok(vec![("command-line grants", text)]),
+        None => Ok(Vec::new()),
+    }
 }
 
 /// The layer granting the directory the shell was launched from.
@@ -1102,7 +1254,7 @@ fn cmd_audit(args: AuditArgs) -> anyhow::Result<i32> {
     refuse_root()?;
     let (program, program_args) = split_command(args.command)?;
     let profile = select_profile(args.profile.as_deref(), &program)?;
-    let resolved = resolve(&profile, &program, args.config.as_deref())?;
+    let resolved = resolve(&profile, &program, args.config.as_deref(), &QuickGrants::default())?;
     report_untrusted(&program, args.config.as_deref());
     let target_dir = target_dir(&program);
     let target = Target {
@@ -1168,7 +1320,7 @@ fn cmd_audit(args: AuditArgs) -> anyhow::Result<i32> {
 fn cmd_show(args: ShowArgs) -> anyhow::Result<i32> {
     let target = resolve_target(&args.target)?;
     let profile = select_profile(args.profile.as_deref(), &target)?;
-    let resolved = resolve(&profile, &target, args.config.as_deref())?;
+    let resolved = resolve(&profile, &target, args.config.as_deref(), &args.quick_grants)?;
     print_sources(&profile, &target, args.config.as_deref());
     print_policy(&resolved, &target);
     Ok(0)
@@ -1353,7 +1505,7 @@ fn cmd_profile_generate(args: GenerateArgs) -> anyhow::Result<i32> {
     }
 
     let profile = select_profile(args.profile.as_deref(), &args.target)?;
-    let resolved = resolve(&profile, &args.target, args.config.as_deref())?;
+    let resolved = resolve(&profile, &args.target, args.config.as_deref(), &QuickGrants::default())?;
     let target_dir = target_dir(&args.target);
 
     let effective = policy_with_own_storage(&resolved.policy, &args.target);
@@ -1430,7 +1582,12 @@ fn select_profile(requested: Option<&str>, target: &Path) -> anyhow::Result<Stri
     }
 }
 
-fn resolve(profile: &str, target: &Path, explicit: Option<&Path>) -> anyhow::Result<Resolved> {
+fn resolve(
+    profile: &str,
+    target: &Path,
+    explicit: Option<&Path>,
+    grants: &QuickGrants,
+) -> anyhow::Result<Resolved> {
     let implicit = implicit_target_layer(target);
     let layers = profiles::base_layers(profile).map_err(|err| anyhow::anyhow!(err))?;
     let mut bases: Vec<(&str, &str)> = vec![("implicit:target", implicit.as_str())];
@@ -1439,7 +1596,17 @@ fn resolve(profile: &str, target: &Path, explicit: Option<&Path>) -> anyhow::Res
             .iter()
             .map(|layer| (layer.label.as_str(), layer.toml.as_str())),
     );
-    Ok(config::resolve_with_bases(&bases, target, explicit)?)
+    let overrides = override_layers(grants)?;
+    let override_refs: Vec<(&str, &str)> = overrides
+        .iter()
+        .map(|(label, text)| (*label, text.as_str()))
+        .collect();
+    Ok(config::resolve_with_bases(
+        &bases,
+        target,
+        explicit,
+        &override_refs,
+    )?)
 }
 
 /// Split a command line into the target and the arguments passed to it.
