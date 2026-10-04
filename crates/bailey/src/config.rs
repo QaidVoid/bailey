@@ -200,6 +200,10 @@ struct RawLayer {
     home: Option<String>,
     #[serde(default)]
     fuse: Vec<RawFuse>,
+    /// The self-serve FUSE switch. A top-level key, since [[fuse]] owns the
+    /// table name for its entries.
+    #[serde(default)]
+    self_fuse: Option<bool>,
     #[serde(default)]
     socket: Vec<RawSocket>,
     #[serde(default)]
@@ -375,6 +379,9 @@ struct Accumulator {
     env: EnvPolicy,
     home: Option<PathBuf>,
     fuse: Vec<FuseMount>,
+    /// The self-serve FUSE switch, with the path of the layer that set it,
+    /// so a conflicting policy can name where the switch came from.
+    self_fuse: Option<(bool, PathBuf)>,
     sockets: Vec<SocketRelay>,
     forwards: Vec<PortForward>,
 }
@@ -463,7 +470,7 @@ fn merge(layers: &[Layer]) -> Result<Resolved, ConfigError> {
     for layer in layers {
         apply_layer(&mut acc, layer)?;
     }
-    Ok(finalize(acc))
+    finalize(acc)
 }
 
 fn apply_layer(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> {
@@ -575,6 +582,10 @@ fn apply_layer(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> 
                 acc.bind_ports.push(*port);
             }
         }
+    }
+
+    if let Some(self_fuse) = layer.raw.self_fuse {
+        acc.self_fuse = Some((self_fuse, layer.path.clone()));
     }
 
     for device in &layer.raw.device {
@@ -841,7 +852,49 @@ fn build_socket(
     })
 }
 
-fn finalize(acc: Accumulator) -> Resolved {
+fn finalize(mut acc: Accumulator) -> Result<Resolved, ConfigError> {
+    // Self-serve FUSE hands the target mount power over the run's whole
+    // namespace, and two guarantees are enforced by mounts the target could
+    // then take down: a read-only island is a read-only bind the target could
+    // remount writable, and a denial beneath a grant is an empty mount
+    // covering the path, which the parent grant would expose. Refuse the
+    // combination rather than promise less than the policy says.
+    if let Some((true, source)) = &acc.self_fuse {
+        let island = acc.read_only.first();
+        let conceal = acc.denied.iter().find(|denied| {
+            acc.filesystem
+                .keys()
+                .any(|granted| denied.starts_with(granted) && denied.as_path() != granted)
+        });
+        if let Some(path) = island.or(conceal) {
+            let kind = if island.is_some() {
+                "a read-only island"
+            } else {
+                "a denial beneath a grant"
+            };
+            let why = if island.is_some() {
+                "remount writable"
+            } else {
+                "unmount"
+            };
+            return Err(ConfigError::Conflict {
+                path: source.clone(),
+                target: "self_fuse".into(),
+                reason: format!(
+                    "`{}` is {kind}, enforced by a mount the target could \
+                     {why} with the power self_fuse hands it. Clear \
+                     `self_fuse`, or drop {kind} from the policy",
+                    path.display()
+                ),
+            });
+        }
+        // A FUSE mount needs the device node, and a switch that promises
+        // full use should not also demand the boilerplate.
+        acc.devices
+            .entry(PathBuf::from("/dev/fuse"))
+            .or_insert(Access::READ | Access::WRITE);
+    }
+
     let relocated = acc.relocated;
     let filesystem = acc
         .filesystem
@@ -857,7 +910,7 @@ fn finalize(acc: Accumulator) -> Resolved {
         .map(|(path, access)| DeviceRule { path, access })
         .collect();
 
-    Resolved {
+    Ok(Resolved {
         policy: Policy {
             filesystem,
             denied: acc.denied.into_iter().collect(),
@@ -870,12 +923,13 @@ fn finalize(acc: Accumulator) -> Resolved {
             resources: acc.resources,
             env: acc.env,
             home: acc.home,
+            self_fuse: matches!(acc.self_fuse, Some((true, _))),
             fuse: acc.fuse,
             sockets: acc.sockets,
             forwards: acc.forwards,
         },
         hooks: acc.hooks,
-    }
+    })
 }
 
 /// Build the egress intent for a layer.
@@ -1755,5 +1809,83 @@ mod tests {
             "[[fuse]]\nmount = \"one\"\nat = \"/mnt/a\"\nextra = \"x\"",
         );
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn self_fuse_reaches_the_policy_and_brings_the_device() {
+        let resolved = merge(&[layer(
+            "/base",
+            "self_fuse = true\n[filesystem]\nread = [\"/a\"]",
+        )])
+        .unwrap();
+        assert!(resolved.policy.self_fuse);
+        assert!(resolved.policy.devices.iter().any(|rule| rule.path
+            == PathBuf::from("/dev/fuse")
+            && rule.access.contains(Access::READ | Access::WRITE)));
+    }
+
+    /// The switch means "nearest layer that sets it", the same standing an
+    /// `egress` setting has, so a project can turn off what a profile turned
+    /// on.
+    #[test]
+    fn self_fuse_follows_the_nearest_layer() {
+        let on_then_off = [
+            layer("/base", "self_fuse = true"),
+            layer("/base", "self_fuse = false"),
+        ];
+        assert!(!merge(&on_then_off).unwrap().policy.self_fuse);
+        let off_then_on = [
+            layer("/base", "self_fuse = false"),
+            layer("/base", "self_fuse = true"),
+        ];
+        assert!(merge(&off_then_on).unwrap().policy.self_fuse);
+    }
+
+    /// The read-only guarantee is a mount the target could unmount with the
+    /// power self_fuse hands it, so the two are refused together.
+    #[test]
+    fn self_fuse_with_a_read_only_island_is_refused() {
+        let layers = [layer(
+            "/base",
+            "self_fuse = true\n[filesystem]\nwrite = [\"/a\"]\nread_only = [\"/a/keep\"]",
+        )];
+        assert!(merge(&layers).is_err());
+    }
+
+    /// A denial beneath a grant is enforced by an empty mount over the path,
+    /// which the parent grant would expose again once the target can unmount.
+    #[test]
+    fn self_fuse_with_a_denial_beneath_a_grant_is_refused() {
+        let layers = [layer(
+            "/base",
+            "self_fuse = true\n[filesystem]\nread = [\"/a\"]\ndeny = [\"/a/secret\"]",
+        )];
+        assert!(merge(&layers).is_err());
+    }
+
+    /// A read-only island is a read-only bind wherever it sits: with mount
+    /// power the target could remount it writable, so even one no grant
+    /// reaches is refused.
+    #[test]
+    fn self_fuse_with_an_unnested_read_only_island_is_refused() {
+        let layers = [layer(
+            "/base",
+            "self_fuse = true\n[filesystem]\nread = [\"/a\"]\nread_only = [\"/c/keep\"]",
+        )];
+        assert!(merge(&layers).is_err());
+    }
+
+    /// A denial no grant reaches needs no mount to enforce, so it costs
+    /// nothing and is left alone.
+    #[test]
+    fn self_fuse_with_an_unnested_denial_is_accepted() {
+        let layers = [layer(
+            "/base",
+            "self_fuse = true\n[filesystem]\nread = [\"/a\"]\ndeny = [\"/b/secret\"]",
+        )];
+        let resolved = merge(&layers).unwrap();
+        assert!(resolved.policy.self_fuse);
+        assert!(resolved.policy.read_only.is_empty());
+        assert_eq!(resolved.policy.denied.len(), 1);
     }
 }

@@ -245,6 +245,17 @@ pub struct Policy {
     /// Host directory to use as the target's private home, overriding the
     /// derived one.
     pub home: Option<PathBuf>,
+    /// Whether the target may mount and unmount its own filesystems.
+    ///
+    /// Keeps `CAP_SYS_ADMIN` in the run's user namespace and allows the mount
+    /// syscall family through seccomp, so the target can mount its own FUSE
+    /// filesystems inside the sandbox. What it mounts lives and dies inside
+    /// the run's mount namespace. The same power reaches every mount the run
+    /// already holds, and two guarantees are enforced by mounts: a read-only
+    /// island is a read-only mount, and a denial beneath a grant is an empty
+    /// read-only mount covering the path. Resolution therefore refuses a
+    /// policy that asks for this and either of those at once.
+    pub self_fuse: bool,
     /// FUSE mounts bailey performs before the target starts, in order.
     pub fuse: Vec<FuseMount>,
     /// Desktop service sockets relayed into the sandbox, in order.

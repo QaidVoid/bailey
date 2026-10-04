@@ -219,6 +219,39 @@ namespaces. Where a host disables them, the run falls back to Landlock and
 seccomp and reports the downgrade, which for the network means TCP-only
 restriction.
 
+### `self_fuse` trades Landlock for mount power
+
+`self_fuse = true` keeps the mount syscalls and `CAP_SYS_ADMIN` inside the
+run's user namespace so the target can mount its own FUSE filesystems. This
+kernel will not let both stand: a process under a Landlock domain is refused
+every mount of a new filesystem, and a FUSE mount is a new filesystem. Binding
+and remounting what is already there stays allowed, but `mount("tmpfs")` and
+`mount("fuse")` return `EPERM` the moment a ruleset is applied, whichever
+rights the ruleset handles, and the kernel offers no right that opts back in.
+
+A `self_fuse` run therefore carries no Landlock ruleset. What still confines
+it is the shape of the root: only granted subtrees are bound in, a `deny` no
+grant reaches is simply not there, and the user namespace maps only the
+target's own uid, so DAC still stops it reading files its user could not read
+anyway. What weakens is everything that depended on a mount staying put:
+
+- A `read_only` island is a read-only bind the target can remount writable,
+  which would let it write a path the policy only let it read. The config
+  refuses `read_only` alongside `self_fuse` rather than enforce it loosely.
+- A `deny` beneath a grant is an empty mount the target could remove, so the
+  config refuses that combination too. A `deny` no grant reaches costs
+  nothing and stays.
+- The read-only remounts bailey adds on its own, such as the metadata
+  protection on read-granted paths, stay in place but are advisory: the
+  target has the power to lift them, and only the target's own good behavior
+  says it will not.
+
+The pid namespace, the network namespace, the seccomp filter (which still
+denies `pivot_root`, `setns`, and `unshare`), and the capability drop of
+everything but `CAP_SYS_ADMIN` all hold in a `self_fuse` run. It is a real
+confinement, measured by what the root contains rather than by what the
+kernel promises to refuse.
+
 ## Resource limits
 
 ### Skipped without a delegated cgroup

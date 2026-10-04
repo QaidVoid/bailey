@@ -94,7 +94,7 @@ impl ForwardGuard {
             };
             let host_port = *host_port;
             thread::spawn(move || {
-                for client in acceptor.incoming().flatten() {
+                    for client in acceptor.incoming().flatten() {
                     let Ok(service) = TcpStream::connect((Ipv4Addr::LOCALHOST, host_port)) else {
                         // No host service on this port right now. The client
                         // sees a closed connection instead of a hang, which

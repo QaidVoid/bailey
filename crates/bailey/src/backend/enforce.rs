@@ -186,8 +186,9 @@ impl EnforceBackend {
     pub fn spawn(&self, policy: &Policy, target: &Target) -> Result<Confined, BackendError> {
         report_degradation(policy);
 
-        let seccomp = build_seccomp_filter()
+        let seccomp = build_seccomp_filter(policy.self_fuse)
             .map_err(|err| BackendError::Unsupported(format!("seccomp: {err}")))?;
+        let keep_mount = policy.self_fuse;
 
         // User namespaces gate both the isolation layer and the network
         // namespace, so the host is probed once for both.
@@ -220,6 +221,9 @@ impl EnforceBackend {
             None => report.skipped("landlock", "the kernel does not provide Landlock"),
         }
         report.applied("seccomp");
+        if policy.self_fuse {
+            report.applied("self-serve fuse mounts");
+        }
         match mode {
             NetworkMode::Isolated => report.applied("network namespace"),
             NetworkMode::LandlockOnly
@@ -262,6 +266,18 @@ impl EnforceBackend {
                  absent under isolation; starting in the private home instead \
                  ({landed}). Grant the directory to keep it."
             );
+        }
+
+        // Self-serve FUSE is the target holding mount power inside the run's
+        // own namespace. Without a namespace to hold, the power would land on
+        // the host's, so the run is refused rather than widened.
+        if policy.self_fuse && !isolated {
+            return Err(BackendError::Command(
+                "the policy allows self-serve fuse mounts, which need \
+                 namespace isolation to stay inside the run; run without \
+                 --no-isolate, or clear `self_fuse`"
+                    .into(),
+            ));
         }
 
         // FUSE mounts run as the caller, before any confinement exists, and
@@ -576,7 +592,15 @@ impl EnforceBackend {
                 if let Some(fd) = forward_fd {
                     forward::arm(fd, &forward_ports)?;
                 }
-                plan.apply()?;
+                // Landlock and self-serve mounts cannot be combined: this
+                // kernel refuses a new filesystem to any process under a
+                // Landlock domain, and a FUSE mount is a new filesystem.
+                // Confinement then rests on the reconstructed root alone,
+                // which is why the config refuses the mount-backed
+                // restrictions the target could take down.
+                if !keep_mount {
+                    plan.apply()?;
+                }
                 seccompiler::apply_filter(&seccomp)
                     .map_err(|err| io::Error::other(format!("seccomp: {err}")))?;
                 // Last, so everything above still has what it needs. With no
@@ -585,7 +609,7 @@ impl EnforceBackend {
                 // the mount syscalls it would need inside one are denied
                 // outright; `unshare` and `setns` are denied for the same
                 // reason.
-                drop_capabilities()?;
+                drop_capabilities(keep_mount)?;
                 Ok(())
             });
         }
@@ -1419,11 +1443,19 @@ fn set_no_new_privs() -> io::Result<()> {
 /// The bounding set goes first, because a capability dropped from it cannot be
 /// regained by any later exec. The securebits then stop the kernel handing
 /// capabilities back across a `setuid` or an `execve`.
-fn drop_capabilities() -> io::Result<()> {
+///
+/// With `keep_mount`, `CAP_SYS_ADMIN` survives instead: it stays in the
+/// bounding set and the permitted and inheritable sets, and is raised ambient
+/// before the securebits land, so it crosses the exec of an ordinary binary.
+/// This is what `self_fuse` promises: the power to mount inside the run's own
+/// namespace, and nothing beyond it.
+fn drop_capabilities(keep_mount: bool) -> io::Result<()> {
     // SECBIT_NOROOT, SECBIT_NO_SETUID_FIXUP, SECBIT_NO_CAP_AMBIENT_RAISE and
     // the lock bit of each, so none of it can be undone.
     const SECUREBITS: libc::c_ulong = 0b1100_1111;
     const CAP_LAST: libc::c_ulong = 40;
+    const PR_CAP_AMBIENT_RAISE: libc::c_ulong = 2;
+    const CAP_SYS_ADMIN: libc::c_ulong = 21;
     const PR_CAP_AMBIENT_CLEAR_ALL: libc::c_ulong = 4;
     const CAPABILITY_VERSION_3: u32 = 0x2008_0522;
 
@@ -1432,11 +1464,13 @@ fn drop_capabilities() -> io::Result<()> {
         // Beyond the last capability this kernel knows, the call simply fails,
         // which is the signal to stop rather than an error to report.
         for cap in 0..=CAP_LAST {
+            if keep_mount && cap == CAP_SYS_ADMIN {
+                continue;
+            }
             if libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) != 0 {
                 break;
             }
         }
-        libc::prctl(libc::PR_SET_SECUREBITS, SECUREBITS, 0, 0, 0);
     }
 
     #[repr(C)]
@@ -1456,9 +1490,34 @@ fn drop_capabilities() -> io::Result<()> {
         version: CAPABILITY_VERSION_3,
         pid: 0,
     };
-    let data = [CapData::default(); 2];
+    let mut data = [CapData::default(); 2];
+    if keep_mount {
+        // CAP_SYS_ADMIN is 21, so bit 21 of the low word.
+        data[0].effective |= 1 << 21;
+        data[0].permitted |= 1 << 21;
+        data[0].inheritable |= 1 << 21;
+    }
     if unsafe { libc::syscall(libc::SYS_capset, &header, data.as_ptr()) } != 0 {
         return Err(io::Error::last_os_error());
+    }
+
+    unsafe {
+        // Ambient before the securebits: SECBIT_NO_CAP_AMBIENT_RAISE is
+        // among them and would refuse the raise. It must be ambient to
+        // survive the exec of an ordinary binary, which is every binary a
+        // policy grants.
+        if keep_mount
+            && libc::prctl(
+                libc::PR_CAP_AMBIENT,
+                PR_CAP_AMBIENT_RAISE,
+                21, /* CAP_SYS_ADMIN */
+                0,
+                0,
+            ) != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        libc::prctl(libc::PR_SET_SECUREBITS, SECUREBITS, 0, 0, 0);
     }
     Ok(())
 }
@@ -1540,17 +1599,6 @@ fn denied_syscalls() -> &'static [i64] {
         libc::SYS_swapon,
         libc::SYS_swapoff,
         libc::SYS_reboot,
-        libc::SYS_mount,
-        libc::SYS_umount2,
-        // The mount(2) replacement, split across several syscalls. Denying the
-        // old call alone would leave the same power reachable by the new one.
-        libc::SYS_fsopen,
-        libc::SYS_fsconfig,
-        libc::SYS_fsmount,
-        libc::SYS_move_mount,
-        libc::SYS_open_tree,
-        libc::SYS_fspick,
-        libc::SYS_mount_setattr,
         libc::SYS_pivot_root,
         libc::SYS_setns,
         libc::SYS_unshare,
@@ -1588,6 +1636,24 @@ fn denied_syscalls() -> &'static [i64] {
     ]
 }
 
+/// The mount syscall family: `mount(2)` and the new mount API that reaches
+/// the same power across several calls.
+///
+/// Denied by default. A policy with `self_fuse` lets them through, because
+/// the kernel still gates every one on `CAP_SYS_ADMIN` in the run's user
+/// namespace, which is exactly the capability `self_fuse` keeps.
+const MOUNT_SYSCALLS: &[i64] = &[
+    libc::SYS_mount,
+    libc::SYS_umount2,
+    libc::SYS_fsopen,
+    libc::SYS_fsconfig,
+    libc::SYS_fsmount,
+    libc::SYS_move_mount,
+    libc::SYS_open_tree,
+    libc::SYS_fspick,
+    libc::SYS_mount_setattr,
+];
+
 /// Type bytes of the ioctl families that create a subvolume or a snapshot,
 /// `_IOC_TYPE(nr)`, in bits 8 to 15 of the request.
 ///
@@ -1611,7 +1677,7 @@ const SUBVOL_IOCTL_TYPES: [u64; 2] = [0x94, 0xbc];
 /// the older ones this still supports do not.
 const TERMINAL_INJECTION_IOCTLS: [u64; 2] = [0x5412, 0x541c];
 
-fn build_seccomp_filter() -> anyhow::Result<seccompiler::BpfProgram> {
+fn build_seccomp_filter(self_fuse: bool) -> anyhow::Result<seccompiler::BpfProgram> {
     use seccompiler::{
         SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter, SeccompRule,
     };
@@ -1620,6 +1686,11 @@ fn build_seccomp_filter() -> anyhow::Result<seccompiler::BpfProgram> {
     for &nr in denied_syscalls() {
         // An empty rule vector matches the syscall unconditionally.
         rules.insert(nr, Vec::new());
+    }
+    if !self_fuse {
+        for &nr in MOUNT_SYSCALLS {
+            rules.insert(nr, Vec::new());
+        }
     }
 
     // ioctl carries too much that is ordinary to deny whole, so only the
@@ -1963,7 +2034,8 @@ mod tests {
     /// here rather than as every run failing to start.
     #[test]
     fn the_seccomp_filter_builds_with_the_clone_rules() {
-        assert!(build_seccomp_filter().is_ok());
+        assert!(build_seccomp_filter(false).is_ok());
+        assert!(build_seccomp_filter(true).is_ok());
     }
 
     /// A forward is a dial the target means to make, on a loopback that has
@@ -2136,7 +2208,8 @@ mod tests {
 
     #[test]
     fn seccomp_filter_builds() {
-        assert!(build_seccomp_filter().is_ok());
+        assert!(build_seccomp_filter(false).is_ok());
+        assert!(build_seccomp_filter(true).is_ok());
     }
 
     /// Constructs an ioctl request number the way the kernel macros do, so the
@@ -2154,7 +2227,7 @@ mod tests {
     /// lifted.
     #[test]
     fn the_filter_denies_subvolume_ioctls_and_spares_the_rest() {
-        let filter: seccompiler::BpfProgram = build_seccomp_filter().unwrap();
+        let filter: seccompiler::BpfProgram = build_seccomp_filter(false).unwrap();
 
         // btrfs SNAP_CREATE and SUBVOL_CREATE_V2, the pair the report used, and
         // bcachefs SUBVOLUME_CREATE, the same class on the other filesystem.
@@ -2296,21 +2369,21 @@ mod tests {
     #[test]
     fn the_whole_mount_family_is_denied() {
         // The old mount(2) and its split successors reach the same power, so a
-        // denylist that stops one but not the others stops nothing.
-        let denied = denied_syscalls();
-        for nr in [
-            libc::SYS_mount,
-            libc::SYS_umount2,
-            libc::SYS_fsopen,
-            libc::SYS_fsconfig,
-            libc::SYS_fsmount,
-            libc::SYS_move_mount,
-            libc::SYS_open_tree,
-            libc::SYS_fspick,
-            libc::SYS_mount_setattr,
-            libc::SYS_pivot_root,
-        ] {
-            assert!(denied.contains(&nr), "syscall {nr} should be denied");
+        // denylist that stops one but not the others stops nothing. The family
+        // lives in `MOUNT_SYSCALLS` alone, which is the only thing `self_fuse`
+        // lifts; the calls that would leave the namespace are denied outright
+        // and never lifted.
+        for nr in MOUNT_SYSCALLS {
+            assert!(
+                !denied_syscalls().contains(nr),
+                "syscall {nr} must sit in MOUNT_SYSCALLS alone, so self_fuse lifts it and nothing else"
+            );
+        }
+        for nr in [libc::SYS_pivot_root, libc::SYS_setns, libc::SYS_unshare] {
+            assert!(
+                denied_syscalls().contains(&nr),
+                "syscall {nr} must stay denied even with self_fuse"
+            );
         }
     }
 }
@@ -2341,7 +2414,7 @@ mod arch_guard_tests {
     /// Runs a probe in a child under the real filter and returns its exit code.
     /// A code in 0..256 is the probe's own; 256 + signal means it was killed.
     fn under_filter(probe: fn()) -> i32 {
-        let filter: seccompiler::BpfProgram = build_seccomp_filter().unwrap();
+        let filter: seccompiler::BpfProgram = build_seccomp_filter(false).unwrap();
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0);
         if pid == 0 {

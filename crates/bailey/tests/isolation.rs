@@ -7,6 +7,7 @@
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::process::Command;
 
 fn bailey() -> &'static str {
@@ -662,5 +663,121 @@ fn granting_dev_pts_gives_the_run_terminals_of_its_own() {
     assert!(
         !stdout.lines().any(|line| line.trim() == "1"),
         "the run must not see the host's terminals: {stdout}"
+    );
+}
+
+/// The policy for a mount test: the workspace granted for reading and writing
+/// so the mountpoint is reachable, on top of the system paths the target's own
+/// tools need.
+fn mount_workspace(dir: &std::path::Path, work: &std::path::Path, self_fuse: bool) -> std::path::PathBuf {
+    let config = dir.join("bailey.toml");
+    fs::write(
+        &config,
+        format!(
+            "{}[filesystem]\n\
+             read = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\", \"/etc\", \"{work}\"]\n\
+             write = [\"{work}\"]\n\
+             execute = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\"]\n",
+            if self_fuse { "self_fuse = true\n" } else { "" },
+            work = work.display()
+        ),
+    )
+    .unwrap();
+    config
+}
+
+/// The proof is at the syscall boundary, exactly as with the subvolume ioctl:
+/// the same `mount(2)` call is EPERM under the default filter and succeeds
+/// when `self_fuse` keeps the capability. A tmpfs is used rather than a real
+/// FUSE mount because it exercises the identical gate (the capability and the
+/// seccomp family) with no /dev/fuse or helper daemon on the path.
+///
+/// The call is made through ctypes because mount(8) refuses in restricted
+/// mode whenever it is not setuid and its caller is not root, and never
+/// reaches the syscall whose permission we are testing.
+#[test]
+fn self_fuse_lets_the_target_mount_and_unmount() {
+    if !isolation_active() {
+        eprintln!("skipping: isolation unavailable on this host");
+        return;
+    }
+    if !Path::new("/usr/bin/python3").exists() {
+        eprintln!("skipping: /usr/bin/python3 unavailable");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    fs::create_dir(&work).unwrap();
+
+    let config = mount_workspace(dir.path(), &work, true);
+    let script = format!(
+        "python3 -c \"\n\
+         import ctypes, os\n\
+         libc = ctypes.CDLL(None, use_errno=True)\n\
+         point = '{work}'.encode() + b'/m'\n\
+         os.makedirs(point, exist_ok=True)\n\
+         if libc.mount(b'tmpfs', point, b'tmpfs', 0, b'size=1m') != 0:\n\
+         \x20   raise SystemExit('mount failed: ' + os.strerror(ctypes.get_errno()))\n\
+         open(point + b'/inside', 'w').write('there')\n\
+         print('mounted')\n\
+         if libc.umount2(point, 0) != 0:\n\
+         \x20   raise SystemExit('umount failed: ' + os.strerror(ctypes.get_errno()))\n\
+         print('unmounted' if not os.path.exists(point + b'/inside') else 'still there')\n\"",
+        work = work.display()
+    );
+    let output = Command::new(bailey())
+        .args(["run", "--isolate", "-c"])
+        .arg(&config)
+        .args(["/bin/sh", "-c", &script])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success()
+            && stdout.contains("mounted")
+            && stdout.contains("unmounted"),
+        "self_fuse must let the target mount and unmount: {}{}",
+        stdout,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn mounting_stays_refused_without_self_fuse() {
+    if !isolation_active() {
+        eprintln!("skipping: isolation unavailable on this host");
+        return;
+    }
+    if !Path::new("/usr/bin/python3").exists() {
+        eprintln!("skipping: /usr/bin/python3 unavailable");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    fs::create_dir(&work).unwrap();
+
+    let config = mount_workspace(dir.path(), &work, false);
+    let script = format!(
+        "python3 -c \"\n\
+         import ctypes, os\n\
+         libc = ctypes.CDLL(None, use_errno=True)\n\
+         point = '{work}'.encode() + b'/m'\n\
+         os.makedirs(point, exist_ok=True)\n\
+         if libc.mount(b'tmpfs', point, b'tmpfs', 0, b'size=1m') == 0:\n\
+         \x20   raise SystemExit('unexpectedly mounted')\n\
+         print('refused')\n\"",
+        work = work.display()
+    );
+    let output = Command::new(bailey())
+        .args(["run", "--isolate", "-c"])
+        .arg(&config)
+        .args(["/bin/sh", "-c", &script])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("refused"),
+        "mounting must be refused without self_fuse: {stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }

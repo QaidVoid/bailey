@@ -157,6 +157,32 @@ Entries accumulate across layers and are cleared by `filesystem.reset = true`.
 A failing mount command refuses the run. Isolation is required; `--no-isolate`
 with a `[[fuse]]` entry in the policy is an error.
 
+## `self_fuse`
+
+A top-level boolean that lets the target mount its own filesystems. It keeps
+the mount syscalls, holds `CAP_SYS_ADMIN` inside the run's user namespace, and
+gets `/dev/fuse` without a `[[device]]` entry:
+
+```toml
+self_fuse = true
+```
+
+Like `egress`, the nearest layer that sets it decides. Isolation is required;
+`self_fuse` without `--isolate` is refused at startup.
+
+The cost is structural, and bailey refuses combinations that would promise
+more than it can deliver:
+
+- Recent kernels refuse a new filesystem to any process under a Landlock
+  domain, and a FUSE mount is a new filesystem. A `self_fuse` run therefore
+  has no Landlock ruleset; confinement rests on the reconstructed root alone.
+  See [known limitations](/security/limitations).
+- A `read_only` path is a read-only bind the target could remount writable,
+  so any `read_only` entry alongside `self_fuse` is a resolution error.
+- A `deny` beneath a grant is an empty mount the target could remove, so that
+  combination is a resolution error too. A `deny` no grant reaches is absent
+  from the root outright and stays enforced.
+
 ## `[[socket]]`
 
 An array of tables, one per desktop service socket relayed into the sandbox.
