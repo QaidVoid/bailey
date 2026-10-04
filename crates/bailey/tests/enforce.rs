@@ -361,3 +361,166 @@ fn a_fuse_mount_without_isolation_is_refused() {
         "the refusal should name the unplaceable mounts: {stderr}"
     );
 }
+
+/// A `[[socket]]` relay carries a host service into the sandbox one socket at
+/// a time: the target talks to the socket at its `at`, and the bytes come out
+/// at the real host socket, while the directory holding it is never granted.
+#[test]
+fn a_socket_relay_carries_a_service_into_the_sandbox() {
+    if !landlock_available() {
+        eprintln!("skipping: Landlock unavailable");
+        return;
+    }
+    if !Path::new("/usr/bin/python3").exists() && !Path::new("/bin/python3").exists() {
+        eprintln!("skipping: python3 unavailable to stand in for a service");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let service_sock = dir.path().join("real.sock");
+    let at_sock = dir.path().join("presented.sock");
+
+    // The service echoes one line per connection.
+    let mut server = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(format!(
+            "import socket, os\n\
+             p = {service_sock:?}\n\
+             s = socket.socket(socket.AF_UNIX)\n\
+             s.bind(p)\n\
+             s.listen(4)\n\
+             for _ in range(3):\n\
+             \x20   c, _ = s.accept()\n\
+             \x20   c.sendall(b'pong')\n\
+             \x20   c.close()\n",
+            service_sock = service_sock.to_str().unwrap(),
+        ))
+        .spawn()
+        .unwrap();
+    // Wait for the socket to appear.
+    for _ in 0..50 {
+        if service_sock.exists() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let config = dir.path().join("bailey.toml");
+    fs::write(
+        &config,
+        format!(
+            "[filesystem]\n\
+             read = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\", \"/etc\"]\n\
+             execute = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\"]\n\
+             [[socket]]\n\
+             host = \"{}\"\n\
+             at = \"{}\"\n",
+            service_sock.display(),
+            at_sock.display(),
+        ),
+    )
+    .unwrap();
+
+    let client = format!(
+        "import socket\n\
+         s = socket.socket(socket.AF_UNIX)\n\
+         s.connect({at_sock:?})\n\
+         print(s.recv(8).decode())\n",
+        at_sock = at_sock.to_str().unwrap(),
+    );
+    let output = std::process::Command::new(bailey())
+        .args(["run", "-c"])
+        .arg(&config)
+        .args(["/usr/bin/python3", "-c", &client])
+        .env("XDG_CONFIG_HOME", dir.path().join("no-config"))
+        .env("XDG_DATA_HOME", dir.path().join("no-store"))
+        .output()
+        .unwrap();
+
+    let _ = server.kill();
+    assert!(
+        output.status.success(),
+        "the relayed socket should answer: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "pong",
+        "the target reached the host service through the relay"
+    );
+}
+
+/// A named `dbus` relay points the session bus variable at the relayed
+/// socket, without the runtime directory being granted.
+#[test]
+fn a_dbus_relay_sets_the_bus_address() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("bailey.toml");
+    fs::write(
+        &config,
+        "[filesystem]\n\
+         read = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\", \"/etc\"]\n\
+         execute = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\"]\n\
+         [[socket]]\n\
+         service = \"dbus\"\n",
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(bailey())
+        .args(["run", "-c"])
+        .arg(&config)
+        .args(["/bin/sh", "-c", "echo $DBUS_SESSION_BUS_ADDRESS"])
+        // A fake runtime dir keeps the assertion deterministic: the relay's
+        // paths mirror whatever the session names, real or not.
+        .env("XDG_RUNTIME_DIR", "/run/user/test")
+        .env("XDG_CONFIG_HOME", dir.path().join("no-config"))
+        .env("XDG_DATA_HOME", dir.path().join("no-store"))
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout.trim(),
+        "unix:path=/run/user/test/bus",
+        "the bus address should name the relayed socket: {stdout}"
+    );
+}
+
+/// A relay and a grant of the same hierarchy are refused together: the relay
+/// exists to keep the directory ungranted, and both at once is a contradiction.
+#[test]
+fn a_socket_relay_overlapping_a_grant_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("bailey.toml");
+    fs::write(
+        &config,
+        format!(
+            "[filesystem]\n\
+             read = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\", \"/etc\", \"{}\"]\n\
+             execute = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\"]\n\
+             [[socket]]\n\
+             host = \"{}\"\n\
+             at = \"{}\"\n",
+            dir.path().display(),
+            dir.path().join("real.sock").display(),
+            dir.path().join("presented.sock").display(),
+        ),
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(bailey())
+        .args(["run", "-c"])
+        .arg(&config)
+        .args(["/bin/sh", "-c", "true"])
+        .env("XDG_CONFIG_HOME", dir.path().join("no-config"))
+        .env("XDG_DATA_HOME", dir.path().join("no-store"))
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("overlaps the grant"),
+        "the refusal should name the overlap: {stderr}"
+    );
+}

@@ -13,6 +13,7 @@ pub mod fuse;
 pub mod isolation;
 pub mod network;
 pub mod probe;
+pub mod relay;
 pub mod world;
 
 use std::path::PathBuf;

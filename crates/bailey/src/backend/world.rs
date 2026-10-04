@@ -198,6 +198,26 @@ fn controlling_terminal() -> Option<PathBuf> {
     None
 }
 
+/// Where the per-run session runtime directory appears to the target, when the
+/// policy relays service sockets.
+///
+/// The path mirrors the host's, so a relayed socket keeps its usual name and
+/// the display variables mean what they meant outside. Without a caller
+/// runtime directory to mirror, the conventional per-user path under `/run`
+/// stands in.
+pub(crate) fn runtime_dir_inside(policy: &Policy) -> Option<PathBuf> {
+    if policy.sockets.is_empty() {
+        return None;
+    }
+    match std::env::var_os("XDG_RUNTIME_DIR") {
+        Some(dir) if Path::new(&dir).is_absolute() => Some(PathBuf::from(dir)),
+        _ => Some(PathBuf::from(format!(
+            "/run/user/{}",
+            unsafe { libc::geteuid() }
+        ))),
+    }
+}
+
 /// Whether this process is already confined by an outer bailey run.
 ///
 /// There is no way to ask the kernel "am I restricted by Landlock", and a
@@ -248,6 +268,53 @@ pub fn environment(policy: &Policy, world: &World, network: NetworkMode) -> Vec<
     }
     if covered_by_grant(policy, Path::new("/tmp/.X11-unix")) {
         insert_from_caller(&mut env, X11_VARS);
+    }
+
+    // Relayed services set the same variables by a different road: the socket
+    // exists at its usual path because bailey put it there, not because the
+    // directory was granted. The runtime directory is the per-run tmpfs the
+    // relays live in, and each named service gets the variables that point a
+    // program at it.
+    if let Some(inside) = runtime_dir_inside(policy) {
+        env.insert(
+            "XDG_RUNTIME_DIR".into(),
+            inside.display().to_string(),
+        );
+        for socket in &policy.sockets {
+            match socket.service.as_deref() {
+                Some("wayland") => {
+                    for name in ["WAYLAND_DISPLAY", "XDG_SESSION_TYPE"] {
+                        if let Ok(value) = std::env::var(name) {
+                            env.insert(name.into(), value);
+                        }
+                    }
+                }
+                Some("x11") => {
+                    for name in ["DISPLAY", "XAUTHORITY"] {
+                        if let Ok(value) = std::env::var(name) {
+                            env.insert(name.into(), value);
+                        }
+                    }
+                }
+                Some("pulse") => {
+                    if let Ok(value) = std::env::var("PULSE_SERVER") {
+                        env.insert("PULSE_SERVER".into(), value);
+                    }
+                    // Without the variable, a Pulse client defaults to
+                    // `$XDG_RUNTIME_DIR/pulse/native`, which is where the
+                    // relay sits.
+                }
+                Some("dbus") => {
+                    env.insert(
+                        "DBUS_SESSION_BUS_ADDRESS".into(),
+                        format!("unix:path={}", socket.at.display()),
+                    );
+                }
+                // A custom relay carries no variables of its own; the config
+                // sets what it wants through `[env]`.
+                _ => {}
+            }
+        }
     }
 
     for (name, value) in std::env::vars() {

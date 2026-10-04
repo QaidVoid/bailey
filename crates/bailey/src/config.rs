@@ -28,7 +28,7 @@ use serde::Deserialize;
 use crate::hooks::Hooks;
 use crate::policy::{
     Access, DeviceRule, Egress, EgressRule, EnvPolicy, FsRule, FuseMount, NetworkPolicy, Policy,
-    ResourceLimits,
+    ResourceLimits, SocketRelay,
 };
 use crate::trust::{Rejected, Store};
 
@@ -200,6 +200,8 @@ struct RawLayer {
     home: Option<String>,
     #[serde(default)]
     fuse: Vec<RawFuse>,
+    #[serde(default)]
+    socket: Vec<RawSocket>,
     /// Which targets a profile claims. Parsed only so that a profile carrying
     /// the key is still a valid config layer; the value is read by
     /// `profiles::for_target`, from the file rather than from here.
@@ -217,6 +219,23 @@ struct RawFuse {
     mount: String,
     /// Where the mount appears to the target.
     at: String,
+}
+
+/// One desktop service socket relayed into the sandbox.
+///
+/// Either a named `service` or an explicit `host` and `at`, never both: a
+/// service's paths are chosen by bailey, and a custom socket's are chosen by
+/// the config.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSocket {
+    /// A named service: `wayland`, `x11`, `pulse`, or `dbus`.
+    service: Option<String>,
+    /// The host socket to relay, when naming a custom one.
+    host: Option<String>,
+    /// Where the target sees it, when naming a custom one. Defaults to the
+    /// host path, since a custom socket usually keeps its own name.
+    at: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -344,6 +363,7 @@ struct Accumulator {
     env: EnvPolicy,
     home: Option<PathBuf>,
     fuse: Vec<FuseMount>,
+    sockets: Vec<SocketRelay>,
 }
 
 /// Discover the config layers for `target`, lowest precedence first.
@@ -503,6 +523,9 @@ fn apply_layer(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> 
         // lower layer is exactly the kind of inheritance a reset exists to
         // refuse.
         acc.fuse.clear();
+        // Same standing: a socket relay is a promise to carry a host service
+        // in, and one inherited from below would do it silently.
+        acc.sockets.clear();
     }
     // After the reset, with this layer's grants: a layer that resets and
     // relocates in one breath means to keep its own placement, and clearing
@@ -561,6 +584,10 @@ fn apply_layer(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> 
             command: fuse.mount.clone(),
             at,
         });
+    }
+
+    for socket in &layer.raw.socket {
+        acc.sockets.push(build_socket(socket, &layer.path, &layer.base)?);
     }
 
     if let Some(resources) = &layer.raw.resources {
@@ -643,6 +670,125 @@ fn apply_layer(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> 
     Ok(())
 }
 
+/// Build one socket relay from a config entry.
+///
+/// A named `service` gets bailey's paths for it, taken from the session the
+/// run is launched from. An explicit entry names both ends itself, and the
+/// two spellings are refused together: a service's paths are bailey's to
+/// know, and a custom socket's are the config's.
+fn build_socket(
+    raw: &RawSocket,
+    path: &Path,
+    base: &Path,
+) -> Result<SocketRelay, ConfigError> {
+    if let Some(service) = &raw.service {
+        if raw.host.is_some() || raw.at.is_some() {
+            return Err(ConfigError::Invalid {
+                path: path.to_path_buf(),
+                reason: format!(
+                    "socket service `{service}` chooses its own paths; name \
+                     either a service or a host and at, not both"
+                ),
+            });
+        }
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| Path::new(&home).join(".runtime"))
+            });
+        let invalid = |reason: String| ConfigError::Invalid {
+            path: path.to_path_buf(),
+            reason,
+        };
+        return match service.as_str() {
+            "wayland" => {
+                let dir = runtime.ok_or_else(|| {
+                    invalid("service `wayland` needs XDG_RUNTIME_DIR, which is not set".into())
+                })?;
+                Ok(SocketRelay {
+                    host: dir.join("wayland-0"),
+                    at: dir.join("wayland-0"),
+                    service: Some(service.clone()),
+                })
+            }
+            "pulse" => {
+                let dir = runtime.ok_or_else(|| {
+                    invalid("service `pulse` needs XDG_RUNTIME_DIR, which is not set".into())
+                })?;
+                Ok(SocketRelay {
+                    host: dir.join("pulse").join("native"),
+                    at: dir.join("pulse").join("native"),
+                    service: Some(service.clone()),
+                })
+            }
+            "dbus" => {
+                let dir = runtime.ok_or_else(|| {
+                    invalid("service `dbus` needs XDG_RUNTIME_DIR, which is not set".into())
+                })?;
+                Ok(SocketRelay {
+                    host: dir.join("bus"),
+                    at: dir.join("bus"),
+                    service: Some(service.clone()),
+                })
+            }
+            "x11" => {
+                // The display number is the socket's name: `:1` means X1.
+                let number = std::env::var("DISPLAY")
+                    .ok()
+                    .and_then(|display| {
+                        display.split(':').next_back().and_then(|rest| {
+                            rest.split('.').next().map(str::to_owned)
+                        })
+                    })
+                    .unwrap_or_else(|| "0".into());
+                let valid = !number.is_empty()
+                    && number.chars().all(|ch| ch.is_ascii_digit());
+                if !valid {
+                    return Err(invalid(format!(
+                        "service `x11` could not read a display number from \
+                         DISPLAY `{}`",
+                        std::env::var("DISPLAY").unwrap_or_default()
+                    )));
+                }
+                let socket = PathBuf::from(format!("/tmp/.X11-unix/X{number}"));
+                Ok(SocketRelay {
+                    at: socket.clone(),
+                    host: socket.clone(),
+                    service: Some(service.clone()),
+                })
+            }
+            other => Err(invalid(format!(
+                "unknown socket service `{other}`; the known ones are wayland, \
+                 x11, pulse, and dbus"
+            ))),
+        };
+    }
+    let Some(host) = &raw.host else {
+        return Err(ConfigError::Invalid {
+            path: path.to_path_buf(),
+            reason: "a [[socket]] entry needs either a `service` or a `host`".into(),
+        });
+    };
+    let Some(host) = resolve_path(host, base) else {
+        return Err(ConfigError::Invalid {
+            path: path.to_path_buf(),
+            reason: format!("socket host `{host}` resolves to nothing"),
+        });
+    };
+    let at = match &raw.at {
+        Some(at) => resolve_path(at, base).ok_or_else(|| ConfigError::Invalid {
+            path: path.to_path_buf(),
+            reason: format!("socket at `{at}` resolves to nothing"),
+        })?,
+        None => host.clone(),
+    };
+    Ok(SocketRelay {
+        host,
+        at,
+        service: None,
+    })
+}
+
 fn finalize(acc: Accumulator) -> Resolved {
     let relocated = acc.relocated;
     let filesystem = acc
@@ -673,6 +819,7 @@ fn finalize(acc: Accumulator) -> Resolved {
             env: acc.env,
             home: acc.home,
             fuse: acc.fuse,
+            sockets: acc.sockets,
         },
         hooks: acc.hooks,
     }

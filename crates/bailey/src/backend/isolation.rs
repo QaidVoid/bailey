@@ -88,6 +88,10 @@ pub struct IsolationPlan {
     pub private_shm: bool,
     /// Size of the private `/dev/shm`, in bytes.
     pub shm_bytes: u64,
+    /// The session runtime directory to mount as a per-run tmpfs, so relayed
+    /// service sockets have somewhere to appear and the target has somewhere
+    /// to put its own. The path is where the target sees it.
+    pub runtime_dir: Option<PathBuf>,
     /// Directory to start the target in, once the new root is in place.
     pub cwd: PathBuf,
     /// Host directory the new root is staged in, removed by the parent after the
@@ -276,6 +280,15 @@ fn setup_root(plan: &IsolationPlan) -> io::Result<()> {
             None::<&str>,
         )
         .map_err(errno)?;
+    }
+
+    // The per-run runtime directory goes before the binds too, because the
+    // relayed sockets bind into it. It is the target's own: mode 0700 on a
+    // tmpfs mounted under the run's identity mapping means only the target's
+    // uid reaches it, which is what a session runtime directory is for.
+    if let Some(dir) = &plan.runtime_dir {
+        let target = new_root.join(dir.strip_prefix("/").unwrap_or(dir));
+        mount_tmpfs(&target, plan.tmp_bytes, "mode=0700")?;
     }
 
     for bind in &plan.binds {

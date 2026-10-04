@@ -29,9 +29,10 @@ use crate::backend::cgroup;
 use crate::backend::fuse;
 use crate::backend::isolation::{self, BindMount, Conceal, IsolationPlan};
 use crate::backend::network::{self, NetworkMode};
+use crate::backend::relay;
 use crate::backend::world::{self, World};
 use crate::backend::{Backend, BackendError, Target};
-use crate::policy::{self, Egress, Policy, ResourceLimits};
+use crate::policy::{self, Egress, FsRule, Policy, ResourceLimits};
 use crate::strings::quoted as json_string;
 
 /// Landlock ABI the backend targets. Best-effort compatibility degrades this
@@ -289,6 +290,50 @@ impl EnforceBackend {
             policy
         };
 
+        // Socket relays listen as the caller, then ride in as binds. Like the
+        // FUSE mounts they need isolation to be placed, and they refuse to
+        // share a path with a grant: the relay exists to keep the directory
+        // holding the real socket ungranted.
+        let mut relay_guard: Option<relay::RelayGuard> = None;
+        let relay_policy;
+        let policy = if !policy.sockets.is_empty() {
+            if !isolated {
+                return Err(BackendError::Command(
+                    "the policy relays sockets, which need namespace isolation \
+                     to be placed; run without --no-isolate, or remove the \
+                     [[socket]] entries"
+                        .into(),
+                ));
+            }
+            for socket in &policy.sockets {
+                for rule in &policy.filesystem {
+                    let visible = rule.at.as_ref().unwrap_or(&rule.path);
+                    if visible.starts_with(&socket.at) || socket.at.starts_with(visible) {
+                        return Err(BackendError::Command(format!(
+                            "a socket relay at `{}` overlaps the grant on `{}`; \
+                             the relay exists to keep that directory ungranted, \
+                             so grant the directory or drop the relay",
+                            socket.at.display(),
+                            visible.display()
+                        )));
+                    }
+                }
+            }
+            relay::sweep_stale();
+            let dir = relay::run_dir();
+            let ats: Vec<PathBuf> = policy.sockets.iter().map(|s| s.at.clone()).collect();
+            let guard = relay::listen_all(&ats, &dir).map_err(BackendError::Io)?;
+            for (relay, socket) in guard.relays().iter().zip(&policy.sockets) {
+                relay.serve(&socket.host);
+                report.applied(&format!("socket relay at {}", socket.at.display()));
+            }
+            relay_policy = policy_with_relays(policy, guard.relays());
+            relay_guard = Some(guard);
+            &relay_policy
+        } else {
+            policy
+        };
+
         // Relocation only happens where a root is reconstructed to put it in.
         let mut plan = LandlockPlan::build(
             policy,
@@ -472,6 +517,7 @@ impl EnforceBackend {
             cgroup,
             staging,
             fuse: fuse_guard,
+            relay: relay_guard,
             report,
             summary: self.summary,
         })
@@ -485,6 +531,18 @@ fn policy_with_fuse(policy: &Policy, mounted: &[fuse::Mounted]) -> Policy {
     extended
         .filesystem
         .extend(mounted.iter().map(|mount| mount.rule()));
+    extended
+}
+
+/// A copy of `policy` with a bind for every relay socket, placed where the
+/// target sees it.
+fn policy_with_relays(policy: &Policy, relays: &[relay::Relay]) -> Policy {
+    let mut extended = policy.clone();
+    extended.filesystem.extend(relays.iter().map(|relay| FsRule {
+        path: relay.listener_path.clone(),
+        access: policy::Access::READ | policy::Access::WRITE | policy::Access::EXECUTE,
+        at: Some(relay.at.clone()),
+    }));
     extended
 }
 
@@ -512,6 +570,7 @@ pub struct Confined {
     cgroup: CgroupGuard,
     staging: StagingGuard,
     fuse: fuse::FuseGuard,
+    relay: Option<relay::RelayGuard>,
     report: RunReport,
     summary: Summary,
 }
@@ -538,6 +597,9 @@ impl Confined {
         // The mounts are on the host, so they come down after the target is
         // gone and there is no one left to read them.
         drop(self.fuse);
+        // The relay listeners close with the run, so a client inside cannot
+        // reach past it.
+        drop(self.relay);
         let code = status.code().unwrap_or(-1);
         match self.summary {
             Summary::Text => self.report.print(code),
@@ -971,6 +1033,7 @@ fn build_isolation_plan(
         devpts: world.devpts,
         private_shm: world.private_shm,
         shm_bytes: policy.resources.shm_bytes.unwrap_or(DEFAULT_SHM_BYTES),
+        runtime_dir: world::runtime_dir_inside(policy),
         cwd: world.cwd.clone(),
         staging: PathBuf::from(format!("/tmp/{STAGING_PREFIX}{}", std::process::id())),
     })

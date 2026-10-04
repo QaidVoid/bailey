@@ -182,6 +182,22 @@ pub struct FuseMount {
     pub at: PathBuf,
 }
 
+/// One desktop service socket carried into the sandbox by a host-side relay.
+///
+/// The relay is what makes a single service grantable: the sandbox sees a
+/// socket at the service's usual path, backed by bailey, and the directory
+/// holding the real socket stays out of reach along with everything beside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SocketRelay {
+    /// The host socket the relay forwards to.
+    pub host: PathBuf,
+    /// Where the target sees the socket.
+    pub at: PathBuf,
+    /// The named service this is, when the config named one. Custom relays
+    /// carry `None` and set up their own environment.
+    pub service: Option<String>,
+}
+
 /// A fully resolved, deny-by-default sandbox policy.
 ///
 /// Any access not explicitly granted here is denied. This is the single value
@@ -217,6 +233,8 @@ pub struct Policy {
     pub home: Option<PathBuf>,
     /// FUSE mounts bailey performs before the target starts, in order.
     pub fuse: Vec<FuseMount>,
+    /// Desktop service sockets relayed into the sandbox, in order.
+    pub sockets: Vec<SocketRelay>,
 }
 
 impl Policy {
