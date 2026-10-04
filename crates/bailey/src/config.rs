@@ -757,9 +757,23 @@ fn build_socket(
                     service: Some(service.clone()),
                 })
             }
+            "url-open" => {
+                let dir = runtime.ok_or_else(|| {
+                    invalid("service `url-open` needs XDG_RUNTIME_DIR, which is not set".into())
+                })?;
+                // The socket is bailey's own: the host side of this relay is
+                // the broker, not another program, so the host path is the
+                // same path and never used.
+                let at = dir.join("url-open");
+                Ok(SocketRelay {
+                    host: at.clone(),
+                    at,
+                    service: Some(service.clone()),
+                })
+            }
             other => Err(invalid(format!(
                 "unknown socket service `{other}`; the known ones are wayland, \
-                 x11, pulse, and dbus"
+                 x11, pulse, dbus, and url-open"
             ))),
         };
     }

@@ -320,11 +320,28 @@ impl EnforceBackend {
                 }
             }
             relay::sweep_stale();
+            // A brokered URL needs the helper it opens with, and a run whose
+            // policy names it should say so before the target starts rather
+            // than answer every request with ERR.
+            if policy
+                .sockets
+                .iter()
+                .any(|socket| socket.service.as_deref() == Some("url-open"))
+            {
+                crate::cli::resolve_helper("xdg-open").map_err(|err| {
+                    BackendError::Command(format!("the url-open relay: {err}"))
+                })?;
+            }
             let dir = relay::run_dir();
             let ats: Vec<PathBuf> = policy.sockets.iter().map(|s| s.at.clone()).collect();
             let guard = relay::listen_all(&ats, &dir).map_err(BackendError::Io)?;
             for (relay, socket) in guard.relays().iter().zip(&policy.sockets) {
-                relay.serve(&socket.host);
+                let destination = if socket.service.as_deref() == Some("url-open") {
+                    relay::Destination::OpenUrl
+                } else {
+                    relay::Destination::Socket(socket.host.clone())
+                };
+                relay.serve(destination);
                 report.applied(&format!("socket relay at {}", socket.at.display()));
             }
             relay_policy = policy_with_relays(policy, guard.relays());

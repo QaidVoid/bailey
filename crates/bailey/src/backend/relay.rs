@@ -11,6 +11,7 @@
 //! out of reach.
 
 use std::io;
+use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::thread;
@@ -29,14 +30,24 @@ pub(crate) struct Relay {
     listener: UnixListener,
 }
 
+/// Where a relayed connection goes.
+pub(crate) enum Destination {
+    /// Carry the bytes to a host socket.
+    Socket(PathBuf),
+    /// Read one line naming a URL, open it on the host with `xdg-open`, and
+    /// answer `OK` or `ERR`. This is how a sandboxed agent opens a link in
+    /// the host's browser without holding any authority over the browser.
+    OpenUrl,
+}
+
 impl Relay {
     /// Serve connections until the process ends.
     ///
-    /// Each accepted connection is carried to the host socket in its own
-    /// thread, connected lazily: a client that opens and closes without
-    /// speaking never touches the real service. The threads are detached;
-    /// they end when their sockets do, and the sockets end with the run.
-    pub(crate) fn serve(&self, host: &Path) {
+    /// Each accepted connection is handled in its own thread, connected
+    /// lazily: a client that opens and closes without speaking never touches
+    /// the real service. The threads are detached; they end when their
+    /// sockets do, and the sockets end with the run.
+    pub(crate) fn serve(&self, destination: Destination) {
         let listener = match self.listener.try_clone() {
             Ok(listener) => listener,
             Err(err) => {
@@ -47,11 +58,16 @@ impl Relay {
                 return;
             }
         };
-        let host = host.to_path_buf();
         thread::spawn(move || {
             while let Ok((client, _addr)) = listener.accept() {
-                let host = host.clone();
-                thread::spawn(move || forward(client, host));
+                let destination = match &destination {
+                    Destination::Socket(host) => Destination::Socket(host.clone()),
+                    Destination::OpenUrl => Destination::OpenUrl,
+                };
+                thread::spawn(move || match destination {
+                    Destination::Socket(host) => forward(client, host),
+                    Destination::OpenUrl => open_url(client),
+                });
             }
         });
     }
@@ -89,6 +105,67 @@ fn forward(client: UnixStream, host: PathBuf) {
     });
     let _ = up.join();
     let _ = down.join();
+}
+
+/// The most one URL may be, longer being a protocol error rather than a
+/// request.
+const URL_MAX: usize = 2048;
+
+/// Answer one URL-opening request, opening with the real host helper.
+fn open_url(client: UnixStream) {
+    open_url_with(client, open_on_host)
+}
+
+/// The same protocol with the opener injected, which is what the tests hold.
+fn open_url_with(client: UnixStream, opener: impl Fn(&str) -> bool) {
+    let mut line = Vec::new();
+    let mut byte = [0u8; 1];
+    let mut reader = &client;
+    loop {
+        match reader.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) => {
+                if byte[0] == b'\n' {
+                    break;
+                }
+                line.push(byte[0]);
+                if line.len() > URL_MAX {
+                    answer(&client, false);
+                    return;
+                }
+            }
+            Err(_) => return,
+        }
+    }
+    let url = String::from_utf8_lossy(&line);
+    let acceptable = (url.starts_with("http://") || url.starts_with("https://"))
+        && url.chars().all(|ch| ch.is_ascii_graphic());
+    answer(&client, acceptable && opener(url.trim_end_matches('\r')));
+}
+
+/// Reply and close.
+fn answer(client: &UnixStream, ok: bool) {
+    let _ = (&*client).write_all(if ok { b"OK\n" as &[u8] } else { b"ERR\n" });
+}
+
+/// Open a URL on the host, the way the user opening a browser would.
+///
+/// `xdg-open` is taken from a trusted location and refused if someone other
+/// than its owner can write it, the same standard every helper bailey runs
+/// with the caller's authority is held to.
+fn open_on_host(url: &str) -> bool {
+    let program = match crate::cli::resolve_helper("xdg-open") {
+        Ok(program) => program,
+        Err(err) => {
+            eprintln!("bailey: url-open: {err}");
+            return false;
+        }
+    };
+    std::process::Command::new(program)
+        .arg(url)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 /// The relays of one run, torn down when the guard drops.
@@ -187,7 +264,7 @@ mod tests {
         let staged = dir.path().join("staged");
         let guard = listen_all(&[PathBuf::from("/run/user/1000/wayland-0")], &staged).unwrap();
         assert_eq!(guard.relays().len(), 1);
-        guard.relays()[0].serve(&service_path);
+        guard.relays()[0].serve(Destination::Socket(service_path));
 
         let mut client = UnixStream::connect(&guard.relays()[0].listener_path).unwrap();
         client.write_all(b"ping").unwrap();
@@ -203,7 +280,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let staged = dir.path().join("staged");
         let guard = listen_all(&[PathBuf::from("/run/user/1000/bus")], &staged).unwrap();
-        guard.relays()[0].serve(&dir.path().join("missing.sock"));
+        guard.relays()[0].serve(Destination::Socket(dir.path().join("missing.sock")));
 
         let mut client = UnixStream::connect(&guard.relays()[0].listener_path).unwrap();
         // The relay may close before this write lands, so the write itself
@@ -227,9 +304,72 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let staged = dir.path().join("staged");
         let guard = listen_all(&[PathBuf::from("/run/user/1000/pulse")], &staged).unwrap();
-        let socket = &guard.relays()[0].listener_path.to_path_buf();
+        let socket = guard.relays()[0].listener_path.clone();
         assert!(socket.exists());
         drop(guard);
         assert!(!socket.exists(), "the staged socket must not outlive the run");
+    }
+
+    /// The URL broker's contract, against a stand-in opener that records what
+    /// it was asked to open: a web URL opens, anything else is refused, and
+    /// the opener never sees anything but the URL itself.
+    #[test]
+    fn the_url_broker_opens_only_web_schemes() {
+        use std::sync::{Arc, Mutex};
+
+        let asked: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let ask = |url: &str, asked: &Arc<Mutex<Vec<String>>>| -> String {
+            let (client, server) = UnixStream::pair().unwrap();
+            let asked = Arc::clone(asked);
+            let handler = thread::spawn(move || {
+                open_url_with(server, |url| {
+                    asked.lock().unwrap().push(url.to_string());
+                    true
+                })
+            });
+            (&client)
+                .write_all(url.as_bytes())
+                .and_then(|_| client.shutdown(std::net::Shutdown::Write))
+                .unwrap();
+            let mut reply = String::new();
+            let mut reader = client;
+            let _ = reader.read_to_string(&mut reply);
+            handler.join().unwrap();
+            reply
+        };
+
+        assert_eq!(ask("https://example.com/page\n", &asked), "OK\n");
+        assert_eq!(ask("http://example.com\n", &asked), "OK\n");
+        assert_eq!(ask("file:///etc/passwd\n", &asked), "ERR\n");
+        assert_eq!(
+            ask("https://example.com; rm -rf /tmp/x\n", &asked),
+            "ERR\n",
+            "a URL with spaces is not a web URL and never reaches a shell"
+        );
+        assert_eq!(
+            ask("https://x\nrm -rf /\n", &asked),
+            "OK\n",
+            "only the first line is the request"
+        );
+        assert_eq!(
+            asked.lock().unwrap().last().unwrap(),
+            "https://x",
+            "the opener sees one argument, and nothing after the newline"
+        );
+        assert_eq!(ask("", &asked), "ERR\n");
+    }
+
+    /// A URL beyond the size cap is refused unread, so a client cannot make
+    /// the broker buffer without bound.
+    #[test]
+    fn an_oversized_url_is_refused() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let handler = thread::spawn(move || open_url_with(server, |_| true));
+        let _ = (&client).write_all(&[b'a'; URL_MAX + 1]);
+        let mut reply = String::new();
+        let mut reader = client;
+        let _ = reader.read_to_string(&mut reply);
+        handler.join().unwrap();
+        assert_eq!(reply, "ERR\n");
     }
 }

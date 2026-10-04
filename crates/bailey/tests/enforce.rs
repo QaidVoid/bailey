@@ -524,3 +524,59 @@ fn a_socket_relay_overlapping_a_grant_is_refused() {
         "the refusal should name the overlap: {stderr}"
     );
 }
+
+/// The URL broker answers through a real sandbox: the target writes one line
+/// to the broker socket and reads the verdict. A refused scheme needs nothing
+/// from the host desktop, so the protocol is proven end to end whatever the
+/// machine's browser situation is.
+#[test]
+fn the_url_broker_refuses_non_web_schemes_through_a_run() {
+    if !landlock_available() {
+        eprintln!("skipping: Landlock unavailable");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("bailey.toml");
+    fs::write(
+        &config,
+        format!(
+            "[filesystem]\n\
+             read = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\", \"/etc\"]\n\
+             execute = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\"]\n\
+             [[socket]]\n\
+             service = \"url-open\"\n"
+        ),
+    )
+    .unwrap();
+
+    // One line in, one verdict out, in a dozen lines of Python: the protocol
+    // is deliberately something any agent can speak.
+    let client = format!(
+        "import socket\n\
+         s = socket.socket(socket.AF_UNIX)\n\
+         s.connect({at:?})\n\
+         s.sendall(b'file:///etc/passwd\\n')\n\
+         print(s.recv(8).decode().strip())\n",
+        at = "/run/user/test/url-open",
+    );
+    let output = std::process::Command::new(bailey())
+        .args(["run", "-c"])
+        .arg(&config)
+        .args(["/usr/bin/python3", "-c", &client])
+        .env("XDG_RUNTIME_DIR", "/run/user/test")
+        .env("XDG_CONFIG_HOME", dir.path().join("no-config"))
+        .env("XDG_DATA_HOME", dir.path().join("no-store"))
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "ERR",
+        "a file:// URL must be refused by the broker, not opened"
+    );
+}
