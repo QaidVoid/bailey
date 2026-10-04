@@ -41,6 +41,10 @@ pub enum BackendError {
     /// An underlying I/O error occurred.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// A path the policy names could not be examined, so the run would start
+    /// narrower than the policy says. The message carries the path and cause.
+    #[error("{0}")]
+    UnreadablePath(String),
 }
 
 /// A sandbox execution backend.

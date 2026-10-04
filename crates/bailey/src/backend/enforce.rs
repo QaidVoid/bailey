@@ -269,7 +269,7 @@ impl EnforceBackend {
         let isolation = if self.isolate {
             if userns {
                 report.applied("namespace isolation");
-                let plan = build_isolation_plan(policy, mode, &world, &self.implicit_write);
+                let plan = build_isolation_plan(policy, mode, &world, &self.implicit_write)?;
                 // The bind source has to exist before it is bound at /tmp. It
                 // is created empty, which is what /tmp starts as anyway.
                 if let Some(dir) = &plan.tmp_dir {
@@ -765,6 +765,9 @@ fn to_visible_path(policy: &Policy, path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+/// The `statfs` magic of a FUSE filesystem.
+const FUSE_MAGIC: i64 = 0x6573_5546;
+
 /// Build the bind-mount and concealment set for isolation from the policy.
 ///
 /// Nested paths under an already-included directory are skipped (they come
@@ -779,7 +782,7 @@ fn build_isolation_plan(
     mode: NetworkMode,
     world: &World,
     implicit_write: &[PathBuf],
-) -> IsolationPlan {
+) -> Result<IsolationPlan, BackendError> {
     sweep_stale_staging();
 
     // A deny or a read-only island may be written either where the host keeps
@@ -824,9 +827,10 @@ fn build_isolation_plan(
         if roots.iter().any(|root| path.starts_with(root)) {
             continue;
         }
-        if !path.exists() {
-            continue;
-        }
+        let meta = match probe_grant(&path)? {
+            GrantState::Missing => continue,
+            GrantState::Live(meta) => meta,
+        };
         // A symlink is recreated rather than bound when the policy already
         // provides what it points at. Binding through it would put a regular
         // file where the link was, and a program that resolves paths relative to
@@ -853,9 +857,7 @@ fn build_isolation_plan(
                 continue;
             }
         }
-        let is_dir = std::fs::metadata(&path)
-            .map(|meta| meta.is_dir())
-            .unwrap_or(false);
+        let is_dir = meta.is_dir();
         if is_dir {
             roots.push(path.clone());
         }
@@ -870,23 +872,30 @@ fn build_isolation_plan(
         });
     }
 
-    let conceal = denied_paths
-        .iter()
-        .filter_map(|path| {
-            // Concealment covers a denied path where it ends up, which is not
-            // where the host keeps it once its parent has been relocated.
-            // Covering the host path would leave the denied one reachable at
-            // its new location, which is the grant leaking exactly what the
-            // deny was written to withhold.
-            let bind = binds.iter().find(|bind| path.starts_with(&bind.source))?;
-            let relative = path.strip_prefix(&bind.source).ok()?;
-            let is_dir = std::fs::metadata(path).ok()?.is_dir();
-            Some(Conceal {
-                path: bind.at.join(relative),
-                is_dir,
-            })
-        })
-        .collect();
+    let mut conceal = Vec::new();
+    for path in &denied_paths {
+        // Concealment covers a denied path where it ends up, which is not
+        // where the host keeps it once its parent has been relocated.
+        // Covering the host path would leave the denied one reachable at
+        // its new location, which is the grant leaking exactly what the
+        // deny was written to withhold.
+        let Some(bind) = binds.iter().find(|bind| path.starts_with(&bind.source)) else {
+            continue;
+        };
+        let Ok(relative) = path.strip_prefix(&bind.source) else {
+            continue;
+        };
+        let is_dir = match probe_grant(path)? {
+            // A denied path that does not exist needs no cover: there is
+            // nothing on the host, so nothing can arrive inside the bind.
+            GrantState::Missing => continue,
+            GrantState::Live(meta) => meta.is_dir(),
+        };
+        conceal.push(Conceal {
+            path: bind.at.join(relative),
+            is_dir,
+        });
+    }
 
     // The remount happens inside the reconstructed root, so an island is named
     // where the target sees it.
@@ -900,7 +909,7 @@ fn build_isolation_plan(
     read_only.sort();
     read_only.dedup();
 
-    IsolationPlan {
+    Ok(IsolationPlan {
         binds,
         links,
         conceal,
@@ -918,7 +927,7 @@ fn build_isolation_plan(
         shm_bytes: policy.resources.shm_bytes.unwrap_or(DEFAULT_SHM_BYTES),
         cwd: world.cwd.clone(),
         staging: PathBuf::from(format!("/tmp/{STAGING_PREFIX}{}", std::process::id())),
-    }
+    })
 }
 
 /// Granted paths that sit beneath something bailey granted for writing on the
@@ -1011,14 +1020,68 @@ fn is_kernel_filesystem(path: &Path) -> bool {
         0x7472_6163,
         -0x3501_b5ef,
     ];
+    statfs_magic(path).is_some_and(|magic| KERNEL_MAGIC.contains(&magic))
+}
+
+/// Whether a path sits on a FUSE filesystem.
+fn is_fuse(path: &Path) -> bool {
+    statfs_magic(path) == Some(FUSE_MAGIC)
+}
+
+/// The `statfs` magic of the filesystem a path sits on.
+fn statfs_magic(path: &Path) -> Option<i64> {
     let Ok(raw) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
-        return false;
+        return None;
     };
     let mut buf: libc::statfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::statfs(raw.as_ptr(), &mut buf) } != 0 {
-        return false;
+        return None;
     }
-    KERNEL_MAGIC.contains(&(buf.f_type as i64))
+    Some(buf.f_type as i64)
+}
+
+/// What a failed read of a granted path usually means.
+///
+/// A mount whose server has gone away answers reads with EIO or ESTALE once
+/// the connection is torn down, and hangs before that. FUSE is where this
+/// happens most, so the note names it when `statfs` can still see the mount.
+fn stale_mount_note(path: &Path) -> String {
+    if is_fuse(path) {
+        "The path sits on a FUSE filesystem; check that the mount is alive."
+            .to_string()
+    } else {
+        "A stale FUSE or network mount is the usual cause; check that the \
+         mounts this path depends on are alive."
+            .to_string()
+    }
+}
+
+/// The state of a path the policy names.
+enum GrantState {
+    /// The path does not exist. Grants may name optional paths, so this is a
+    /// normal skip.
+    Missing,
+    /// The path exists.
+    Live(std::fs::Metadata),
+}
+
+/// Read the state of a path the policy names.
+///
+/// A missing path is skipped, and any other failure refuses the run: a grant
+/// that cannot be read would leave the target narrower than the policy says,
+/// which is a silence this tool exists to refuse.
+fn probe_grant(path: &Path) -> Result<GrantState, BackendError> {
+    match std::fs::metadata(path) {
+        Ok(meta) => Ok(GrantState::Live(meta)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(GrantState::Missing),
+        Err(err) => Err(BackendError::UnreadablePath(format!(
+            "the policy grants `{}`, but it could not be read: {}. {} The run is \
+             refused rather than started narrower than the policy says.",
+            path.display(),
+            err,
+            stale_mount_note(path),
+        ))),
+    }
 }
 
 fn fs_access_bits(access: policy::Access) -> Option<BitFlags<AccessFs>> {
@@ -1726,8 +1789,81 @@ mod tests {
             at: None,
         });
         let world = World::derive(Path::new("/bin/true"), &policy, true);
-        let plan = build_isolation_plan(&policy, NetworkMode::Isolated, &world, &[]);
+        let plan = build_isolation_plan(&policy, NetworkMode::Isolated, &world, &[]).unwrap();
         assert!(plan.read_only.contains(&PathBuf::from("/data")));
+    }
+
+    /// A grant whose state cannot be read would start the target narrower
+    /// than the policy says, which is the silence this run refuses. A dead
+    /// FUSE or network mount answers exactly this way, with an error that is
+    /// not `NotFound`.
+    #[test]
+    fn an_unreadable_grant_refuses_the_plan() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            // Root reads through every mode bit, so there is no way to stage
+            // the failure this test is about.
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let jail = dir.path().join("jail");
+        let secret = jail.join("secret");
+        std::fs::create_dir_all(&secret).unwrap();
+        std::fs::set_permissions(&jail, std::fs::Permissions::from_mode(0o000)).unwrap();
+        struct Restore(PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(
+                    &self.0,
+                    std::fs::Permissions::from_mode(0o755),
+                );
+            }
+        }
+        let _restore = Restore(jail.clone());
+
+        let mut policy = Policy::default();
+        policy.filesystem.push(FsRule {
+            path: secret.clone(),
+            access: Access::READ,
+            at: None,
+        });
+        let world = World::derive(Path::new("/bin/true"), &policy, true);
+        let err = match build_isolation_plan(&policy, NetworkMode::Isolated, &world, &[]) {
+            Err(err) => err,
+            Ok(_) => {
+                if unsafe { libc::geteuid() } == 0 {
+                    return;
+                }
+                panic!("an unreadable grant must refuse the run");
+            }
+        };
+        let message = err.to_string();
+        assert!(message.contains("could not be read"), "{message}");
+        assert!(message.contains(&secret.display().to_string()), "{message}");
+    }
+
+    /// A grant naming a path that does not exist is a normal skip: policies
+    /// name optional paths, and that behavior predates the refusal.
+    #[test]
+    fn a_missing_grant_is_still_skipped() {
+        let mut policy = Policy::default();
+        policy.filesystem.push(FsRule {
+            path: PathBuf::from("/nonexistent/grant/target"),
+            access: Access::READ,
+            at: None,
+        });
+        let world = World::derive(Path::new("/bin/true"), &policy, true);
+        let plan = build_isolation_plan(&policy, NetworkMode::Isolated, &world, &[]).unwrap();
+        assert!(plan.binds.is_empty(), "a missing path is not bound");
+    }
+
+    /// The classifier reads what a path is really on, so a plain directory is
+    /// never mistaken for FUSE.
+    #[test]
+    fn a_plain_directory_is_not_fuse() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(statfs_magic(dir.path()).is_some(), "statfs answers");
+        assert!(!is_fuse(dir.path()), "a tmpfs directory is not FUSE");
     }
 
     #[test]
