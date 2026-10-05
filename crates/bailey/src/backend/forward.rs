@@ -68,6 +68,28 @@ impl ForwardGuard {
                 listeners: Vec::new(),
             });
         }
+        // Wait for readability in bounded slices rather than one blocking
+        // read: a wake-up that never comes would hang the relay for the
+        // whole run, and the send always arrives while the sandbox lives or
+        // not at all, so re-checking costs nothing.
+        loop {
+            let mut pollfds = [libc::pollfd {
+                fd: stream.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            }];
+            let ready = unsafe { libc::poll(pollfds.as_mut_ptr(), 1, 250) };
+            if ready < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err);
+            }
+            if ready > 0 || pollfds[0].revents & (libc::POLLHUP | libc::POLLERR) != 0 {
+                break;
+            }
+        }
         let fds = recv_fds(stream, forwards.len())?;
         let listeners = fds
             .into_iter()

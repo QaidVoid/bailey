@@ -618,23 +618,41 @@ impl EnforceBackend {
             report.print_established();
         }
 
+        // The handover arrives from inside the pre-exec fork, and under
+        // isolation the intermediate parent never execs, so the spawn below
+        // does not return until the run is over. Receiving on this thread
+        // would serve nothing but the corpse: the relay runs on its own
+        // thread instead, for as long as the process lives, which for a run
+        // is the same span.
+        let forward_up = forward_forwards.is_some().then(|| {
+            let up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let announce = forward_announce.expect("an announce exists for forwards");
+            let forwards = forward_forwards.clone().expect("announced forwards are set");
+            let up_for_thread = up.clone();
+            std::thread::spawn(move || {
+                if let Ok(guard) = forward::ForwardGuard::receive(&announce, &forwards) {
+                    up_for_thread.store(true, std::sync::atomic::Ordering::Release);
+                    guard.serve();
+                }
+            });
+            up
+        });
+
         let child = command.spawn().map_err(BackendError::Io)?;
         // The parent's copy of the child end must close before the handover is
         // read, or the socket never reaches an end when the sandbox dies.
         drop(forward_child_end);
-        let mut forward_guard: Option<forward::ForwardGuard> = None;
-        if let Some(announce) = forward_announce {
-            let forwards = forward_forwards.expect("announced forwards are set");
-            let guard = forward::ForwardGuard::receive(&announce, &forwards)
-                .map_err(BackendError::Io)?;
-            guard.serve();
-            for forward in &forwards {
-                report.applied(&format!(
-                    "forward 127.0.0.1:{} to host port {}",
-                    forward.port, forward.host_port
-                ));
+        if let (Some(up), Some(forwards)) = (&forward_up, &forward_forwards) {
+            if up.load(std::sync::atomic::Ordering::Acquire) {
+                for forward in forwards {
+                    report.applied(&format!(
+                        "forward 127.0.0.1:{} to host port {}",
+                        forward.port, forward.host_port
+                    ));
+                }
+            } else {
+                report.skipped("forward", "the handover never arrived");
             }
-            forward_guard = Some(guard);
         }
         Ok(Confined {
             child,
@@ -642,7 +660,6 @@ impl EnforceBackend {
             staging,
             fuse: fuse_guard,
             relay: relay_guard,
-            forward: forward_guard,
             report,
             summary: self.summary,
         })
@@ -696,7 +713,6 @@ pub struct Confined {
     staging: StagingGuard,
     fuse: fuse::FuseGuard,
     relay: Option<relay::RelayGuard>,
-    forward: Option<forward::ForwardGuard>,
     report: RunReport,
     summary: Summary,
 }
@@ -726,9 +742,9 @@ impl Confined {
         // The relay listeners close with the run, so a client inside cannot
         // reach past it.
         drop(self.relay);
-        // The forwarded listeners live on the sandbox's loopback, which stops
-        // existing with the last holder of the namespace.
-        drop(self.forward);
+        // The forwarded listeners live on the relay thread, which ends with
+        // the process; the sandbox's loopback stops existing with the last
+        // holder of the namespace.
         let code = status.code().unwrap_or(-1);
         match self.summary {
             Summary::Text => self.report.print(code),
