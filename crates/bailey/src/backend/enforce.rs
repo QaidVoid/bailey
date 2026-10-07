@@ -381,12 +381,22 @@ impl EnforceBackend {
         let mut forward_forwards: Option<Vec<PortForward>> = None;
         if !policy.forwards.is_empty() {
             if mode != NetworkMode::Isolated {
-                return Err(BackendError::Command(
+                // The two reasons read differently to the user: an egress
+                // allowance is a choice in the policy they can revisit, while
+                // missing namespaces or `--no-isolate` is about the host or
+                // the invocation.
+                let reason = if !matches!(policy.network.egress, Egress::DenyAll) {
+                    "the policy allows egress, which keeps the target in the \
+                     host's network namespace, and a forward needs the \
+                     sandbox's own loopback; deny egress and reach the \
+                     outside through what a forward carries, or remove the \
+                     [[forward]] entries"
+                } else {
                     "the policy forwards ports, which need the target in a \
                      network namespace of its own; run with isolation on, or \
                      remove the [[forward]] entries"
-                        .into(),
-                ));
+                };
+                return Err(BackendError::Command(reason.into()));
             }
             // The same file can arrive twice, explicit and discovered, and
             // layers can name a forward again. An identical repeat collapses;
@@ -2127,6 +2137,32 @@ mod tests {
         let world = World::derive(Path::new("/bin/true"), &policy, true);
         let plan = build_isolation_plan(&policy, NetworkMode::Isolated, &world, &[]).unwrap();
         assert!(plan.read_only.contains(&PathBuf::from("/data")));
+    }
+
+    /// A forward needs the sandbox's own loopback, which only exists while
+    /// egress is denied: an allowance keeps the target in the host's
+    /// namespace, and the refusal must say that rather than send the user
+    /// hunting for an isolation flag that is already on.
+    #[test]
+    fn forwards_under_an_egress_allowance_name_the_allowance() {
+        let mut policy = Policy::default();
+        policy.network.egress = Egress::AllowAll;
+        policy.forwards.push(PortForward {
+            port: 11434,
+            host_port: 11434,
+        });
+        let backend = EnforceBackend::default();
+        let target = Target {
+            program: "/bin/true".into(),
+            args: Vec::new(),
+            cwd: None,
+        };
+        let message = backend
+            .run(&policy, &target)
+            .expect_err("an egress allowance must refuse forwards")
+            .to_string();
+        assert!(message.contains("allows egress"), "{message}");
+        assert!(!message.contains("isolation on"), "{message}");
     }
 
     /// A grant whose state cannot be read would start the target narrower
