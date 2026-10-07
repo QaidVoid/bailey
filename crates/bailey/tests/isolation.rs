@@ -3,7 +3,7 @@
 //! These run real programs under user, mount, and PID namespaces. They self-skip
 //! where isolation cannot actually be established (for example, a host that
 //! restricts unprivileged user namespaces via AppArmor), detected by checking
-//! whether the target really lands as PID 1.
+//! whether the sandbox's init really is bailey's own supervisor.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -14,15 +14,22 @@ fn bailey() -> &'static str {
     env!("CARGO_BIN_EXE_bailey")
 }
 
-/// True only when an isolated run genuinely enters a new PID namespace. When the
-/// host forces the Landlock-only fallback, the target keeps its host PID, so
-/// this returns false and the tests skip.
+/// True only when an isolated run genuinely enters a new PID namespace. When
+/// the host forces the Landlock-only fallback, the target keeps its host PID,
+/// so this returns false and the tests skip. Inside a real sandbox PID 1 is
+/// the supervisor that reaps the namespace's orphans.
 fn isolation_active() -> bool {
     let output = Command::new(bailey())
-        .args(["run", "--isolate", "/bin/sh", "-c", "echo $$"])
+        .args([
+            "run",
+            "--isolate",
+            "/bin/sh",
+            "-c",
+            "[ \"$(cat /proc/1/comm)\" = bailey ] && echo yes || echo no",
+        ])
         .output();
     matches!(output, Ok(out) if out.status.success()
-        && String::from_utf8_lossy(&out.stdout).trim() == "1")
+        && String::from_utf8_lossy(&out.stdout).trim() == "yes")
 }
 
 /// A workspace with a granted directory holding both a denied subdirectory and
@@ -150,18 +157,40 @@ fn ungranted_path_is_absent_under_isolation() {
     );
 }
 
+/// The kernel hands every orphaned process to PID 1 and reaps nothing itself,
+/// so the target must not hold the namespace's init role: a target that leaks
+/// a grandchild would otherwise leave an immortal zombie pinning a host PID
+/// until the run ended, and enough leaked zombies drain the kernel's PID
+/// space until `fork` fails on the whole host. The supervisor takes the role
+/// instead and reaps what reparents to it.
 #[test]
-fn target_is_pid_one_under_isolation() {
+fn orphans_a_target_leaves_are_reaped() {
     if !isolation_active() {
         eprintln!("skipping: isolation unavailable on this host");
         return;
     }
+    // Two generations: the inner sh backgrounds a sleeper and exits, so the
+    // sleeper reparents to PID 1, runs out its sleep, and stays a zombie
+    // until PID 1 reaps it. The spawner is nested inside the counter subshell
+    // so every shell that exits is reaped by its own shell parent, and the
+    // target itself execs `sleep`, which never waits: the count must come out
+    // zero because the supervisor reaped, not because the target did.
+    let script = r#"( ( i=0; while [ $i -lt 20 ]; do sh -c 'sh -c "sleep 0.3" &'; i=$((i+1)); done ) & sleep 1; z=0; for p in /proc/[0-9]*/stat; do set -- $(cat "$p" 2>/dev/null); [ "$3" = Z ] && z=$((z+1)); done; echo zombies=$z ) & exec sleep 2.5"#;
     let output = Command::new(bailey())
-        .args(["run", "--isolate", "/bin/sh", "-c", "echo $$"])
+        .args(["run", "--isolate", "/bin/sh", "-c", script])
         .output()
         .unwrap();
-    assert!(output.status.success());
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "1");
+
+    assert!(
+        output.status.success(),
+        "the run must still exit with the target's own status: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "zombies=0",
+        "every orphan the target left must have been reaped while the run lived"
+    );
 }
 
 #[test]

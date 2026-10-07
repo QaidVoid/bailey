@@ -13,6 +13,7 @@
 //! bundled profiles exist to supply those defaults.
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
@@ -545,6 +546,18 @@ impl EnforceBackend {
         // announce end below is the one the parent reads.
         let forward_fd = forward_child_end.as_ref().map(|s| s.as_raw_fd());
         let forward_ports = forward_forwards.clone().unwrap_or_default();
+        // Under isolation the target is spawned by the PID 1 supervisor rather
+        // than exec'd by this process, so its exact shape travels with the
+        // closure (the command itself stays behind for the parent's spawn).
+        let target_program = target.program.clone();
+        let target_args = target.args.clone();
+        let target_cwd = target.cwd.clone();
+        let target_env: Vec<(OsString, OsString)> = command
+            .get_envs()
+            .filter_map(|(key, value)| {
+                value.map(|value| (key.to_os_string(), value.to_os_string()))
+            })
+            .collect();
 
         // Safety: the closure runs in the forked child before exec. Bailey is
         // single-threaded at this point, so the usual fork-safety hazard of
@@ -620,6 +633,21 @@ impl EnforceBackend {
                 // outright; `unshare` and `setns` are denied for the same
                 // reason.
                 drop_capabilities(keep_mount)?;
+                // This process is PID 1 of the sandbox. Exec'ing the target
+                // here would make the target the namespace's init, and the
+                // kernel reaps nothing for an init: every orphan the target
+                // leaves would stay a zombie pinning a host PID until the run
+                // ended. The target runs as a child instead, and this process
+                // waits, reaping what reparents to it. Only a non-isolated run
+                // falls through to the exec below.
+                if isolation.is_some() {
+                    isolation::run_as_init(
+                        &target_program,
+                        &target_args,
+                        &target_env,
+                        target_cwd.as_deref(),
+                    )?;
+                }
                 Ok(())
             });
         }

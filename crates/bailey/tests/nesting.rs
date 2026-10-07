@@ -17,10 +17,15 @@ fn bailey() -> &'static str {
 
 fn isolation_active() -> bool {
     let output = Command::new(bailey())
-        .args(["run", "/bin/sh", "-c", "echo $$"])
+        .args([
+            "run",
+            "/bin/sh",
+            "-c",
+            "[ \"$(cat /proc/1/comm)\" = bailey ] && echo yes || echo no",
+        ])
         .output();
     matches!(output, Ok(out) if out.status.success()
-        && String::from_utf8_lossy(&out.stdout).trim() == "1")
+        && String::from_utf8_lossy(&out.stdout).trim() == "yes")
 }
 
 /// A project directory with a trusted config and a copy of bailey inside it.

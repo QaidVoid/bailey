@@ -6,11 +6,12 @@
 //! the enforcement `pre_exec`, before Landlock and seccomp are applied, and is
 //! fully unprivileged via the user namespace.
 
-use std::ffi::CString;
+use std::ffi::{CString, OsString};
 use std::fs;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use nix::mount::{MntFlags, MsFlags, mount, umount2};
 use nix::sched::{CloneFlags, unshare};
@@ -156,9 +157,10 @@ fn probe() -> io::Result<()> {
 
 /// Enter the isolation namespaces and reconstruct the root.
 ///
-/// Returns `Ok` only in the child that will exec the target (PID 1 in the new
-/// PID namespace). The intermediate parent waits for that child and exits with
-/// its status, so it never returns.
+/// Returns `Ok` only in the child that becomes PID 1 of the new PID
+/// namespace. The caller then hands the target to [`run_as_init`], which keeps
+/// PID 1 free to reap the namespace's orphans. The intermediate parent waits
+/// for that child and exits with its status, so it never returns.
 pub fn enter(plan: &IsolationPlan) -> io::Result<()> {
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
@@ -200,23 +202,83 @@ pub fn enter(plan: &IsolationPlan) -> io::Result<()> {
         -1 => Err(io::Error::last_os_error()),
         0 => {
             // Child: PID 1 in the new PID namespace. It reconstructs the root
-            // and then returns so the caller execs the target here.
+            // and returns so the caller can apply the remaining confinement
+            // and start the target as its child.
             setup_root(plan)
         }
         pid => {
-            // Parent: reap the target and exit with its status. Never returns.
+            // Parent: reap the sandbox's init and exit with its status.
+            // Never returns.
             let mut status: libc::c_int = 0;
             unsafe { libc::waitpid(pid, &mut status, 0) };
-            let code = if libc::WIFEXITED(status) {
-                libc::WEXITSTATUS(status)
-            } else if libc::WIFSIGNALED(status) {
-                128 + libc::WTERMSIG(status)
-            } else {
-                1
-            };
-            unsafe { libc::_exit(code) }
+            unsafe { libc::_exit(status_code(status)) }
         }
     }
+}
+
+/// Run the target as a child of PID 1 and wait for it, reaping orphans.
+///
+/// The caller of [`enter`] ends up as PID 1 of the sandbox's PID namespace,
+/// and the kernel hands every orphaned process to PID 1 while reaping nothing
+/// itself. Exec'ing the target directly would therefore make the target its
+/// own init: every grandchild whose parent dies first would stay a zombie
+/// holding a host PID for the rest of the run. Enough leaked zombies drain the
+/// kernel's PID space, and then `fork` fails on the whole host.
+///
+/// Spawning the target as a child keeps PID 1 free to reap: this function
+/// blocks on `waitpid(-1)`, discards whatever reparents to it, and exits with
+/// the target's own exit code, or `128 + signal` when the target died by
+/// signal.
+///
+/// Only a failure to start the target returns, so the caller can report it
+/// through the usual spawn-error path. On success the process never returns:
+/// it exits from inside.
+pub fn run_as_init(
+    program: &Path,
+    args: &[String],
+    env: &[(OsString, OsString)],
+    cwd: Option<&Path>,
+) -> io::Result<()> {
+    let mut command = Command::new(program);
+    command.args(args);
+    command.env_clear();
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
+    }
+    let pid = command.spawn()?.id();
+    unsafe { libc::_exit(supervise(pid)) }
+}
+
+/// Wait on every child, reaping the namespace's orphans, and report the
+/// target's own status.
+fn supervise(target: u32) -> i32 {
+    let mut status: libc::c_int = 0;
+    loop {
+        let pid = unsafe { libc::waitpid(-1, &mut status, 0) };
+        if pid < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return 1;
+        }
+        if pid as u32 == target {
+            return status_code(status);
+        }
+    }
+}
+
+/// Exit code of a reaped child, counting a signal death as a shell would.
+fn status_code(status: libc::c_int) -> i32 {
+    if libc::WIFEXITED(status) {
+        return libc::WEXITSTATUS(status);
+    }
+    if libc::WIFSIGNALED(status) {
+        return 128 + libc::WTERMSIG(status);
+    }
+    1
 }
 
 fn setup_root(plan: &IsolationPlan) -> io::Result<()> {

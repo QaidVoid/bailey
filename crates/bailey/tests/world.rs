@@ -12,10 +12,16 @@ fn bailey() -> &'static str {
 /// True only when an isolated run genuinely enters a new PID namespace.
 fn isolation_active() -> bool {
     let output = Command::new(bailey())
-        .args(["run", "--isolate", "/bin/sh", "-c", "echo $$"])
+        .args([
+            "run",
+            "--isolate",
+            "/bin/sh",
+            "-c",
+            "[ \"$(cat /proc/1/comm)\" = bailey ] && echo yes || echo no",
+        ])
         .output();
     matches!(output, Ok(out) if out.status.success()
-        && String::from_utf8_lossy(&out.stdout).trim() == "1")
+        && String::from_utf8_lossy(&out.stdout).trim() == "yes")
 }
 
 /// A run with its own data home, so the private home lands somewhere temporary.

@@ -17,8 +17,10 @@ paths the policy grants plus the essential system paths. Everything else is abse
 from its mount table. `ls /home` does not return a permission error; it returns
 nothing, because `/home` does not exist in that world.
 
-**Processes.** A new PID namespace, with a fresh `/proc`. The program is PID 1 in
-its own namespace and cannot see or signal anything outside its own tree.
+**Processes.** A new PID namespace, with a fresh `/proc`. The program is a child
+of PID 1, a supervisor bailey runs for the purpose, and cannot see or signal
+anything outside its own tree. The supervisor reaps the orphans the program
+leaves, so they cannot pile up as zombies pinning the host's process IDs.
 
 **Denials.** A path denied by the policy is covered with an empty read-only
 filesystem, so a `deny` on a subdirectory of a granted directory is actually
@@ -41,7 +43,7 @@ Inside the pre-exec child:
    denied.
 2. `unshare(CLONE_NEWNS | CLONE_NEWPID)`.
 3. Fork. A PID namespace only takes effect for a child of the process that
-   unshared it, so the target becomes PID 1 in the new namespace. The intermediate
+   unshared it, so that child is PID 1 of the new namespace. The intermediate
    process waits for it and exits with its status.
 4. Make the mount tree private, mount a tmpfs as the new root, and bind-mount each
    granted path into it.
@@ -51,6 +53,15 @@ Inside the pre-exec child:
 Landlock is applied after this, against the reconstructed root. Because Landlock
 governs inodes and the granted directories are bind mounts of the same inodes,
 enforcement holds on both sides of the pivot.
+
+PID 1 is not the program itself. The kernel hands every orphaned process to PID 1
+and reaps nothing on its behalf, so a program that held the role would leave one
+immortal zombie per grandchild that outlived its parent, each pinning a host
+process ID until the run ended. On a host that runs many sandboxes, enough leaked
+zombies exhaust the kernel's PID space and `fork` starts failing everywhere. So
+after confinement is complete, PID 1 spawns the program as its child, waits on
+`waitpid(-1)`, reaps whatever reparents to it, and exits with the program's own
+status.
 
 ## The bind set
 
