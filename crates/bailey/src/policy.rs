@@ -253,8 +253,10 @@ pub struct Policy {
     /// the run's mount namespace. The same power reaches every mount the run
     /// already holds, and two guarantees are enforced by mounts: a read-only
     /// island is a read-only mount, and a denial beneath a grant is an empty
-    /// read-only mount covering the path. Resolution therefore refuses a
-    /// policy that asks for this and either of those at once.
+    /// read-only mount covering the path. A partial egress allowance is
+    /// enforced by the Landlock ruleset rather than by a mount, which this
+    /// switch also gives up. Resolution therefore refuses a policy that asks
+    /// for this and any of those at once.
     pub self_fuse: bool,
     /// FUSE mounts bailey performs before the target starts, in order.
     pub fuse: Vec<FuseMount>,
