@@ -394,6 +394,52 @@ mod tests {
         assert_eq!(&buf, b"ping");
     }
 
+    /// Three descriptors through the same handover. The receive side walks the
+    /// control message and counts the descriptors its length implies, so this
+    /// is the case where a wrong count or a wrong stride stops being
+    /// indistinguishable from the single-descriptor one.
+    #[test]
+    fn several_descriptors_survive_the_announce_roundtrip() {
+        use std::os::fd::AsRawFd;
+        let (announce, child_end) = UnixStream::pair().unwrap();
+        let mut kept = Vec::new();
+        let mut raw = Vec::new();
+        for _ in 0..3 {
+            let (keep, traveled) = UnixStream::pair().unwrap();
+            raw.push(traveled.into_raw_fd());
+            kept.push(keep);
+        }
+        let sender = thread::spawn(move || send_fds(child_end.as_raw_fd(), &raw).unwrap());
+        let back = recv_fds(&announce, 3).unwrap();
+        sender.join().unwrap();
+        assert_eq!(back.len(), 3);
+        // Each descriptor must be the one it was sent as, not merely present:
+        // a stride that preserves the count still lands the wrong far end.
+        for (far, mut near) in back.into_iter().zip(kept) {
+            let mut far = unsafe { UnixStream::from_raw_fd(far) };
+            far.write_all(b"ping").unwrap();
+            let mut buf = [0u8; 4];
+            near.read_exact(&mut buf).unwrap();
+            assert_eq!(&buf, b"ping");
+        }
+    }
+
+    /// The descriptor count the length implies, without a send: this is the
+    /// arithmetic `recv_fds` does, read on a buffer the test controls.
+    #[test]
+    fn the_control_buffer_holds_the_declared_length() {
+        for count in 1..=8 {
+            let payload = count * size_of::<RawFd>();
+            let buffer = cmsg_space(count);
+            let declared = unsafe { libc::CMSG_LEN(payload as _) as usize };
+            assert!(
+                buffer >= declared,
+                "the buffer for {count} descriptors is {buffer} bytes, the \
+                 declared control message needs {declared}"
+            );
+        }
+    }
+
     /// The full round trip without a sandbox: the sandbox side arms and hands
     /// its listener over, the parent serves it, and a client dials the forward
     /// and reaches the host echo.
