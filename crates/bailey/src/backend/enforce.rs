@@ -676,7 +676,7 @@ impl EnforceBackend {
             std::thread::spawn(move || {
                 if let Ok(guard) = forward::ForwardGuard::receive(&announce, &forwards) {
                     up_for_thread.store(true, std::sync::atomic::Ordering::Release);
-                    guard.serve();
+                    guard.serve(forward::PUMP_IDLE);
                 }
             });
             up
