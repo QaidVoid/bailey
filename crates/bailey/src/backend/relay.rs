@@ -107,11 +107,7 @@ impl Duplex for TcpStream {
 /// Each direction propagates the end it sees: when one side stops writing, the
 /// other learns the request is complete. Without the shutdown, the pipe's own
 /// held descriptors would keep both sides waiting forever.
-pub(crate) fn pipe<A: Duplex, B: Duplex>(client: A, service: B)
-where
-    A: Send + 'static,
-    B: Send + 'static,
-{
+pub(crate) fn pipe<A: Duplex + Send + 'static, B: Duplex + Send + 'static>(client: A, service: B) {
     let Ok(mut client_out) = client.try_duplicate() else {
         return;
     };

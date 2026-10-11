@@ -291,7 +291,7 @@ fn send_fds(announce: RawFd, fds: &[RawFd]) -> io::Result<()> {
         let header = libc::CMSG_FIRSTHDR(&message);
         (*header).cmsg_level = libc::SOL_SOCKET;
         (*header).cmsg_type = libc::SCM_RIGHTS;
-        (*header).cmsg_len = libc::CMSG_LEN((fds.len() * size_of::<RawFd>()) as _) as usize;
+        (*header).cmsg_len = libc::CMSG_LEN((size_of_val(fds)) as _) as usize;
         std::ptr::copy_nonoverlapping(
             fds.as_ptr(),
             libc::CMSG_DATA(header).cast::<RawFd>(),

@@ -1824,7 +1824,7 @@ mod tests {
                 .policy
                 .devices
                 .iter()
-                .any(|rule| rule.path == PathBuf::from("/dev/fuse")
+                .any(|rule| rule.path == *"/dev/fuse"
                     && rule.access.contains(Access::READ | Access::WRITE))
         );
     }

@@ -272,14 +272,12 @@ fn a_fuse_mount_is_performed_and_placed() {
     let config = dir.path().join("bailey.toml");
     fs::write(
         &config,
-        format!(
-            "[filesystem]\n\
-             read = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\", \"/etc\"]\n\
-             execute = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\"]\n\
-             [[fuse]]\n\
-             mount = \"mkdir -p \\\"$BAILEY_MOUNTPOINT\\\" && echo from-mount > \\\"$BAILEY_MOUNTPOINT/inside\\\"\"\n\
-             at = \"/mnt/data\"\n"
-        ),
+        "[filesystem]\n\
+         read = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\", \"/etc\"]\n\
+         execute = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\"]\n\
+         [[fuse]]\n\
+         mount = \"mkdir -p \\\"$BAILEY_MOUNTPOINT\\\" && echo from-mount > \\\"$BAILEY_MOUNTPOINT/inside\\\"\"\n\
+         at = \"/mnt/data\"\n"
     )
     .unwrap();
 
@@ -438,6 +436,7 @@ fn a_socket_relay_carries_a_service_into_the_sandbox() {
         .unwrap();
 
     let _ = server.kill();
+    let _ = server.wait();
     assert!(
         output.status.success(),
         "the relayed socket should answer: {}",
@@ -544,13 +543,11 @@ fn the_url_broker_refuses_non_web_schemes_through_a_run() {
     let config = dir.path().join("bailey.toml");
     fs::write(
         &config,
-        format!(
-            "[filesystem]\n\
-             read = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\", \"/etc\"]\n\
-             execute = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\"]\n\
-             [[socket]]\n\
-             service = \"url-open\"\n"
-        ),
+        "[filesystem]\n\
+         read = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\", \"/etc\"]\n\
+         execute = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\"]\n\
+         [[socket]]\n\
+         service = \"url-open\"\n",
     )
     .unwrap();
 
