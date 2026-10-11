@@ -30,7 +30,7 @@ use landlock::{
 use crate::backend::cgroup;
 use crate::backend::forward;
 use crate::backend::fuse;
-use crate::backend::isolation::{self, BindMount, Conceal, IsolationPlan};
+use crate::backend::isolation::{self, BindMount, Conceal, IsolationPlan, ReadOnly};
 use crate::backend::network::{self, NetworkMode};
 use crate::backend::relay;
 use crate::backend::world::{self, World};
@@ -1201,16 +1201,20 @@ fn build_isolation_plan(
     }
 
     // The remount happens inside the reconstructed root, so an island is named
-    // where the target sees it.
-    let mut read_only: Vec<PathBuf> = policy
+    // where the target sees it. The host spelling travels with it, because the
+    // question of whether the sandbox lost the path can only be asked there.
+    let mut read_only: Vec<ReadOnly> = policy
         .read_only
         .iter()
-        .map(|path| to_visible_path(policy, path))
+        .map(|path| ReadOnly {
+            host: path.clone(),
+            visible: to_visible_path(policy, path),
+        })
         .collect();
     read_only.extend(unwritable_beneath_implicit(policy, world, implicit_write));
     read_only.extend(metadata_read_only(policy));
-    read_only.sort();
-    read_only.dedup();
+    read_only.sort_by(|a, b| a.visible.cmp(&b.visible));
+    read_only.dedup_by(|a, b| a.visible == b.visible);
 
     Ok(IsolationPlan {
         binds,
@@ -1255,7 +1259,7 @@ fn unwritable_beneath_implicit(
     policy: &Policy,
     world: &World,
     implicit: &[PathBuf],
-) -> Vec<PathBuf> {
+) -> Vec<ReadOnly> {
     // The remount that consumes this vector strips the leading `/` and resolves
     // what is left beneath the reconstructed root, so every entry has to be
     // spelled where the target sees it. The roots are translated into the same
@@ -1277,11 +1281,14 @@ fn unwritable_beneath_implicit(
         .filesystem
         .iter()
         .filter(|rule| !rule.access.contains(policy::Access::WRITE))
-        .map(|rule| rule.visible().clone())
-        .filter(|path| {
-            roots
-                .iter()
-                .any(|root| path.as_path() != root.as_path() && path.starts_with(root))
+        .map(|rule| ReadOnly {
+            host: rule.path.clone(),
+            visible: rule.visible().clone(),
+        })
+        .filter(|entry| {
+            roots.iter().any(|root| {
+                entry.visible.as_path() != root.as_path() && entry.visible.starts_with(root)
+            })
         })
         .collect()
 }
@@ -1294,7 +1301,7 @@ fn unwritable_beneath_implicit(
 /// writable grant overlaps in either direction is left alone: a writable
 /// ancestor keeps the path writable, which is the documented merge rule, and a
 /// writable descendant would be broken by remounting its parent.
-fn metadata_read_only(policy: &Policy) -> Vec<PathBuf> {
+fn metadata_read_only(policy: &Policy) -> Vec<ReadOnly> {
     policy
         .filesystem
         .iter()
@@ -1311,7 +1318,10 @@ fn metadata_read_only(policy: &Policy) -> Vec<PathBuf> {
                         || other.path.starts_with(rule.path.as_path()))
             })
         })
-        .map(|rule| rule.visible().clone())
+        .map(|rule| ReadOnly {
+            host: rule.path.clone(),
+            visible: rule.visible().clone(),
+        })
         .collect()
 }
 
@@ -2145,7 +2155,13 @@ mod tests {
             access: Access::READ,
             at: None,
         });
-        assert_eq!(metadata_read_only(&policy), vec![PathBuf::from("/data")]);
+        assert_eq!(
+            metadata_read_only(&policy)
+                .iter()
+                .map(|entry| entry.visible.clone())
+                .collect::<Vec<_>>(),
+            vec![PathBuf::from("/data")]
+        );
 
         policy.filesystem.push(FsRule {
             path: PathBuf::from("/data/logs"),
@@ -2164,7 +2180,10 @@ mod tests {
             at: Some(PathBuf::from("/workspace")),
         });
         assert_eq!(
-            metadata_read_only(&policy),
+            metadata_read_only(&policy)
+                .iter()
+                .map(|entry| entry.visible.clone())
+                .collect::<Vec<_>>(),
             vec![PathBuf::from("/workspace")]
         );
     }
@@ -2194,7 +2213,8 @@ mod tests {
         let plan = build_isolation_plan(&policy, NetworkMode::Isolated, &world, &implicit).unwrap();
         assert!(
             plan.read_only
-                .contains(&PathBuf::from("/workspace/versions")),
+                .iter()
+                .any(|entry| entry.visible == Path::new("/workspace/versions")),
             "the read-only entry must be spelled where the target sees it: {:?}",
             plan.read_only
         );
@@ -2202,7 +2222,7 @@ mod tests {
             !plan
                 .read_only
                 .iter()
-                .any(|path| path.starts_with("/var/tmp")),
+                .any(|entry| entry.visible.starts_with("/var/tmp")),
             "no entry may keep the host spelling, which the remount cannot \
              resolve: {:?}",
             plan.read_only
@@ -2219,7 +2239,11 @@ mod tests {
         });
         let world = World::derive(Path::new("/bin/true"), &policy, true);
         let plan = build_isolation_plan(&policy, NetworkMode::Isolated, &world, &[]).unwrap();
-        assert!(plan.read_only.contains(&PathBuf::from("/data")));
+        assert!(
+            plan.read_only
+                .iter()
+                .any(|entry| entry.visible == Path::new("/data"))
+        );
     }
 
     /// A forward needs the sandbox's own loopback, which only exists while
