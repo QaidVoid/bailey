@@ -2154,6 +2154,45 @@ mod tests {
         );
     }
 
+    /// A relocated grant beneath an implicit-write root is the case where the two
+    /// producers disagreed: one answered with the host spelling, the other with
+    /// the spelling the target sees, and the remount consumer resolves under the
+    /// new root, so only the second one can ever match. The whole vector has to
+    /// be in that spelling, or the entry is skipped in silence and the path stays
+    /// writable against the host file.
+    #[test]
+    fn a_relocated_read_grant_beneath_an_implicit_root_is_remounted() {
+        let mut policy = Policy::default();
+        policy.filesystem.push(FsRule {
+            path: PathBuf::from("/var/tmp/proj/src"),
+            access: Access::READ | Access::WRITE,
+            at: Some(PathBuf::from("/workspace")),
+        });
+        policy.filesystem.push(FsRule {
+            path: PathBuf::from("/var/tmp/proj/src/versions"),
+            access: Access::READ,
+            at: Some(PathBuf::from("/workspace/versions")),
+        });
+        let world = World::derive(Path::new("/bin/true"), &policy, true);
+        let implicit = [PathBuf::from("/var/tmp/proj/src")];
+
+        let plan = build_isolation_plan(&policy, NetworkMode::Isolated, &world, &implicit).unwrap();
+        assert!(
+            plan.read_only.contains(&PathBuf::from("/workspace/versions")),
+            "the read-only entry must be spelled where the target sees it: {:?}",
+            plan.read_only
+        );
+        assert!(
+            !plan
+                .read_only
+                .iter()
+                .any(|path| path.starts_with("/var/tmp")),
+            "no entry may keep the host spelling, which the remount cannot \
+             resolve: {:?}",
+            plan.read_only
+        );
+    }
+
     #[test]
     fn the_isolation_plan_remounts_a_read_only_grant() {
         let mut policy = Policy::default();
