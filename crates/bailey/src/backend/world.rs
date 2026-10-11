@@ -211,10 +211,9 @@ pub(crate) fn runtime_dir_inside(policy: &Policy) -> Option<PathBuf> {
     }
     match std::env::var_os("XDG_RUNTIME_DIR") {
         Some(dir) if Path::new(&dir).is_absolute() => Some(PathBuf::from(dir)),
-        _ => Some(PathBuf::from(format!(
-            "/run/user/{}",
-            unsafe { libc::geteuid() }
-        ))),
+        _ => Some(PathBuf::from(format!("/run/user/{}", unsafe {
+            libc::geteuid()
+        }))),
     }
 }
 
@@ -276,10 +275,7 @@ pub fn environment(policy: &Policy, world: &World, network: NetworkMode) -> Vec<
     // relays live in, and each named service gets the variables that point a
     // program at it.
     if let Some(inside) = runtime_dir_inside(policy) {
-        env.insert(
-            "XDG_RUNTIME_DIR".into(),
-            inside.display().to_string(),
-        );
+        env.insert("XDG_RUNTIME_DIR".into(), inside.display().to_string());
         for socket in &policy.sockets {
             match socket.service.as_deref() {
                 Some("wayland") => {

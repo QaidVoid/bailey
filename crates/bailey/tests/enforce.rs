@@ -317,11 +317,12 @@ fn a_fuse_mount_is_performed_and_placed() {
     // The stub's own leftover is the test's to remove: this tree provably
     // holds nothing but the files the stub wrote.
     for entry in fs::read_dir("/tmp").unwrap().flatten() {
-        let is_ours = entry
-            .path()
-            .join("0/inside")
-            .is_file()
-            && entry.file_name().to_str().unwrap().starts_with(".bailey-fuse.");
+        let is_ours = entry.path().join("0/inside").is_file()
+            && entry
+                .file_name()
+                .to_str()
+                .unwrap()
+                .starts_with(".bailey-fuse.");
         if is_ours {
             fs::remove_dir_all(entry.path()).unwrap();
         }
@@ -477,7 +478,11 @@ fn a_dbus_relay_sets_the_bus_address() {
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(
         stdout.trim(),

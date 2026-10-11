@@ -344,7 +344,10 @@ mod tests {
         let socket = guard.relays()[0].listener_path.clone();
         assert!(socket.exists());
         drop(guard);
-        assert!(!socket.exists(), "the staged socket must not outlive the run");
+        assert!(
+            !socket.exists(),
+            "the staged socket must not outlive the run"
+        );
     }
 
     /// The URL broker's contract, against a stand-in opener that records what

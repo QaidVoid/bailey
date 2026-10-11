@@ -9,12 +9,12 @@ pub mod audit;
 pub mod audit_helper;
 pub mod cgroup;
 pub mod enforce;
+pub mod forward;
 pub mod fuse;
 pub mod isolation;
 pub mod network;
 pub mod probe;
 pub mod relay;
-pub mod forward;
 pub mod world;
 
 use std::path::PathBuf;

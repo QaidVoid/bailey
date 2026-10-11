@@ -147,7 +147,11 @@ fn command_line_grants_reach_the_policy() {
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         policy_line(&stdout, "r--", &marker),
@@ -216,7 +220,11 @@ fn a_relative_quick_grant_resolves_against_the_working_directory() {
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         policy_line(&stdout, "-w-", dir.path()),
