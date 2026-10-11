@@ -17,6 +17,7 @@ use std::io::{self, Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use crate::policy::PortForward;
 
@@ -109,7 +110,11 @@ impl ForwardGuard {
     /// client, and a queued second client waits in the listen backlog until
     /// the first is done. The host side is dialed fresh per connection, so a
     /// service that restarts underneath a running sandbox keeps working.
-    pub(crate) fn serve(&self) {
+    ///
+    /// `idle` is how long a carried connection may sit with no byte crossing
+    /// before it is closed. The run passes the production deadline; a test
+    /// passes a scaled-down one so it does not wait five minutes.
+    pub(crate) fn serve(&self, idle: Duration) {
         for (listener, host_port) in &self.listeners {
             let Ok(acceptor) = listener.try_clone() else {
                 continue;
@@ -123,7 +128,7 @@ impl ForwardGuard {
                         // is what dialing a dead local daemon looks like.
                         continue;
                     };
-                    pump(client, service);
+                    pump(client, service, idle);
                 }
             });
         }
@@ -132,6 +137,16 @@ impl ForwardGuard {
 
 /// Stop reading on one side once its queue holds this much.
 const HIGH_WATER: usize = 256 * 1024;
+
+/// Close a forwarded connection once no byte has crossed in either direction
+/// for this long.
+///
+/// The deadline is per connection and resets whenever a byte moves, so an
+/// interactive session or a streaming download is never cut. A peer that
+/// connects and then goes quiet without closing otherwise holds two
+/// descriptors and the port's thread for as long as the run lives, which
+/// denies the forward to every other client.
+pub(crate) const PUMP_IDLE: Duration = Duration::from_secs(300);
 
 /// Read more bytes into `buf` without blocking.
 ///
@@ -181,8 +196,10 @@ fn drain(stream: &TcpStream, buf: &mut Vec<u8>) -> io::Result<bool> {
 /// propagates the end it sees: when the client stops writing, the service
 /// learns the request is complete once the last buffered byte is through,
 /// and the other way around. A broken direction ends the connection; there
-/// is no caller left to report to.
-fn pump(client: TcpStream, service: TcpStream) {
+/// is no caller left to report to. A connection idle past `idle` ends the
+/// same way, so a peer that stops speaking cannot hold the port for the
+/// rest of the run.
+fn pump(client: TcpStream, service: TcpStream, idle: Duration) {
     for stream in [&client, &service] {
         let _ = stream.set_nonblocking(true);
     }
@@ -190,6 +207,7 @@ fn pump(client: TcpStream, service: TcpStream) {
     let mut to_client: Vec<u8> = Vec::new();
     let mut client_sends = true;
     let mut service_sends = true;
+    let mut last_moved = Instant::now();
     let mut pollfds = [
         libc::pollfd {
             fd: client.as_raw_fd(),
@@ -221,7 +239,14 @@ fn pump(client: TcpStream, service: TcpStream) {
             // Both ends are spent and everything read was delivered.
             return;
         }
-        let ready = unsafe { libc::poll(pollfds.as_mut_ptr(), 2, -1) };
+        // Wait only the time the connection has left, so the deadline is on
+        // idleness rather than on age.
+        let left = idle.saturating_sub(last_moved.elapsed());
+        if left.is_zero() {
+            return;
+        }
+        let wait = left.as_millis().min(i32::MAX as u128) as libc::c_int;
+        let ready = unsafe { libc::poll(pollfds.as_mut_ptr(), 2, wait) };
         if ready < 0 {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::Interrupted {
@@ -231,29 +256,41 @@ fn pump(client: TcpStream, service: TcpStream) {
         }
         let client_event = pollfds[0].revents;
         let service_event = pollfds[1].revents;
+        let mut moved = false;
         if client_event & libc::POLLIN != 0 {
+            let queued = to_service.len();
             match fill(&client, &mut to_service) {
                 Ok(still_sending) => client_sends = still_sending,
                 Err(_) => return,
             }
+            moved |= to_service.len() != queued;
         }
         if service_event & libc::POLLIN != 0 {
+            let queued = to_client.len();
             match fill(&service, &mut to_client) {
                 Ok(still_sending) => service_sends = still_sending,
                 Err(_) => return,
             }
+            moved |= to_client.len() != queued;
         }
         if client_event & libc::POLLOUT != 0 {
+            let queued = to_client.len();
             match drain(&client, &mut to_client) {
                 Ok(_) => {}
                 Err(_) => return,
             }
+            moved |= to_client.len() != queued;
         }
         if service_event & libc::POLLOUT != 0 {
+            let queued = to_service.len();
             match drain(&service, &mut to_service) {
                 Ok(_) => {}
                 Err(_) => return,
             }
+            moved |= to_service.len() != queued;
+        }
+        if moved {
+            last_moved = Instant::now();
         }
         // Each direction ends when its far end stopped sending and everything
         // read was delivered. Checked outside the POLLOUT branches: a queue
@@ -367,6 +404,12 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// The idle deadline the tests wait out: the real one divided by three
+    /// hundred, so a test measures a second instead of five minutes.
+    const PUMP_IDLE_TEST: Duration = Duration::from_secs(PUMP_IDLE.as_secs() / 300);
 
     /// A free loopback port, racy until bound again but fine for tests.
     fn free_port() -> u16 {
@@ -375,6 +418,26 @@ mod tests {
             .local_addr()
             .unwrap()
             .port()
+    }
+
+    /// One connection pair: the two ends `pump` owns, then the test's own end
+    /// of each, so a test can drive one side and watch the other.
+    fn paired() -> (TcpStream, TcpStream, TcpStream, TcpStream) {
+        let target_side = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let service_side = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let target = TcpStream::connect((
+            Ipv4Addr::LOCALHOST,
+            target_side.local_addr().unwrap().port(),
+        ))
+        .unwrap();
+        let (peer_of_target, _) = target_side.accept().unwrap();
+        let service = TcpStream::connect((
+            Ipv4Addr::LOCALHOST,
+            service_side.local_addr().unwrap().port(),
+        ))
+        .unwrap();
+        let (peer_of_service, _) = service_side.accept().unwrap();
+        (target, service, peer_of_target, peer_of_service)
     }
 
     #[test]
@@ -468,7 +531,7 @@ mod tests {
         };
         let guard = ForwardGuard::receive(&announce, &forwards).unwrap();
         worker.join().unwrap();
-        guard.serve();
+        guard.serve(PUMP_IDLE);
         // The sandbox side holds the port now, so a second bind must fail.
         assert!(std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, forward_port)).is_err());
         // Dialing it lands on the handed-over listener, like the target would,
@@ -498,23 +561,9 @@ mod tests {
     /// side instead of leaving both ends waiting.
     #[test]
     fn the_pump_carries_split_writes_and_half_closes() {
-        let target_side = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let service_side = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let (target, service, mut peer_of_target, mut peer_of_service) = paired();
 
-        let target = TcpStream::connect((
-            Ipv4Addr::LOCALHOST,
-            target_side.local_addr().unwrap().port(),
-        ))
-        .unwrap();
-        let (mut peer_of_target, _) = target_side.accept().unwrap();
-        let service = TcpStream::connect((
-            Ipv4Addr::LOCALHOST,
-            service_side.local_addr().unwrap().port(),
-        ))
-        .unwrap();
-        let (mut peer_of_service, _) = service_side.accept().unwrap();
-
-        thread::spawn(move || pump(target, service));
+        thread::spawn(move || pump(target, service, PUMP_IDLE));
 
         peer_of_service
             .set_read_timeout(Some(std::time::Duration::from_secs(30)))
@@ -527,5 +576,143 @@ mod tests {
         let mut whole = Vec::new();
         peer_of_service.read_to_end(&mut whole).unwrap();
         assert_eq!(whole, b"hello");
+    }
+
+    /// A client that connects to a forwarded port and then says nothing is
+    /// closed at the deadline instead of held for the rest of the run.
+    #[test]
+    fn an_idle_forward_connection_closes_at_the_deadline() {
+        let (target, service, peer_of_target, peer_of_service) = paired();
+        let (returned, waited) = mpsc::channel();
+        thread::spawn(move || {
+            pump(target, service, PUMP_IDLE_TEST);
+            let _ = returned.send(());
+        });
+        assert!(
+            waited.recv_timeout(PUMP_IDLE_TEST * 2).is_ok(),
+            "a forwarded connection with no traffic must close at the deadline"
+        );
+        // The pump owned both ends, so returning closed them: each peer reads
+        // the end rather than a socket with nobody behind it.
+        for mut peer in [peer_of_target, peer_of_service] {
+            peer.set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut buf = [0u8; 1];
+            assert_eq!(
+                peer.read(&mut buf).unwrap(),
+                0,
+                "both sockets must be closed once the pump returns"
+            );
+        }
+    }
+
+    /// A connection that keeps moving bytes is never cut: the deadline is on
+    /// idleness, not on how long the connection has lived.
+    #[test]
+    fn a_forward_connection_that_stays_active_is_not_cut() {
+        let (target, service, mut peer_of_target, mut peer_of_service) = paired();
+        let (returned, waited) = mpsc::channel();
+        thread::spawn(move || {
+            pump(target, service, PUMP_IDLE_TEST);
+            let _ = returned.send(());
+        });
+        // A byte every half deadline, for longer than the deadline. A
+        // write that fails means the pump has already closed the connection,
+        // which is what the assertion below reports.
+        for _ in 0..4 {
+            thread::sleep(PUMP_IDLE_TEST / 2);
+            let _ = peer_of_target.write_all(b"x");
+        }
+        assert!(
+            waited.try_recv().is_err(),
+            "a connection that keeps moving bytes must not be cut by the idle deadline"
+        );
+        let mut seen = [0u8; 4];
+        peer_of_service
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        peer_of_service.read_exact(&mut seen).unwrap();
+        assert_eq!(&seen, b"xxxx");
+        // End it from both sides so the pump's thread finishes with the test.
+        peer_of_target.shutdown(std::net::Shutdown::Write).unwrap();
+        peer_of_service.shutdown(std::net::Shutdown::Write).unwrap();
+        assert!(waited.recv_timeout(Duration::from_secs(10)).is_ok());
+    }
+
+    /// A connection that sends and then falls silent is closed at the deadline
+    /// measured from its last byte, not from when it connected.
+    #[test]
+    fn a_forward_connection_that_goes_quiet_closes_at_the_deadline() {
+        let (target, service, mut peer_of_target, mut peer_of_service) = paired();
+        let (returned, waited) = mpsc::channel();
+        thread::spawn(move || {
+            pump(target, service, PUMP_IDLE_TEST);
+            let _ = returned.send(());
+        });
+        peer_of_target.write_all(b"hi").unwrap();
+        // The service saw the bytes, so the pump really carried them.
+        let mut seen = [0u8; 2];
+        peer_of_service
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        peer_of_service.read_exact(&mut seen).unwrap();
+        assert_eq!(&seen, b"hi");
+        assert!(
+            waited.recv_timeout(PUMP_IDLE_TEST * 2).is_ok(),
+            "a connection that has gone quiet must close at the deadline"
+        );
+    }
+
+    /// One abandoned connection must not deny the forward to the next client:
+    /// the idle pump returns, the port's thread accepts again, and the second
+    /// client is served.
+    #[test]
+    fn an_idle_connection_does_not_deny_the_forward_to_the_next_client() {
+        let forward_port = free_port();
+        let host_port = free_port();
+        let host = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, host_port)).unwrap();
+        let echoes = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut client, _) = host.accept().unwrap();
+                thread::spawn(move || {
+                    let mut buf = [0u8; 2];
+                    if let Ok(n) = client.read(&mut buf) {
+                        let _ = client.write_all(&buf[..n]);
+                    }
+                });
+            }
+        });
+        let forwards = vec![PortForward {
+            port: forward_port,
+            host_port,
+        }];
+        let (announce, child_end) = UnixStream::pair().unwrap();
+        let child_fd = child_end.into_raw_fd();
+        let worker = {
+            let forwards = forwards.clone();
+            thread::spawn(move || arm(child_fd, &forwards).unwrap())
+        };
+        let guard = ForwardGuard::receive(&announce, &forwards).unwrap();
+        worker.join().unwrap();
+        guard.serve(PUMP_IDLE_TEST);
+        // The abandoned client: connected, and silent.
+        let idle = TcpStream::connect((Ipv4Addr::LOCALHOST, forward_port)).unwrap();
+        thread::sleep(PUMP_IDLE_TEST * 2);
+        // The next client is served all the same.
+        let mut second = TcpStream::connect((Ipv4Addr::LOCALHOST, forward_port)).unwrap();
+        second.write_all(b"hi").unwrap();
+        let mut buf = [0u8; 2];
+        second
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let served = second.read_exact(&mut buf);
+        assert!(
+            served.is_ok(),
+            "a second client must be served once the idle connection is closed: {served:?}"
+        );
+        assert_eq!(&buf, b"hi");
+        drop(idle);
+        drop(second);
+        echoes.join().ok();
     }
 }
