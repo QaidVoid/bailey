@@ -866,10 +866,16 @@ fn finalize(mut acc: Accumulator) -> Result<Resolved, ConfigError> {
     // combination rather than promise less than the policy says.
     if let Some((true, source)) = &acc.self_fuse {
         let island = acc.read_only.first();
+        // A relocation moves where the target sees a grant, so a denial can
+        // name that grant from either the host or the visible spelling.
         let conceal = acc.denied.iter().find(|denied| {
-            acc.filesystem
-                .keys()
-                .any(|granted| denied.starts_with(granted) && denied.as_path() != granted)
+            acc.filesystem.keys().any(|granted| {
+                beneath(granted, denied)
+                    || acc
+                        .relocated
+                        .get(granted)
+                        .is_some_and(|at| beneath(at, denied))
+            })
         });
         if let Some(path) = island.or(conceal) {
             let kind = if island.is_some() {
@@ -1154,7 +1160,9 @@ pub fn expand_flag_path(raw: &str) -> Result<PathBuf, String> {
 }
 
 /// Collapse `.` and `..` components without touching the filesystem, so that
-/// equivalent spellings of a path resolve to the same key during merge.
+/// equivalent spellings of a path resolve to the same key during merge. A
+/// `..` above the root is dropped, because an absolute path has nothing above
+/// `/`, and a key that kept one would match no rule.
 fn normalize_lexical(path: &Path) -> PathBuf {
     use std::path::Component;
 
@@ -1163,14 +1171,17 @@ fn normalize_lexical(path: &Path) -> PathBuf {
         match component {
             Component::CurDir => {}
             Component::ParentDir => {
-                if !out.pop() {
-                    out.push("..");
-                }
+                out.pop();
             }
             other => out.push(other),
         }
     }
     out
+}
+
+/// True when `child` lies strictly beneath `parent`, component for component.
+fn beneath(parent: &Path, child: &Path) -> bool {
+    child.starts_with(parent) && child != parent
 }
 
 /// Expand `${VAR}` references against the environment.
@@ -1432,6 +1443,23 @@ mod tests {
         assert_eq!(resolved.policy.filesystem.len(), 1);
         assert_eq!(resolved.policy.filesystem[0].path, PathBuf::from("/a"));
         assert_eq!(resolved.policy.denied, vec![PathBuf::from("/a/secret")]);
+    }
+
+    /// A `..` that walks above the root lands on the root, so a deny spelled
+    /// with one still retracts the grant it names. A literal `..` surviving
+    /// normalisation would leave the deny keyed at a path no rule holds.
+    #[test]
+    fn a_deny_that_pops_above_the_root_still_names_its_grant() {
+        let layers = [
+            layer("/base", "[filesystem]\nread = [\"/a/granted\"]"),
+            layer(
+                "/base",
+                "[filesystem]\ndeny = [\"/a/granted/../../../a/granted\"]",
+            ),
+        ];
+        let resolved = merge(&layers).unwrap();
+        assert!(resolved.policy.filesystem.is_empty());
+        assert_eq!(resolved.policy.denied, vec![PathBuf::from("/a/granted")]);
     }
 
     #[test]
@@ -1970,6 +1998,21 @@ mod tests {
         );
     }
 
+    /// A `..` above the root names the root, so no normalised path carries a
+    /// parent component for a key to trip over.
+    #[test]
+    fn normalize_lexical_drops_a_parent_above_the_root() {
+        assert_eq!(
+            normalize_lexical(Path::new("/a/granted/../../../a/granted")),
+            PathBuf::from("/a/granted")
+        );
+        assert_eq!(normalize_lexical(Path::new("/..")), PathBuf::from("/"));
+        assert_eq!(
+            normalize_lexical(Path::new("/a/./b")),
+            PathBuf::from("/a/b")
+        );
+    }
+
     #[test]
     fn fuse_mounts_accumulate_and_resolve_at() {
         let layers = [
@@ -2059,6 +2102,31 @@ mod tests {
         let layers = [layer(
             "/base",
             "self_fuse = true\n[filesystem]\nread = [\"/a\"]\ndeny = [\"/a/secret\"]",
+        )];
+        assert!(merge(&layers).is_err());
+    }
+
+    /// The visible spelling is where the target acts, so a denial written
+    /// there is enforced by a mount just as much as the host spelling is.
+    #[test]
+    fn a_relocated_visible_deny_is_recognised() {
+        let layers = [layer(
+            "/base",
+            "self_fuse = true\n[filesystem]\nread = [{ path = \"/a\", at = \"/v\" }]\ndeny = [\"/v/secret\"]",
+        )];
+        let error = merge(&layers).unwrap_err().to_string();
+        assert!(
+            error.contains("self_fuse") && error.contains("/v/secret"),
+            "the refusal names the denial: {error}"
+        );
+    }
+
+    /// The host spelling of the same denial was always caught, and stays so.
+    #[test]
+    fn a_relocated_host_deny_is_still_refused() {
+        let layers = [layer(
+            "/base",
+            "self_fuse = true\n[filesystem]\nread = [{ path = \"/a\", at = \"/v\" }]\ndeny = [\"/a/secret\"]",
         )];
         assert!(merge(&layers).is_err());
     }
