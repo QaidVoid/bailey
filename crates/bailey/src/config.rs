@@ -613,7 +613,8 @@ fn apply_layer(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> 
     }
 
     for socket in &layer.raw.socket {
-        acc.sockets.push(build_socket(socket, &layer.path, &layer.base)?);
+        acc.sockets
+            .push(build_socket(socket, &layer.path, &layer.base)?);
     }
 
     let mut forward_ports = std::collections::BTreeSet::new();
@@ -725,11 +726,7 @@ fn apply_layer(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> 
 /// run is launched from. An explicit entry names both ends itself, and the
 /// two spellings are refused together: a service's paths are bailey's to
 /// know, and a custom socket's are the config's.
-fn build_socket(
-    raw: &RawSocket,
-    path: &Path,
-    base: &Path,
-) -> Result<SocketRelay, ConfigError> {
+fn build_socket(raw: &RawSocket, path: &Path, base: &Path) -> Result<SocketRelay, ConfigError> {
     if let Some(service) = &raw.service {
         if raw.host.is_some() || raw.at.is_some() {
             return Err(ConfigError::Invalid {
@@ -742,9 +739,7 @@ fn build_socket(
         }
         let runtime = std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME").map(|home| Path::new(&home).join(".runtime"))
-            });
+            .or_else(|| std::env::var_os("HOME").map(|home| Path::new(&home).join(".runtime")));
         let invalid = |reason: String| ConfigError::Invalid {
             path: path.to_path_buf(),
             reason,
@@ -785,13 +780,13 @@ fn build_socket(
                 let number = std::env::var("DISPLAY")
                     .ok()
                     .and_then(|display| {
-                        display.split(':').next_back().and_then(|rest| {
-                            rest.split('.').next().map(str::to_owned)
-                        })
+                        display
+                            .split(':')
+                            .next_back()
+                            .and_then(|rest| rest.split('.').next().map(str::to_owned))
                     })
                     .unwrap_or_else(|| "0".into());
-                let valid = !number.is_empty()
-                    && number.chars().all(|ch| ch.is_ascii_digit());
+                let valid = !number.is_empty() && number.chars().all(|ch| ch.is_ascii_digit());
                 if !valid {
                     return Err(invalid(format!(
                         "service `x11` could not read a display number from \
@@ -1697,11 +1692,17 @@ mod tests {
             &[],
             Path::new("/bin/true"),
             Some(&config),
-            &[("command-line grants", "[filesystem]\nread = [\"/kept-out\"]")],
+            &[(
+                "command-line grants",
+                "[filesystem]\nread = [\"/kept-out\"]",
+            )],
         )
         .unwrap();
         assert!(resolved.policy.denied.is_empty());
-        assert_eq!(resolved.policy.filesystem[0].path, PathBuf::from("/kept-out"));
+        assert_eq!(
+            resolved.policy.filesystem[0].path,
+            PathBuf::from("/kept-out")
+        );
     }
 
     /// Egress is a scalar where later layers replace earlier ones, so a
@@ -1805,9 +1806,8 @@ mod tests {
     #[test]
     fn unknown_fuse_keys_are_refused() {
         // The refusal happens at deserialize, before any merging.
-        let parsed: Result<RawLayer, _> = toml::from_str(
-            "[[fuse]]\nmount = \"one\"\nat = \"/mnt/a\"\nextra = \"x\"",
-        );
+        let parsed: Result<RawLayer, _> =
+            toml::from_str("[[fuse]]\nmount = \"one\"\nat = \"/mnt/a\"\nextra = \"x\"");
         assert!(parsed.is_err());
     }
 
@@ -1819,9 +1819,14 @@ mod tests {
         )])
         .unwrap();
         assert!(resolved.policy.self_fuse);
-        assert!(resolved.policy.devices.iter().any(|rule| rule.path
-            == PathBuf::from("/dev/fuse")
-            && rule.access.contains(Access::READ | Access::WRITE)));
+        assert!(
+            resolved
+                .policy
+                .devices
+                .iter()
+                .any(|rule| rule.path == PathBuf::from("/dev/fuse")
+                    && rule.access.contains(Access::READ | Access::WRITE))
+        );
     }
 
     /// The switch means "nearest layer that sets it", the same standing an

@@ -698,7 +698,11 @@ fn granting_dev_pts_gives_the_run_terminals_of_its_own() {
 /// The policy for a mount test: the workspace granted for reading and writing
 /// so the mountpoint is reachable, on top of the system paths the target's own
 /// tools need.
-fn mount_workspace(dir: &std::path::Path, work: &std::path::Path, self_fuse: bool) -> std::path::PathBuf {
+fn mount_workspace(
+    dir: &std::path::Path,
+    work: &std::path::Path,
+    self_fuse: bool,
+) -> std::path::PathBuf {
     let config = dir.join("bailey.toml");
     fs::write(
         &config,
@@ -762,9 +766,7 @@ fn self_fuse_lets_the_target_mount_and_unmount() {
         .unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        output.status.success()
-            && stdout.contains("mounted")
-            && stdout.contains("unmounted"),
+        output.status.success() && stdout.contains("mounted") && stdout.contains("unmounted"),
         "self_fuse must let the target mount and unmount: {}{}",
         stdout,
         String::from_utf8_lossy(&output.stderr)
