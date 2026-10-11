@@ -291,7 +291,7 @@ fn send_fds(announce: RawFd, fds: &[RawFd]) -> io::Result<()> {
         let header = libc::CMSG_FIRSTHDR(&message);
         (*header).cmsg_level = libc::SOL_SOCKET;
         (*header).cmsg_type = libc::SCM_RIGHTS;
-        (*header).cmsg_len = libc::CMSG_LEN((fds.len() * size_of::<RawFd>()) as _) as usize;
+        (*header).cmsg_len = libc::CMSG_LEN((fds.len() * size_of::<RawFd>()) as _) as _;
         std::ptr::copy_nonoverlapping(
             fds.as_ptr(),
             libc::CMSG_DATA(header).cast::<RawFd>(),
@@ -336,7 +336,7 @@ fn recv_fds(stream: &std::os::unix::net::UnixStream, count: usize) -> io::Result
         let mut header = libc::CMSG_FIRSTHDR(&message);
         while !header.is_null() {
             if (*header).cmsg_level == libc::SOL_SOCKET && (*header).cmsg_type == libc::SCM_RIGHTS {
-                let bytes = (*header).cmsg_len - libc::CMSG_LEN(0) as usize;
+                let bytes = (*header).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
                 let items = bytes / size_of::<RawFd>();
                 let source = libc::CMSG_DATA(header).cast_const().cast::<RawFd>();
                 for item in 0..items {
