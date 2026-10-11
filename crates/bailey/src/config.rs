@@ -371,7 +371,9 @@ struct Accumulator {
     relocated: BTreeMap<PathBuf, PathBuf>,
     denied: BTreeSet<PathBuf>,
     read_only: BTreeSet<PathBuf>,
-    egress: Option<Egress>,
+    /// The egress allowance, with the path of the layer that set it, for the
+    /// same reason as `self_fuse` above.
+    egress: Option<(Egress, PathBuf)>,
     bind_ports: Vec<u16>,
     devices: BTreeMap<PathBuf, Access>,
     resources: ResourceLimits,
@@ -575,7 +577,7 @@ fn apply_layer(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> 
 
     if let Some(network) = &layer.raw.network {
         if network.egress.is_some() || !network.egress_allow.is_empty() {
-            acc.egress = Some(build_egress(network, &layer.path)?);
+            acc.egress = Some((build_egress(network, &layer.path)?, layer.path.clone()));
         }
         for port in &network.bind_ports {
             if !acc.bind_ports.contains(port) {
@@ -883,6 +885,23 @@ fn finalize(mut acc: Accumulator) -> Result<Resolved, ConfigError> {
                 ),
             });
         }
+        // The egress port rules are Landlock rules, and Landlock is the half of
+        // confinement this switch gives up: the ruleset that would carry them
+        // is built and then not applied, so an allowance would promise a
+        // restriction nothing in the run makes. A denial is not in that
+        // position, because it is held by the run's own network namespace.
+        if let Some((Egress::Allow(_), egress_source)) = &acc.egress {
+            return Err(ConfigError::Conflict {
+                path: source.clone(),
+                target: "self_fuse".into(),
+                reason: format!(
+                    "`{}` is a partial egress allowance, enforced only by the \
+                     Landlock ruleset that self_fuse drops. Clear `self_fuse`, \
+                     or drop the egress allowance",
+                    egress_source.display()
+                ),
+            });
+        }
         // A FUSE mount needs the device node, and a switch that promises
         // full use should not also demand the boilerplate.
         acc.devices
@@ -911,7 +930,10 @@ fn finalize(mut acc: Accumulator) -> Result<Resolved, ConfigError> {
             denied: acc.denied.into_iter().collect(),
             read_only: acc.read_only.into_iter().collect(),
             network: NetworkPolicy {
-                egress: acc.egress.unwrap_or(Egress::DenyAll),
+                egress: acc
+                    .egress
+                    .map(|(egress, _)| egress)
+                    .unwrap_or(Egress::DenyAll),
                 bind_ports: acc.bind_ports,
             },
             devices,
@@ -1824,7 +1846,7 @@ mod tests {
                 .policy
                 .devices
                 .iter()
-                .any(|rule| rule.path == PathBuf::from("/dev/fuse")
+                .any(|rule| rule.path == *"/dev/fuse"
                     && rule.access.contains(Access::READ | Access::WRITE))
         );
     }
@@ -1892,5 +1914,80 @@ mod tests {
         assert!(resolved.policy.self_fuse);
         assert!(resolved.policy.read_only.is_empty());
         assert_eq!(resolved.policy.denied.len(), 1);
+    }
+
+    /// The egress port rules are Landlock rules, and Landlock is the half a
+    /// self_fuse run gives up. An allowance therefore promises a restriction
+    /// nothing in that run makes, so it is refused rather than quietly dropped.
+    #[test]
+    fn self_fuse_with_an_egress_allowance_is_refused() {
+        let layers = [layer(
+            "/base",
+            "self_fuse = true\n[network]\negress_allow = [{ host = \"*\", port = 443 }]",
+        )];
+        let error = merge(&layers).unwrap_err().to_string();
+        assert!(
+            error.contains("self_fuse") && error.contains("egress allowance"),
+            "the refusal names both things to change: {error}"
+        );
+    }
+
+    /// The two directives usually reach each other from different files, and
+    /// the advice is only actionable if it names both of them.
+    #[test]
+    fn self_fuse_and_an_egress_allowance_refused_across_layers() {
+        let layers = [
+            layer("/over", "self_fuse = true"),
+            layer(
+                "/deep",
+                "[network]\negress_allow = [{ host = \"*\", port = 443 }]",
+            ),
+        ];
+        let error = merge(&layers).unwrap_err().to_string();
+        assert!(
+            error.contains("/over/bailey.toml") && error.contains("/deep/bailey.toml"),
+            "both layers are named: {error}"
+        );
+    }
+
+    /// An allowance absent altogether leaves the denial to the network
+    /// namespace, which self_fuse does not touch.
+    #[test]
+    fn self_fuse_without_an_egress_allowance_is_unchanged() {
+        let layers = [layer(
+            "/base",
+            "self_fuse = true\n[filesystem]\nread = [\"/a\"]",
+        )];
+        let resolved = merge(&layers).unwrap();
+        assert!(resolved.policy.self_fuse);
+        assert_eq!(resolved.policy.network.egress, Egress::DenyAll);
+    }
+
+    /// Allow-everything promises no restriction, so there is nothing for a
+    /// dropped Landlock ruleset to have been enforcing. This assumes no bound
+    /// port: a bound port is restricted by that same ruleset, and that
+    /// restriction is dropped too.
+    #[test]
+    fn self_fuse_with_egress_allow_all_is_unchanged() {
+        let layers = [
+            layer("/base", "self_fuse = true\n[filesystem]\nread = [\"/a\"]"),
+            layer("/base", "[network]\negress = \"allow\""),
+        ];
+        let resolved = merge(&layers).unwrap();
+        assert!(resolved.policy.self_fuse);
+        assert_eq!(resolved.policy.network.egress, Egress::AllowAll);
+    }
+
+    /// A denial is held by the network namespace rather than by Landlock, so
+    /// self_fuse costs it nothing.
+    #[test]
+    fn self_fuse_with_egress_denied_is_unchanged() {
+        let layers = [
+            layer("/base", "self_fuse = true\n[filesystem]\nread = [\"/a\"]"),
+            layer("/base", "[network]\negress = \"deny\""),
+        ];
+        let resolved = merge(&layers).unwrap();
+        assert!(resolved.policy.self_fuse);
+        assert_eq!(resolved.policy.network.egress, Egress::DenyAll);
     }
 }

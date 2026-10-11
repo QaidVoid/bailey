@@ -182,6 +182,11 @@ more than it can deliver:
 - A `deny` beneath a grant is an empty mount the target could remove, so that
   combination is a resolution error too. A `deny` no grant reaches is absent
   from the root outright and stays enforced.
+- An egress allowance is a Landlock port restriction, and it is enforced by the
+  same ruleset the switch gives up, so that combination is a resolution error
+  too. Allow-everything and deny-everything are both unaffected: the first
+  promises no restriction, and the second is held by the run's own network
+  namespace rather than by Landlock.
 
 ## `[[socket]]`
 

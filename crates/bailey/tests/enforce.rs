@@ -15,6 +15,15 @@ fn landlock_available() -> bool {
     bailey::backend::probe::probe(false).landlock_abi.is_some()
 }
 
+/// Whether this host can create the user namespace a `[[socket]]` relay or a
+/// `[[fuse]]` mount needs. Both are placed inside the reconstructed root, so
+/// without one the run refuses rather than dropping what the policy names, and
+/// a test that asserts the mount or the relay arrived fails on a host that
+/// cannot build one. The GitHub-hosted runners report no user namespaces.
+fn isolation_available() -> bool {
+    bailey::backend::isolation::available()
+}
+
 fn write_config(dir: &Path, extra_read: &str) -> std::path::PathBuf {
     let config = dir.join("bailey.toml");
     fs::write(
@@ -264,6 +273,10 @@ fn the_file_limit_is_reported_as_enforced() {
 /// the mount lands where the policy says.
 #[test]
 fn a_fuse_mount_is_performed_and_placed() {
+    if !isolation_available() {
+        eprintln!("skipping: namespace isolation unavailable on this host");
+        return;
+    }
     if !landlock_available() {
         eprintln!("skipping: Landlock unavailable");
         return;
@@ -272,14 +285,12 @@ fn a_fuse_mount_is_performed_and_placed() {
     let config = dir.path().join("bailey.toml");
     fs::write(
         &config,
-        format!(
-            "[filesystem]\n\
-             read = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\", \"/etc\"]\n\
-             execute = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\"]\n\
-             [[fuse]]\n\
-             mount = \"mkdir -p \\\"$BAILEY_MOUNTPOINT\\\" && echo from-mount > \\\"$BAILEY_MOUNTPOINT/inside\\\"\"\n\
-             at = \"/mnt/data\"\n"
-        ),
+        "[filesystem]\n\
+         read = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\", \"/etc\"]\n\
+         execute = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\"]\n\
+         [[fuse]]\n\
+         mount = \"mkdir -p \\\"$BAILEY_MOUNTPOINT\\\" && echo from-mount > \\\"$BAILEY_MOUNTPOINT/inside\\\"\"\n\
+         at = \"/mnt/data\"\n"
     )
     .unwrap();
 
@@ -368,6 +379,10 @@ fn a_fuse_mount_without_isolation_is_refused() {
 /// at the real host socket, while the directory holding it is never granted.
 #[test]
 fn a_socket_relay_carries_a_service_into_the_sandbox() {
+    if !isolation_available() {
+        eprintln!("skipping: namespace isolation unavailable on this host");
+        return;
+    }
     if !landlock_available() {
         eprintln!("skipping: Landlock unavailable");
         return;
@@ -438,6 +453,7 @@ fn a_socket_relay_carries_a_service_into_the_sandbox() {
         .unwrap();
 
     let _ = server.kill();
+    let _ = server.wait();
     assert!(
         output.status.success(),
         "the relayed socket should answer: {}",
@@ -454,6 +470,10 @@ fn a_socket_relay_carries_a_service_into_the_sandbox() {
 /// socket, without the runtime directory being granted.
 #[test]
 fn a_dbus_relay_sets_the_bus_address() {
+    if !isolation_available() {
+        eprintln!("skipping: namespace isolation unavailable on this host");
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("bailey.toml");
     fs::write(
@@ -495,6 +515,10 @@ fn a_dbus_relay_sets_the_bus_address() {
 /// exists to keep the directory ungranted, and both at once is a contradiction.
 #[test]
 fn a_socket_relay_overlapping_a_grant_is_refused() {
+    if !isolation_available() {
+        eprintln!("skipping: namespace isolation unavailable on this host");
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("bailey.toml");
     fs::write(
@@ -536,6 +560,10 @@ fn a_socket_relay_overlapping_a_grant_is_refused() {
 /// machine's browser situation is.
 #[test]
 fn the_url_broker_refuses_non_web_schemes_through_a_run() {
+    if !isolation_available() {
+        eprintln!("skipping: namespace isolation unavailable on this host");
+        return;
+    }
     if !landlock_available() {
         eprintln!("skipping: Landlock unavailable");
         return;
@@ -544,13 +572,11 @@ fn the_url_broker_refuses_non_web_schemes_through_a_run() {
     let config = dir.path().join("bailey.toml");
     fs::write(
         &config,
-        format!(
-            "[filesystem]\n\
-             read = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\", \"/etc\"]\n\
-             execute = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\"]\n\
-             [[socket]]\n\
-             service = \"url-open\"\n"
-        ),
+        "[filesystem]\n\
+         read = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\", \"/etc\"]\n\
+         execute = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\"]\n\
+         [[socket]]\n\
+         service = \"url-open\"\n",
     )
     .unwrap();
 
