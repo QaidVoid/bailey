@@ -61,6 +61,67 @@ fn a_run_reports_what_it_enforced() {
     );
 }
 
+/// A run that keeps the mount power a Landlock domain would remove applies no
+/// Landlock ruleset, so the summary must not claim it did. The layer moves to
+/// the skipped list with the reason, and the JSON rendering moves with it.
+#[test]
+fn a_run_under_self_fuse_does_not_claim_landlock() {
+    if !Path::new("/usr/bin/python3").exists() {
+        eprintln!("skipping: /usr/bin/python3 unavailable");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("bailey.toml");
+    fs::write(
+        &config,
+        "self_fuse = true\n[filesystem]\nread = [\"/usr\", \"/bin\", \"/lib\"]\n",
+    )
+    .unwrap();
+
+    let output = Command::new(bailey())
+        .args(["run", "-c"])
+        .arg(&config)
+        .arg("/bin/true")
+        .output()
+        .unwrap();
+    let summary = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "a self_fuse run must succeed: {summary}"
+    );
+    assert!(
+        !summary.contains("enforced: landlock"),
+        "a run that applies no ruleset must not report landlock as enforced: \
+         {summary}"
+    );
+    assert!(
+        summary.contains("not enforced, landlock:"),
+        "the skipped layer must be named with its reason: {summary}"
+    );
+
+    let json = Command::new(bailey())
+        .args(["run", "--json", "-c"])
+        .arg(&config)
+        .arg("/bin/true")
+        .output()
+        .unwrap();
+    let line = String::from_utf8_lossy(&json.stdout);
+    let parsed: serde_json::Value =
+        serde_json::from_str(line.trim()).expect("--json must emit valid JSON");
+    let applied = parsed["applied"].as_array().expect("applied is an array");
+    assert!(
+        !applied.iter().any(|layer| layer == "landlock"),
+        "--json must move the layer out of applied too: {line}"
+    );
+    let skipped = parsed["skipped"].as_array().expect("skipped is an array");
+    assert!(
+        skipped
+            .iter()
+            .any(|entry| entry["layer"] == "landlock" && entry["reason"].is_string()),
+        "the JSON must record the layer as skipped with a reason: {line}"
+    );
+}
+
 #[test]
 fn a_skipped_layer_is_named_with_its_reason() {
     let dir = tempfile::tempdir().unwrap();
