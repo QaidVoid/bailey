@@ -126,7 +126,8 @@ bailey show [OPTIONS] <TARGET>
 ```
 
 Prints the profile base, every config file that was found in precedence order,
-and the merged policy. Exits 0.
+and the merged policy, including the hooks it will run outside the sandbox.
+Exits 0.
 
 | Option | Description |
 | --- | --- |
@@ -148,6 +149,11 @@ discovery may apply it. With `--list`, prints each accepted path and whether it
 still applies: `ok`, `changed`, `not yours`, `writable`, or `unreadable`.
 
 A file owned by another user, or writable by group or by everyone, is refused.
+
+The commands a config will run outside the sandbox are printed before the file
+is accepted: its `pre_launch` and `post_exit` hooks, named by key. A hook runs
+as you, unconfined, before any layer of the sandbox is built, so accepting the
+file is accepting those too. See [lifecycle hooks](/guide/hooks).
 
 ## `bailey untrust`
 

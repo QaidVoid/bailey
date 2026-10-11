@@ -20,6 +20,7 @@ use crate::backend::{
 use crate::config::{self, Resolved};
 use crate::event::Trace;
 use crate::hook::{self, Shell};
+use crate::hooks::{self, Hooks};
 use crate::policy::Access;
 use crate::profiles;
 use crate::reconcile::{self, Finding, Risk};
@@ -1384,7 +1385,7 @@ fn cmd_profile(args: ProfileArgs) -> anyhow::Result<i32> {
 /// while someone is trying to get on with something else is answered
 /// reflexively, and a run has to work where nobody is present to answer at all.
 /// Print the commands a config would run outside the sandbox, if it has any.
-fn report_hooks(path: &Path) {
+fn report_hooks(out: &mut impl io::Write, path: &Path) {
     let Ok(text) = std::fs::read_to_string(path) else {
         return;
     };
@@ -1395,7 +1396,7 @@ fn report_hooks(path: &Path) {
         return;
     };
     let mut named = Vec::new();
-    for when in ["pre-launch", "post-exit"] {
+    for when in hooks::HOOK_KEYS {
         match hooks.get(when) {
             Some(toml::Value::String(one)) => named.push((when, one.clone())),
             Some(toml::Value::Array(many)) => {
@@ -1411,9 +1412,13 @@ fn report_hooks(path: &Path) {
     if named.is_empty() {
         return;
     }
-    println!("this config runs commands outside the sandbox, as you:");
+    writeln!(
+        out,
+        "this config runs commands outside the sandbox, as you:"
+    )
+    .expect("writing the hook report");
     for (when, command) in named {
-        println!("  {when}: {command}");
+        writeln!(out, "  {when}: {command}").expect("writing the hook report");
     }
 }
 
@@ -1443,7 +1448,7 @@ fn cmd_trust(args: TrustArgs) -> anyhow::Result<i32> {
     // A config is not only a policy: its hooks are commands that run as the
     // caller, unconfined, before the sandbox exists. Trusting the file is
     // trusting those too, so they are named rather than left to be discovered.
-    report_hooks(&path);
+    report_hooks(&mut io::stdout(), &path);
     let recorded = store.record(&path).map_err(|err| anyhow::anyhow!(err))?;
     store.save().map_err(|err| anyhow::anyhow!(err))?;
     println!("trusted {}", recorded.display());
@@ -1808,66 +1813,112 @@ fn print_sources(profile: &str, target: &Path, explicit: Option<&Path>) {
     println!();
 }
 
+/// Print the hooks a policy will run outside the sandbox.
+///
+/// A hook runs as the caller, unconfined, before any layer of the sandbox is
+/// built, so it is the one part of a policy that acts on the host rather than
+/// inside the run. Nothing is printed for a policy that runs none, so a config
+/// without hooks keeps the report it had.
+fn print_hooks(out: &mut impl io::Write, hooks: &Hooks) {
+    let [pre_launch_key, post_exit_key] = hooks::HOOK_KEYS;
+    if hooks.pre_launch.is_empty() && hooks.post_exit.is_empty() {
+        return;
+    }
+    writeln!(out, "hooks:").expect("writing the policy report");
+    for command in &hooks.pre_launch {
+        writeln!(out, "  {pre_launch_key}: {command}").expect("writing the policy report");
+    }
+    for command in &hooks.post_exit {
+        writeln!(out, "  {post_exit_key}: {command}").expect("writing the policy report");
+    }
+}
+
+/// Print the resolved policy for `target`.
+///
+/// The body is in [`print_policy_to`] so a test can drive the real report into a
+/// buffer. A test that printed only the hooks section would stay green when the
+/// section's call site here was deleted, which is the wiring this guards.
 fn print_policy(resolved: &Resolved, target: &Path) {
+    print_policy_to(&mut io::stdout(), resolved, target);
+}
+
+/// The report [`print_policy`] prints, written to `out`.
+fn print_policy_to(out: &mut impl io::Write, resolved: &Resolved, target: &Path) {
     let policy = &resolved.policy;
 
-    println!("filesystem:");
+    writeln!(out, "filesystem:").expect("writing the policy report");
     if policy.filesystem.is_empty() {
-        println!("  (none)");
+        writeln!(out, "  (none)").expect("writing the policy report");
     }
     for rule in &policy.filesystem {
-        println!("  {} {}", access_flags(rule.access), rule.path.display());
+        writeln!(
+            out,
+            "  {} {}",
+            access_flags(rule.access),
+            rule.path.display()
+        )
+        .expect("writing the policy report");
     }
 
     if !policy.read_only.is_empty() {
         let nested: Vec<_> = policy.nested_read_only().collect();
-        println!("read-only:");
+        writeln!(out, "read-only:").expect("writing the policy report");
         for path in &policy.read_only {
             let note = if nested.contains(&path) {
                 "  (inside a writable grant: needs isolation)"
             } else {
                 ""
             };
-            println!("  r-- {}{note}", path.display());
+            writeln!(out, "  r-- {}{note}", path.display()).expect("writing the policy report");
         }
     }
 
     if !policy.denied.is_empty() {
         let nested: Vec<_> = policy.nested_denials().collect();
-        println!("denied:");
+        writeln!(out, "denied:").expect("writing the policy report");
         for path in &policy.denied {
             let note = if nested.contains(&path) {
                 "  (nested under a grant: needs isolation)"
             } else {
                 ""
             };
-            println!("  --- {}{note}", path.display());
+            writeln!(out, "  --- {}{note}", path.display()).expect("writing the policy report");
         }
     }
 
-    println!("network:");
-    println!("  egress: {:?}", policy.network.egress);
-    println!("  bind_ports: {:?}", policy.network.bind_ports);
+    writeln!(out, "network:").expect("writing the policy report");
+    writeln!(out, "  egress: {:?}", policy.network.egress).expect("writing the policy report");
+    writeln!(out, "  bind_ports: {:?}", policy.network.bind_ports)
+        .expect("writing the policy report");
     let mode = network::select(policy, isolation::available());
-    println!("  mode: {}", mode.describe());
+    writeln!(out, "  mode: {}", mode.describe()).expect("writing the policy report");
 
-    println!("devices:");
+    writeln!(out, "devices:").expect("writing the policy report");
     if policy.devices.is_empty() {
-        println!("  (none)");
+        writeln!(out, "  (none)").expect("writing the policy report");
     }
     for rule in &policy.devices {
-        println!("  {} {}", access_flags(rule.access), rule.path.display());
+        writeln!(
+            out,
+            "  {} {}",
+            access_flags(rule.access),
+            rule.path.display()
+        )
+        .expect("writing the policy report");
     }
 
-    println!("resources: {:?}", policy.resources);
+    writeln!(out, "resources: {:?}", policy.resources).expect("writing the policy report");
+
+    print_hooks(out, &resolved.hooks);
 
     let world = World::derive(target, policy, false);
-    println!("home: {}", world.home_inside.display());
+    writeln!(out, "home: {}", world.home_inside.display()).expect("writing the policy report");
     if world.home_host.is_some() {
-        println!("  (private; the real home is not granted)");
+        writeln!(out, "  (private; the real home is not granted)")
+            .expect("writing the policy report");
     }
 
-    println!("environment:");
+    writeln!(out, "environment:").expect("writing the policy report");
     for (name, value) in world::environment(policy, &world, mode) {
         let origin = if policy.env.set.contains_key(&name) {
             "set"
@@ -1876,7 +1927,7 @@ fn print_policy(resolved: &Resolved, target: &Path) {
         } else {
             "base"
         };
-        println!("  {name}={value}  ({origin})");
+        writeln!(out, "  {name}={value}  ({origin})").expect("writing the policy report");
     }
 }
 
@@ -2086,6 +2137,108 @@ mod tests {
         permit_broker_port(&mut open, 8443);
         assert_eq!(open.network.egress, Egress::AllowAll);
     }
+    /// A hook runs as the caller, unconfined, before the sandbox exists, so
+    /// trusting a config is trusting whoever can write it to run programs as
+    /// you. The warning is the whole value of the trust command, and it looked
+    /// for keys the schema never reads.
+    #[test]
+    fn trust_reports_the_hooks_a_config_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("bailey.toml");
+        std::fs::write(
+            &config,
+            "[hooks]\npre_launch = [\"echo INSTALLING DEPENDENCIES\"]\npost_exit = [\"echo CLEANING UP\"]",
+        )
+        .unwrap();
+
+        let mut out = Vec::new();
+        report_hooks(&mut out, &config);
+        let report = String::from_utf8(out).unwrap();
+
+        assert!(
+            report.contains("pre_launch: echo INSTALLING DEPENDENCIES"),
+            "{report}"
+        );
+        assert!(report.contains("post_exit: echo CLEANING UP"), "{report}");
+    }
+
+    /// `on_violation` is accepted for backwards compatibility and can never
+    /// run, so naming it would warn about a command that does nothing.
+    #[test]
+    fn trust_names_no_hook_that_can_never_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("bailey.toml");
+        std::fs::write(&config, "[hooks]\non_violation = [\"echo TOO LATE\"]").unwrap();
+
+        let mut out = Vec::new();
+        report_hooks(&mut out, &config);
+
+        assert!(
+            out.is_empty(),
+            "on_violation cannot run: {:?}",
+            String::from_utf8_lossy(&out)
+        );
+    }
+
+    /// `show` resolves and prints the effective policy, and the hooks are part
+    /// of what a policy does, so they belong in the report beside the rest.
+    ///
+    /// The report is driven through `print_policy`, not through `print_hooks`
+    /// directly, because the wiring is what this is guarding: a test that calls
+    /// `print_hooks` itself stays green when the call inside `print_policy` is
+    /// deleted, which is the failure the section exists to prevent.
+    #[test]
+    fn show_lists_the_hooks_a_config_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("prog");
+        let resolved = Resolved {
+            hooks: Hooks {
+                pre_launch: vec!["echo INSTALLING DEPENDENCIES".into()],
+                post_exit: vec!["echo CLEANING UP".into()],
+            },
+            ..Default::default()
+        };
+
+        let mut out = Vec::new();
+        print_policy_to(&mut out, &resolved, &target);
+        let report = String::from_utf8(out).unwrap();
+
+        assert!(report.contains("hooks:"), "{report}");
+        assert!(
+            report.contains("pre_launch: echo INSTALLING DEPENDENCIES"),
+            "{report}"
+        );
+        assert!(report.contains("post_exit: echo CLEANING UP"), "{report}");
+    }
+
+    /// A policy that runs no hooks prints no section, so the report of a config
+    /// without any is the one it always was. Driven through the same path, so
+    /// the pair fails if either half of the wiring goes.
+    #[test]
+    fn no_hooks_prints_no_hooks_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("prog");
+        let config = dir.path().join("bailey.toml");
+        std::fs::write(&config, "[filesystem]\nread = [\"/granted\"]").unwrap();
+
+        let mut trusted = Vec::new();
+        report_hooks(&mut trusted, &config);
+
+        let mut shown = Vec::new();
+        print_policy_to(&mut shown, &Resolved::default(), &target);
+        let report = String::from_utf8(shown).unwrap();
+
+        assert!(
+            trusted.is_empty(),
+            "no hooks to name: {:?}",
+            String::from_utf8_lossy(&trusted)
+        );
+        assert!(
+            !report.contains("hooks:"),
+            "a policy with no hooks prints no hooks section: {report}"
+        );
+    }
+
     #[test]
     fn a_global_v6_address_is_what_marks_the_host_as_reachable() {
         // A global-scope address on wlan0 (scope 00), alongside loopback and a
