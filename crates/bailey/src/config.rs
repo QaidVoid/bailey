@@ -119,7 +119,7 @@ pub fn resolve_with_bases(
         if !source.applies() {
             continue;
         }
-        layers.push(load_layer(&source.path)?);
+        layers.push(load_verified_layer(&source)?);
     }
     for (label, text) in overrides {
         layers.push(parse_layer(label, text, &base_dir)?);
@@ -169,6 +169,10 @@ pub struct Source {
     /// supplied is never rejected; one found by an upward walk is, until it has
     /// been trusted.
     pub rejected: Option<Rejected>,
+    /// The bytes the trust decision was made against, when the layer
+    /// contributes. Applied rather than read again, so the policy is built from
+    /// what was verified.
+    verified: Option<Vec<u8>>,
 }
 
 impl Source {
@@ -422,6 +426,7 @@ fn discover(target: &Path, explicit: Option<&Path>) -> Vec<Source> {
             path: global,
             origin: Origin::Global,
             rejected,
+            verified: None,
         });
     }
 
@@ -447,11 +452,13 @@ fn discover(target: &Path, explicit: Option<&Path>) -> Vec<Source> {
     for (_, _, path, origin) in walked {
         if seen.insert(path.clone()) {
             let store = store.get_or_insert_with(Store::load);
-            let rejected = store.check(&path);
+            let (rejected, verified) = store.check_read(&path);
+            let verified = rejected.is_none().then_some(verified);
             sources.push(Source {
                 path,
                 origin,
                 rejected,
+                verified,
             });
         }
     }
@@ -461,6 +468,7 @@ fn discover(target: &Path, explicit: Option<&Path>) -> Vec<Source> {
             path: absolute(explicit),
             origin: Origin::Explicit,
             rejected: None,
+            verified: None,
         });
     }
 
@@ -990,6 +998,35 @@ fn parse_layer(label: &str, text: &str, base: &Path) -> Result<Layer, ConfigErro
     Ok(Layer {
         path,
         base: base.to_path_buf(),
+        raw,
+    })
+}
+
+/// Parse a discovered layer from the bytes its trust decision was made against.
+///
+/// A file the user supplied on the command line was never trust-checked, so it
+/// has no verified bytes and is read here instead.
+fn load_verified_layer(source: &Source) -> Result<Layer, ConfigError> {
+    match &source.verified {
+        Some(bytes) => parse_layer_bytes(&source.path, bytes),
+        None => load_layer(&source.path),
+    }
+}
+
+/// Parse `text` as a layer attributed to `path`.
+fn parse_layer_bytes(path: &Path, text: &[u8]) -> Result<Layer, ConfigError> {
+    let text = String::from_utf8_lossy(text);
+    let raw: RawLayer = toml::from_str(&text).map_err(|source| ConfigError::Parse {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let base = path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("/"));
+    Ok(Layer {
+        path: path.to_path_buf(),
+        base,
         raw,
     })
 }
@@ -1673,6 +1710,62 @@ mod tests {
             Some("literal"),
             "and a value with nothing to expand is left alone"
         );
+    }
+
+    /// A discovered layer is applied from the bytes its trust decision was made
+    /// against, not from a second read. The seam is `load_verified_layer`: given
+    /// a source that carries the bytes it was checked against, those are what
+    /// gets parsed, whatever the file says now.
+    #[test]
+    fn a_verified_layer_is_parsed_from_the_bytes_it_was_checked_against() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bailey.toml");
+        std::fs::write(&path, "[filesystem]\nread = [\"/swapped-in\"]\n").unwrap();
+        let verified = b"[filesystem]\nread = [\"/accepted\"]\n".to_vec();
+
+        let source = Source {
+            path: path.clone(),
+            origin: Origin::WorkingDir,
+            rejected: None,
+            verified: Some(verified),
+        };
+        let layer = load_verified_layer(&source).unwrap();
+        let paths: Vec<&str> = layer
+            .raw
+            .filesystem
+            .read
+            .iter()
+            .map(RawGrant::path)
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["/accepted"],
+            "the layer must come from the verified bytes, not the file"
+        );
+    }
+
+    /// A layer the user supplied on the command line was never trust-checked, so
+    /// it has no verified bytes and is read from disk as before.
+    #[test]
+    fn an_unchecked_layer_is_read_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("given.toml");
+        std::fs::write(&path, "[filesystem]\nread = [\"/given\"]\n").unwrap();
+        let source = Source {
+            path: path.clone(),
+            origin: Origin::Explicit,
+            rejected: None,
+            verified: None,
+        };
+        let layer = load_verified_layer(&source).unwrap();
+        let paths: Vec<&str> = layer
+            .raw
+            .filesystem
+            .read
+            .iter()
+            .map(RawGrant::path)
+            .collect();
+        assert_eq!(paths, vec!["/given"]);
     }
 
     #[test]
