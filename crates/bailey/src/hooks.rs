@@ -15,6 +15,15 @@ pub struct Hooks {
     pub post_exit: Vec<String>,
 }
 
+/// The `[hooks]` keys that name commands a config will run, in the order they
+/// run.
+///
+/// One definition, so a report of what a config will do cannot name a key the
+/// schema does not read. `on_violation` is absent on purpose: a config that
+/// still sets it is accepted for backwards compatibility, and nothing can ever
+/// trigger it.
+pub const HOOK_KEYS: [&str; 2] = ["pre_launch", "post_exit"];
+
 /// An error produced while running a hook command.
 #[derive(Debug, thiserror::Error)]
 pub enum HookError {
