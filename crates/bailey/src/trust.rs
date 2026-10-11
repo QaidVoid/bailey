@@ -218,36 +218,49 @@ impl Store {
     }
 
     /// Whether `path` may contribute to a policy, and why not when it may not.
+    ///
+    /// The bytes read here are the bytes the digest was computed from, and they
+    /// are returned so a caller can apply exactly those rather than read the
+    /// file a second time. A second read is a second chance for the file to
+    /// change, and the policy would then be built from bytes no digest ever
+    /// covered.
     pub fn check(&self, path: &Path) -> Option<Rejected> {
+        self.check_read(path).0
+    }
+
+    /// [`Store::check`], with the bytes it read when the file may contribute.
+    pub fn check_read(&self, path: &Path) -> (Option<Rejected>, Vec<u8>) {
         if !self.reachable {
-            return Some(Rejected::StoreUnreachable);
+            return (Some(Rejected::StoreUnreachable), Vec::new());
         }
         let path = absolute(path);
         let meta = match fs::metadata(&path) {
             Ok(meta) => meta,
-            Err(err) => return Some(Rejected::Unreadable(err.to_string())),
+            Err(err) => return (Some(Rejected::Unreadable(err.to_string())), Vec::new()),
         };
         // Ownership is re-checked here, not only when trust was recorded: a
         // file that became writable by others since then is no longer covered
         // by the hash that was stored for it.
         if let Some(exposure) = exposure(&meta) {
-            return Some(exposure);
+            return (Some(exposure), Vec::new());
         }
         // A file nobody else may write still sits somewhere, and a directory
         // another user may write is one they can rename a file out of and a
         // file of their own into. The mode on the file says nothing about that.
         if let Some(exposure) = exposed_parents(&path) {
-            return Some(exposure);
+            return (Some(exposure), Vec::new());
         }
-        let digest = match digest(&path) {
-            Ok(digest) => digest,
-            Err(err) => return Some(Rejected::Unreadable(err.to_string())),
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) => return (Some(Rejected::Unreadable(err.to_string())), Vec::new()),
         };
-        match self.entries.get(&path) {
+        let digest = digest_of(&bytes);
+        let verdict = match self.entries.get(&path) {
             Some(recorded) if *recorded == digest => None,
             Some(_) => Some(Rejected::Changed),
             None => Some(Rejected::Untrusted),
-        }
+        };
+        (verdict, bytes)
     }
 
     /// Record trust in `path` as it currently reads.
@@ -424,13 +437,19 @@ fn group(gid: u32) -> String {
 /// nothing to do with what the file says.
 fn digest(path: &Path) -> std::io::Result<String> {
     let bytes = fs::read(path)?;
+    Ok(digest_of(&bytes))
+}
+
+/// The digest of bytes already read, so one read serves both the hash and the
+/// policy.
+fn digest_of(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(&bytes);
+    hasher.update(bytes);
     let mut out = String::with_capacity(64);
     for byte in hasher.finalize() {
         out.push_str(&format!("{byte:02x}"));
     }
-    Ok(out)
+    out
 }
 
 fn absolute(path: &Path) -> PathBuf {
