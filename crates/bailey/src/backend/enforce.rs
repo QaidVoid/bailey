@@ -28,16 +28,14 @@ use landlock::{
 };
 
 use crate::backend::cgroup;
-use crate::backend::fuse;
 use crate::backend::forward;
+use crate::backend::fuse;
 use crate::backend::isolation::{self, BindMount, Conceal, IsolationPlan};
 use crate::backend::network::{self, NetworkMode};
 use crate::backend::relay;
 use crate::backend::world::{self, World};
 use crate::backend::{Backend, BackendError, Target};
-use crate::policy::{
-    self, Egress, FsRule, Policy, PortForward, ResourceLimits,
-};
+use crate::policy::{self, Egress, FsRule, Policy, PortForward, ResourceLimits};
 use crate::strings::quoted as json_string;
 
 /// Landlock ABI the backend targets. Best-effort compatibility degrades this
@@ -349,9 +347,8 @@ impl EnforceBackend {
                 .iter()
                 .any(|socket| socket.service.as_deref() == Some("url-open"))
             {
-                crate::cli::resolve_helper("xdg-open").map_err(|err| {
-                    BackendError::Command(format!("the url-open relay: {err}"))
-                })?;
+                crate::cli::resolve_helper("xdg-open")
+                    .map_err(|err| BackendError::Command(format!("the url-open relay: {err}")))?;
             }
             let dir = relay::run_dir();
             let ats: Vec<PathBuf> = policy.sockets.iter().map(|s| s.at.clone()).collect();
@@ -665,7 +662,9 @@ impl EnforceBackend {
         let forward_up = forward_forwards.is_some().then(|| {
             let up = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let announce = forward_announce.expect("an announce exists for forwards");
-            let forwards = forward_forwards.clone().expect("announced forwards are set");
+            let forwards = forward_forwards
+                .clone()
+                .expect("announced forwards are set");
             let up_for_thread = up.clone();
             std::thread::spawn(move || {
                 if let Ok(guard) = forward::ForwardGuard::receive(&announce, &forwards) {
@@ -718,11 +717,13 @@ fn policy_with_fuse(policy: &Policy, mounted: &[fuse::Mounted]) -> Policy {
 /// target sees it.
 fn policy_with_relays(policy: &Policy, relays: &[relay::Relay]) -> Policy {
     let mut extended = policy.clone();
-    extended.filesystem.extend(relays.iter().map(|relay| FsRule {
-        path: relay.listener_path.clone(),
-        access: policy::Access::READ | policy::Access::WRITE | policy::Access::EXECUTE,
-        at: Some(relay.at.clone()),
-    }));
+    extended
+        .filesystem
+        .extend(relays.iter().map(|relay| FsRule {
+            path: relay.listener_path.clone(),
+            access: policy::Access::READ | policy::Access::WRITE | policy::Access::EXECUTE,
+            at: Some(relay.at.clone()),
+        }));
     extended
 }
 
@@ -1343,8 +1344,7 @@ fn statfs_magic(path: &Path) -> Option<i64> {
 /// happens most, so the note names it when `statfs` can still see the mount.
 fn stale_mount_note(path: &Path) -> String {
     if is_fuse(path) {
-        "The path sits on a FUSE filesystem; check that the mount is alive."
-            .to_string()
+        "The path sits on a FUSE filesystem; check that the mount is alive.".to_string()
     } else {
         "A stale FUSE or network mount is the usual cause; check that the \
          mounts this path depends on are alive."
@@ -2213,10 +2213,7 @@ mod tests {
         struct Restore(PathBuf);
         impl Drop for Restore {
             fn drop(&mut self) {
-                let _ = std::fs::set_permissions(
-                    &self.0,
-                    std::fs::Permissions::from_mode(0o755),
-                );
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
             }
         }
         let _restore = Restore(jail.clone());

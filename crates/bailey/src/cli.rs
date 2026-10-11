@@ -116,14 +116,14 @@ impl QuickGrants {
             return Ok(None);
         }
         let resolve_all = |paths: &[String]| -> anyhow::Result<Vec<PathBuf>> {
-                paths
-                    .iter()
-                    .map(|raw| {
-                        config::expand_flag_path(raw)
-                            .map_err(|err| anyhow::anyhow!("--allow path: {err}"))
-                    })
-                    .collect()
-            };
+            paths
+                .iter()
+                .map(|raw| {
+                    config::expand_flag_path(raw)
+                        .map_err(|err| anyhow::anyhow!("--allow path: {err}"))
+                })
+                .collect()
+        };
         let read = resolve_all(&self.allow_read)?;
         let write = resolve_all(&self.allow_write)?;
         let execute = resolve_all(&self.allow_exec)?;
@@ -1022,7 +1022,12 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
     refuse_root()?;
     let (program, program_args) = split_command(args.command.clone())?;
     let profile = select_profile(args.profile.as_deref(), &program)?;
-    let mut resolved = resolve(&profile, &program, args.config.as_deref(), &args.quick_grants)?;
+    let mut resolved = resolve(
+        &profile,
+        &program,
+        args.config.as_deref(),
+        &args.quick_grants,
+    )?;
     report_untrusted(&program, args.config.as_deref());
     warn_if_target_denied(&resolved.policy, &program);
 
@@ -1108,7 +1113,13 @@ fn cmd_shell(args: ShellArgs) -> anyhow::Result<i32> {
     let dir = std::env::current_dir()?;
 
     let profile = select_profile(args.profile.as_deref(), &shell)?;
-    let mut resolved = resolve_for_shell(&profile, &shell, &dir, args.config.as_deref(), &args.quick_grants)?;
+    let mut resolved = resolve_for_shell(
+        &profile,
+        &shell,
+        &dir,
+        args.config.as_deref(),
+        &args.quick_grants,
+    )?;
     report_untrusted(&shell, args.config.as_deref());
     report_nesting();
     warn_if_home_granted(&dir);
@@ -1254,7 +1265,12 @@ fn cmd_audit(args: AuditArgs) -> anyhow::Result<i32> {
     refuse_root()?;
     let (program, program_args) = split_command(args.command)?;
     let profile = select_profile(args.profile.as_deref(), &program)?;
-    let resolved = resolve(&profile, &program, args.config.as_deref(), &QuickGrants::default())?;
+    let resolved = resolve(
+        &profile,
+        &program,
+        args.config.as_deref(),
+        &QuickGrants::default(),
+    )?;
     report_untrusted(&program, args.config.as_deref());
     let target_dir = target_dir(&program);
     let target = Target {
@@ -1320,7 +1336,12 @@ fn cmd_audit(args: AuditArgs) -> anyhow::Result<i32> {
 fn cmd_show(args: ShowArgs) -> anyhow::Result<i32> {
     let target = resolve_target(&args.target)?;
     let profile = select_profile(args.profile.as_deref(), &target)?;
-    let resolved = resolve(&profile, &target, args.config.as_deref(), &args.quick_grants)?;
+    let resolved = resolve(
+        &profile,
+        &target,
+        args.config.as_deref(),
+        &args.quick_grants,
+    )?;
     print_sources(&profile, &target, args.config.as_deref());
     print_policy(&resolved, &target);
     Ok(0)
@@ -1505,7 +1526,12 @@ fn cmd_profile_generate(args: GenerateArgs) -> anyhow::Result<i32> {
     }
 
     let profile = select_profile(args.profile.as_deref(), &args.target)?;
-    let resolved = resolve(&profile, &args.target, args.config.as_deref(), &QuickGrants::default())?;
+    let resolved = resolve(
+        &profile,
+        &args.target,
+        args.config.as_deref(),
+        &QuickGrants::default(),
+    )?;
     let target_dir = target_dir(&args.target);
 
     let effective = policy_with_own_storage(&resolved.policy, &args.target);

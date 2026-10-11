@@ -217,8 +217,8 @@ fn allowed_egress_reports_that_only_tcp_is_covered() {
 fn forwarded_ports_carry_to_the_host_and_others_stay_dead() {
     use std::io::{Read, Write};
     use std::net::TcpListener;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     if python().is_none() || !netns_available() {
