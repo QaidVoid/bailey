@@ -1249,9 +1249,18 @@ fn unwritable_beneath_implicit(
     world: &World,
     implicit: &[PathBuf],
 ) -> Vec<PathBuf> {
-    let mut roots: Vec<&Path> = implicit.iter().map(PathBuf::as_path).collect();
+    // The remount that consumes this vector strips the leading `/` and resolves
+    // what is left beneath the reconstructed root, so every entry has to be
+    // spelled where the target sees it. The roots are translated into the same
+    // spelling before they are compared against the rules, or a relocated grant
+    // is never recognised as sitting beneath its own root and is skipped in
+    // silence.
+    let mut roots: Vec<PathBuf> = implicit
+        .iter()
+        .map(|path| to_visible_path(policy, path))
+        .collect();
     if world.home_host.is_some() {
-        roots.push(&world.home_inside);
+        roots.push(world.home_inside.clone());
     }
     if roots.is_empty() {
         return Vec::new();
@@ -1261,13 +1270,12 @@ fn unwritable_beneath_implicit(
         .filesystem
         .iter()
         .filter(|rule| !rule.access.contains(policy::Access::WRITE))
-        .map(|rule| &rule.path)
+        .map(|rule| rule.visible().clone())
         .filter(|path| {
             roots
                 .iter()
-                .any(|root| path.as_path() != *root && path.starts_with(root))
+                .any(|root| path.as_path() != root.as_path() && path.starts_with(root))
         })
-        .cloned()
         .collect()
 }
 
@@ -2178,7 +2186,8 @@ mod tests {
 
         let plan = build_isolation_plan(&policy, NetworkMode::Isolated, &world, &implicit).unwrap();
         assert!(
-            plan.read_only.contains(&PathBuf::from("/workspace/versions")),
+            plan.read_only
+                .contains(&PathBuf::from("/workspace/versions")),
             "the read-only entry must be spelled where the target sees it: {:?}",
             plan.read_only
         );
