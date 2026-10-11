@@ -116,7 +116,7 @@ impl ForwardGuard {
             };
             let host_port = *host_port;
             thread::spawn(move || {
-                    for client in acceptor.incoming().flatten() {
+                for client in acceptor.incoming().flatten() {
                     let Ok(service) = TcpStream::connect((Ipv4Addr::LOCALHOST, host_port)) else {
                         // No host service on this port right now. The client
                         // sees a closed connection instead of a hang, which
@@ -291,7 +291,7 @@ fn send_fds(announce: RawFd, fds: &[RawFd]) -> io::Result<()> {
         let header = libc::CMSG_FIRSTHDR(&message);
         (*header).cmsg_level = libc::SOL_SOCKET;
         (*header).cmsg_type = libc::SCM_RIGHTS;
-        (*header).cmsg_len = libc::CMSG_LEN((fds.len() * size_of::<RawFd>()) as _) as usize;
+        (*header).cmsg_len = libc::CMSG_LEN((fds.len() * size_of::<RawFd>()) as _) as _;
         std::ptr::copy_nonoverlapping(
             fds.as_ptr(),
             libc::CMSG_DATA(header).cast::<RawFd>(),
@@ -319,7 +319,8 @@ fn recv_fds(stream: &std::os::unix::net::UnixStream, count: usize) -> io::Result
     message.msg_iovlen = 1;
     message.msg_controllen = space as _;
     message.msg_control = control.as_mut_ptr().cast();
-    let received = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC) };
+    let received =
+        unsafe { libc::recvmsg(stream.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC) };
     if received < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -334,9 +335,8 @@ fn recv_fds(stream: &std::os::unix::net::UnixStream, count: usize) -> io::Result
     unsafe {
         let mut header = libc::CMSG_FIRSTHDR(&message);
         while !header.is_null() {
-            if (*header).cmsg_level == libc::SOL_SOCKET && (*header).cmsg_type == libc::SCM_RIGHTS
-            {
-                let bytes = (*header).cmsg_len - libc::CMSG_LEN(0) as usize;
+            if (*header).cmsg_level == libc::SOL_SOCKET && (*header).cmsg_type == libc::SCM_RIGHTS {
+                let bytes = (*header).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
                 let items = bytes / size_of::<RawFd>();
                 let source = libc::CMSG_DATA(header).cast_const().cast::<RawFd>();
                 for item in 0..items {
@@ -455,14 +455,16 @@ mod tests {
         let target_side = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let service_side = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
 
-        let target = TcpStream::connect(
-            (Ipv4Addr::LOCALHOST, target_side.local_addr().unwrap().port()),
-        )
+        let target = TcpStream::connect((
+            Ipv4Addr::LOCALHOST,
+            target_side.local_addr().unwrap().port(),
+        ))
         .unwrap();
         let (mut peer_of_target, _) = target_side.accept().unwrap();
-        let service = TcpStream::connect(
-            (Ipv4Addr::LOCALHOST, service_side.local_addr().unwrap().port()),
-        )
+        let service = TcpStream::connect((
+            Ipv4Addr::LOCALHOST,
+            service_side.local_addr().unwrap().port(),
+        ))
         .unwrap();
         let (mut peer_of_service, _) = service_side.accept().unwrap();
 
