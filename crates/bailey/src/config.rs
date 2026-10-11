@@ -1263,18 +1263,45 @@ fn target_dir(target: &Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/"))
 }
 
+/// Where the global config lives, or `None` when the environment names no
+/// directory bailey is willing to read it from.
+///
+/// A relative value is refused rather than resolved: it would be read from the
+/// working directory, so the project a run is launched from would supply a
+/// layer discovery applies with no trust record. `$XDG_CONFIG_HOME` is ignored
+/// rather than treated as unset, per the XDG spec, so a relative value names no
+/// global config at all instead of falling back to `$HOME/.config`.
 fn global_config_path() -> Option<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME")
         && !xdg.is_empty()
     {
-        return Some(Path::new(&xdg).join("bailey").join("config.toml"));
+        let dir = Path::new(&xdg);
+        if !dir.is_absolute() {
+            eprintln!(
+                "bailey: warning: ignoring a relative XDG_CONFIG_HOME `{}`: a relative \
+                 path would be read from the working directory, which the project being \
+                 run controls",
+                dir.display()
+            );
+            return None;
+        }
+        return Some(dir.join("bailey").join("config.toml"));
     }
-    std::env::var_os("HOME").map(|home| {
+    let home = std::env::var_os("HOME")?;
+    if !Path::new(&home).is_absolute() {
+        eprintln!(
+            "bailey: warning: ignoring a relative HOME `{}`: a relative path would be \
+             read from the working directory, which the project being run controls",
+            Path::new(&home).display()
+        );
+        return None;
+    }
+    Some(
         Path::new(&home)
             .join(".config")
             .join("bailey")
-            .join("config.toml")
-    })
+            .join("config.toml"),
+    )
 }
 
 #[cfg(test)]
@@ -1540,6 +1567,59 @@ mod tests {
         assert!(
             !sources.iter().any(|source| source.origin == Origin::Global),
             "a planted global config must not become a layer inside a sandbox"
+        );
+    }
+
+    /// A relative `XDG_CONFIG_HOME` resolves against the working
+    /// directory, so the project a run is launched from would supply the global
+    /// layer, which discovery applies with no trust record. It names no global
+    /// config instead, and a relative `HOME` is refused the same way.
+    ///
+    /// Only the returned path is asserted. The warning is written to stderr,
+    /// which libtest captures per thread rather than at the descriptor, so a
+    /// test cannot read it; the naming is covered by running the binary.
+    #[test]
+    fn a_relative_xdg_config_home_names_no_global_config() {
+        let _env = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("bailey")).unwrap();
+        std::fs::write(
+            dir.path().join("bailey").join("config.toml"),
+            "[filesystem]\nread = [\"/planted\"]",
+        )
+        .unwrap();
+
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", dir.path()) };
+        let absolute = global_config_path();
+
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", "./relative") };
+        let relative = global_config_path();
+
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", "/nonexistent-absolute") };
+        let other_absolute = global_config_path();
+
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        unsafe { std::env::set_var("HOME", "relative-home") };
+        let relative_home = global_config_path();
+        unsafe { std::env::remove_var("HOME") };
+
+        assert_eq!(
+            absolute.as_deref(),
+            Some(dir.path().join("bailey").join("config.toml").as_path()),
+            "an absolute XDG_CONFIG_HOME still names the global config"
+        );
+        assert_eq!(
+            relative, None,
+            "a relative XDG_CONFIG_HOME names no global config at all"
+        );
+        assert_eq!(
+            other_absolute.as_deref(),
+            Some(Path::new("/nonexistent-absolute/bailey/config.toml")),
+            "an absolute value pointing nowhere is still the path it names"
+        );
+        assert_eq!(
+            relative_home, None,
+            "a relative HOME names no global config either"
         );
     }
 
