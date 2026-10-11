@@ -117,15 +117,22 @@ struct StoreFile {
     trusted: BTreeMap<String, String>,
 }
 
-/// Write a file only its owner can read, replacing any existing one.
+/// Write a file only its owner can read, creating it and nothing else.
+///
+/// The file is created rather than opened: `O_EXCL` makes the create fail when
+/// the path is occupied by anything at all, including a symlink, and
+/// `O_NOFOLLOW` closes the window where the final component is replaced between
+/// a failed create and the next attempt. Writing through a path bailey did not
+/// create is how the store's bytes land in a file somebody else chose, and the
+/// rename that follows would then carry that content over the store.
 fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let mut file = fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(path)?;
     file.write_all(text.as_bytes())
 }
@@ -211,8 +218,15 @@ impl Store {
                 .map_err(|err| format!("could not create `{}`: {err}", parent.display()))?;
         }
         let staging = path.with_extension("toml.new");
-        write_private(&staging, &text)
-            .map_err(|err| format!("could not write `{}`: {err}", staging.display()))?;
+        write_private(&staging, &text).map_err(|err| match err.kind() {
+            std::io::ErrorKind::AlreadyExists => format!(
+                "`{}` is already occupied; another process may be writing the \
+                     trust store, or a file has been left where bailey stages its \
+                     writes",
+                staging.display()
+            ),
+            _ => format!("could not write `{}`: {err}", staging.display()),
+        })?;
         fs::rename(&staging, path)
             .map_err(|err| format!("could not replace `{}`: {err}", path.display()))
     }
@@ -581,5 +595,107 @@ mod tests {
 
         let rejected = store.check(&path).expect("a deleted config");
         assert_eq!(rejected.word(), "unreadable");
+    }
+
+    fn store_trusting(dir: &Path) -> Store {
+        let mut store = Store::default();
+        store
+            .record(&config(dir, "[filesystem]\nread = [\"/a\"]\n"))
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn the_staging_file_is_created_exclusively() {
+        // A symlink at the staging path: the store's bytes would land at
+        // whatever the link names, and the rename would move the link itself
+        // over the store.
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        fs::create_dir(&state).unwrap();
+        let victim = dir.path().join("victim");
+        fs::write(&victim, "a file the user owns\n").unwrap();
+        std::os::unix::fs::symlink(&victim, state.join("trusted.toml.new")).unwrap();
+
+        let store_file = state.join("trusted.toml");
+        let err = store_trusting(dir.path())
+            .save_to(&store_file)
+            .expect_err("a symlink at the staging path");
+        assert!(err.contains("already occupied"), "{err}");
+        assert_eq!(
+            fs::read_to_string(&victim).unwrap(),
+            "a file the user owns\n",
+            "the store's bytes are not written through the link"
+        );
+        assert!(!store_file.exists(), "and the store is not replaced");
+        drop(dir);
+
+        // A regular file at the staging path: a leftover from a crashed run is
+        // refused rather than overwritten.
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        fs::create_dir(&state).unwrap();
+        let staging = state.join("trusted.toml.new");
+        fs::write(&staging, "a leftover from a crashed run\n").unwrap();
+
+        let store_file = state.join("trusted.toml");
+        let err = store_trusting(dir.path())
+            .save_to(&store_file)
+            .expect_err("a file at the staging path");
+        assert!(err.contains("already occupied"), "{err}");
+        assert!(
+            err.contains(&*staging.display().to_string()),
+            "the staging path is named: {err}"
+        );
+        assert_eq!(
+            fs::read_to_string(&staging).unwrap(),
+            "a leftover from a crashed run\n",
+            "the planted file is left as it was"
+        );
+        assert!(!store_file.exists(), "and the store is not replaced");
+    }
+
+    #[test]
+    fn a_free_staging_path_writes_a_store_only_its_owner_can_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_file = dir.path().join("state/trusted.toml");
+
+        store_trusting(dir.path()).save_to(&store_file).unwrap();
+
+        let mode = fs::metadata(&store_file).unwrap().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the store is private: {mode:o}");
+        let reloaded = Store::load_from(&store_file);
+        assert_eq!(reloaded.listing().len(), 1);
+        assert_eq!(
+            reloaded.check(&config(dir.path(), "[filesystem]\nread = [\"/a\"]\n")),
+            None,
+            "the recorded entry survived the round trip"
+        );
+    }
+
+    #[test]
+    fn a_second_save_finds_the_staging_path_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_file = dir.path().join("state/trusted.toml");
+        let store = store_trusting(dir.path());
+
+        store.save_to(&store_file).unwrap();
+        store.save_to(&store_file).unwrap();
+
+        assert!(!store_file.with_extension("toml.new").exists());
+        assert_eq!(Store::load_from(&store_file).listing().len(), 1);
+    }
+
+    #[test]
+    fn a_missing_parent_directory_is_created_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("state/nested");
+        let store_file = parent.join("trusted.toml");
+
+        store_trusting(dir.path()).save_to(&store_file).unwrap();
+
+        let mode = fs::metadata(&parent).unwrap().mode() & 0o777;
+        assert_eq!(mode, 0o700, "the directory is private: {mode:o}");
+        assert_eq!(Store::load_from(&store_file).listing().len(), 1);
     }
 }
