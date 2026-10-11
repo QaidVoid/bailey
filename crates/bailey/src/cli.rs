@@ -494,12 +494,27 @@ fn cmd_doctor() -> anyhow::Result<i32> {
         println!("    a nested `deny` cannot be enforced");
     }
 
-    println!("  cgroup delegation: {}", yes_no(caps.cgroup_delegated));
-    if !caps.cgroup_delegated {
+    let delegated = &caps.cgroup_delegated;
+    let missing: Vec<&str> = ["memory", "pids", "cpu"]
+        .into_iter()
+        .filter(|controller| !delegated.contains(controller))
+        .collect();
+    if delegated.is_empty() {
+        println!("  cgroup delegation: no");
         degraded = true;
         println!("    resource limits will be skipped");
         println!("    a run needs a cgroup it may create children in, with the memory, pids");
         println!("    and cpu controllers delegated; set BAILEY_CGROUP_ROOT to name one");
+    } else if missing.is_empty() {
+        println!("  cgroup delegation: {}", delegated.join(", "));
+    } else {
+        degraded = true;
+        println!(
+            "  cgroup delegation: {} ({} not delegated)",
+            delegated.join(", "),
+            missing.join(", ")
+        );
+        println!("    limits using {} will be skipped", missing.join(", "));
     }
 
     println!("audit:");

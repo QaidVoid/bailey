@@ -21,7 +21,7 @@ const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
 /// Environment variable naming the cgroup to create runs in, for when the search
 /// below picks the wrong one.
-const ROOT_OVERRIDE: &str = "BAILEY_CGROUP_ROOT";
+pub(crate) const ROOT_OVERRIDE: &str = "BAILEY_CGROUP_ROOT";
 
 /// The controllers a set of limits needs.
 pub fn needed_controllers(limits: &ResourceLimits) -> Vec<&'static str> {
@@ -124,7 +124,7 @@ fn enable(dir: &Path, controllers: &[&str]) -> std::io::Result<()> {
 
 /// The file a controller writes its limit to, used to tell whether the
 /// controller reached a child.
-fn control_file(controller: &str) -> &'static str {
+pub(crate) fn control_file(controller: &str) -> &'static str {
     match controller {
         "memory" => "memory.max",
         "pids" => "pids.max",
