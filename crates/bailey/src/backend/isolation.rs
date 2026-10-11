@@ -474,6 +474,18 @@ fn remount_read_only(new_root: &Path, paths: &[PathBuf]) -> io::Result<()> {
         // `/proc/self/fd` name cannot be remounted, because the bind below
         // creates a mount the descriptor does not refer to.
         if resolve_beneath(new_root, relative)?.is_none() {
+            // A path this host does not have was never bound, so there is
+            // nothing to remount and nothing to protect: a policy may name
+            // something a given host lacks. A path that does exist and is still
+            // not in the root is a path the sandbox lost, which is the case a
+            // silent skip turned into a writable host file.
+            if path.exists() {
+                return Err(io::Error::other(format!(
+                    "the read-only path {} exists on the host but is not in the \
+                     sandbox root, so it cannot be remounted read-only",
+                    path.display()
+                )));
+            }
             continue;
         }
         let target = new_root.join(relative);
@@ -784,5 +796,47 @@ mod tests {
     #[test]
     fn a_strictatime_mount_says_so() {
         assert_eq!(locked_flags(0), MsFlags::MS_STRICTATIME);
+    }
+
+    /// A read-only entry naming a path the host has but the sandbox root does
+    /// not used to be skipped in silence, which is how a lost path became a
+    /// writable host file with nothing said. The run now refuses and names it.
+    #[test]
+    fn a_lost_read_only_entry_is_an_error() {
+        if !crate::backend::isolation::available() {
+            eprintln!("skipping: user namespaces unavailable on this host");
+            return;
+        }
+        let host = tempfile::tempdir().unwrap();
+        let held = host.path().join("held");
+        std::fs::create_dir_all(&held).unwrap();
+        let empty_root = tempfile::tempdir().unwrap();
+        let new_root = empty_root.path().join("root");
+        std::fs::create_dir_all(&new_root).unwrap();
+
+        let error = remount_read_only(&new_root, std::slice::from_ref(&held))
+            .expect_err("a path the root lost must be an error");
+        let message = error.to_string();
+        assert!(
+            message.contains(&*held.to_string_lossy()),
+            "the error must name the path it could not remount: {message}"
+        );
+    }
+
+    /// A path this host does not have was never bound, so there is nothing to
+    /// remount and nothing to protect. A policy may name something a given host
+    /// lacks, and refusing over it would make every optional entry a trap.
+    #[test]
+    fn an_absent_read_only_entry_is_not_an_error() {
+        if !crate::backend::isolation::available() {
+            eprintln!("skipping: user namespaces unavailable on this host");
+            return;
+        }
+        let empty_root = tempfile::tempdir().unwrap();
+        let new_root = empty_root.path().join("root");
+        std::fs::create_dir_all(&new_root).unwrap();
+        let absent = empty_root.path().join("nothing-here");
+        assert!(!absent.exists());
+        remount_read_only(&new_root, &[absent]).expect("an absent path needs no mount");
     }
 }
