@@ -826,6 +826,79 @@ mod tests {
     /// A path this host does not have was never bound, so there is nothing to
     /// remount and nothing to protect. A policy may name something a given host
     /// lacks, and refusing over it would make every optional entry a trap.
+    /// A read-only entry whose final component is a symlink has to be remounted on
+    /// the link's own dentry. The check walks the components with `O_NOFOLLOW`
+    /// and hands back a descriptor, but the mount then re-walks them, and the
+    /// kernel follows the link, so the read-only bind lands on the destination
+    /// and the path the policy named keeps whatever access it had.
+    #[test]
+    fn a_read_only_island_lands_on_the_named_path_not_the_link_target() {
+        if !crate::backend::isolation::available() {
+            eprintln!("skipping: user namespaces unavailable on this host");
+            return;
+        }
+        // The remount is a mount, so it needs a namespace of its own to be
+        // allowed in, and the test cannot disturb the host's. The child forks
+        // and reports, the way the capability probe does.
+        let ok = unsafe {
+            match libc::fork() {
+                -1 => false,
+                0 => {
+                    let code = i32::from(child_remounts_the_named_path().is_err());
+                    unsafe { libc::_exit(code) }
+                }
+                pid => {
+                    let mut status: libc::c_int = 0;
+                    unsafe { libc::waitpid(pid, &mut status, 0) };
+                    libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+                }
+            }
+        };
+        assert!(ok, "the read-only island must land on the named path");
+    }
+
+    /// The body, run in a child with a private mount namespace. Establishes the
+    /// island over a symlink and checks which dentry the read-only mount landed
+    /// on, so the parent's answer is one bit.
+    fn child_remounts_the_named_path() -> io::Result<()> {
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        unshare(CloneFlags::CLONE_NEWUSER).map_err(errno)?;
+        fs::write("/proc/self/setgroups", "deny")?;
+        fs::write("/proc/self/gid_map", format!("{gid} {gid} 1"))?;
+        fs::write("/proc/self/uid_map", format!("{uid} {uid} 1"))?;
+        unshare(CloneFlags::CLONE_NEWNS).map_err(errno)?;
+        mount(
+            None::<&str>,
+            "/",
+            None::<&str>,
+            MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+            None::<&str>,
+        )
+        .map_err(errno)?;
+
+        let dir = tempfile::tempdir().unwrap();
+        let new_root = dir.path().join("root");
+        let destination = dir.path().join("real");
+        std::fs::create_dir_all(&new_root).unwrap();
+        std::fs::create_dir_all(&destination).unwrap();
+        std::os::unix::fs::symlink(&destination, new_root.join("link")).unwrap();
+
+        remount_read_only(&new_root, &[PathBuf::from("/link")])?;
+
+        // The link's own dentry is now a read-only mount, so writing through the
+        // link fails; the destination is untouched and stays writable.
+        if std::fs::File::create(new_root.join("link/inside")).is_ok() {
+            return Err(io::Error::other(
+                "a write through the link must be refused, so the read-only \
+                 mount did not land on the link's own dentry",
+            ));
+        }
+        std::fs::File::create(destination.join("inside"))
+            .map_err(|err| io::Error::other(format!("the destination must keep the access it had: {err}")))?;
+        Ok(())
+    }
+
     #[test]
     fn an_absent_read_only_entry_is_not_an_error() {
         if !crate::backend::isolation::available() {
