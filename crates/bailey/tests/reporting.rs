@@ -70,6 +70,14 @@ fn a_run_under_self_fuse_does_not_claim_landlock() {
         eprintln!("skipping: /usr/bin/python3 unavailable");
         return;
     }
+    // A self_fuse run needs namespace isolation and `enforce` refuses one
+    // without it, so on a host that cannot isolate the run fails rather than
+    // reporting. Skipping keeps the answer about this host the same as every
+    // other isolation test's.
+    if !bailey::backend::isolation::available() {
+        eprintln!("skipping: isolation unavailable on this host");
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("bailey.toml");
     fs::write(
@@ -79,7 +87,7 @@ fn a_run_under_self_fuse_does_not_claim_landlock() {
     .unwrap();
 
     let output = Command::new(bailey())
-        .args(["run", "-c"])
+        .args(["run", "--isolate", "-c"])
         .arg(&config)
         .arg("/bin/true")
         .output()
@@ -100,7 +108,7 @@ fn a_run_under_self_fuse_does_not_claim_landlock() {
     );
 
     let json = Command::new(bailey())
-        .args(["run", "--json", "-c"])
+        .args(["run", "--isolate", "--json", "-c"])
         .arg(&config)
         .arg("/bin/true")
         .output()
