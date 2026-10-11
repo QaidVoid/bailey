@@ -212,11 +212,18 @@ impl EnforceBackend {
         }
 
         let mut report = RunReport::default();
-        // Asked of the kernel rather than assumed: on a host without Landlock
-        // the ruleset still applies without error and enforces nothing, so
-        // claiming it here would report a boundary that is not there.
+        // Asked of the kernel rather than assumed, and then asked of the run:
+        // on a host without Landlock the ruleset still applies without error
+        // and enforces nothing, so claiming it here would report a boundary
+        // that is not there. The same is true of a run that keeps the mount
+        // power, because a Landlock domain and a new filesystem cannot coexist
+        // and the ruleset is the half that gives way.
         match crate::backend::probe::landlock_abi() {
-            Some(_) => report.applied("landlock"),
+            Some(_) if !keep_mount => report.applied("landlock"),
+            Some(_) => report.skipped(
+                "landlock",
+                "self_fuse keeps the mount power a Landlock domain would remove",
+            ),
             None => report.skipped("landlock", "the kernel does not provide Landlock"),
         }
         report.applied("seccomp");
