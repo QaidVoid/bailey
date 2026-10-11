@@ -470,9 +470,6 @@ fn mount_tmpfs(target: &Path, size_bytes: u64, mode: &str) -> io::Result<()> {
 fn remount_read_only(new_root: &Path, paths: &[PathBuf]) -> io::Result<()> {
     for path in paths {
         let relative = path.strip_prefix("/").unwrap_or(path);
-        // Checked for a planted link, then mounted by its real path: a
-        // `/proc/self/fd` name cannot be remounted, because the bind below
-        // creates a mount the descriptor does not refer to.
         if resolve_beneath(new_root, relative)?.is_none() {
             // A path this host does not have was never bound, so there is
             // nothing to remount and nothing to protect: a policy may name
@@ -489,6 +486,40 @@ fn remount_read_only(new_root: &Path, paths: &[PathBuf]) -> io::Result<()> {
             continue;
         }
         let target = new_root.join(relative);
+        // A link at the named path is refused only when following it would leave
+        // the sandbox. `mount` follows the final component, so a link pointing
+        // outside the root lands the read-only bind on its destination and
+        // leaves the named path writable against the host. A link that stays
+        // inside is the ordinary case: bailey recreates a symlinked target as a
+        // link rather than binding through it, and the destination is itself
+        // bound and remounted in its own right, so there is nothing to move.
+        // A link whose destination, resolved under the new root, is not there is
+        // one that leaves the sandbox: the kernel will follow it to the host and
+        // the read-only bind lands wherever that goes. A link that does resolve
+        // inside is the ordinary case, including bailey's own recreated links for
+        // symlinked targets, and its destination is bound and remounted in its
+        // own right.
+        let link_target = std::fs::read_link(&target).ok();
+        let escapes = link_target.as_ref().is_some_and(|to| {
+            let resolved = if to.is_absolute() {
+                new_root.join(to.strip_prefix("/").unwrap_or(to))
+            } else {
+                target
+                    .parent()
+                    .map(|parent| parent.join(to))
+                    .unwrap_or_else(|| to.clone())
+            };
+            !resolved.exists()
+        });
+        if let Some(to) = link_target.filter(|_| escapes) {
+            return Err(io::Error::other(format!(
+                "the read-only path {} is a symlink to {}, which leaves the \
+                 sandbox, and a read-only mount cannot be placed on one: the \
+                 kernel follows the link when the mount is placed by its path",
+                path.display(),
+                to.display()
+            )));
+        }
         mount(
             Some(&target),
             &target,
@@ -826,13 +857,15 @@ mod tests {
     /// A path this host does not have was never bound, so there is nothing to
     /// remount and nothing to protect. A policy may name something a given host
     /// lacks, and refusing over it would make every optional entry a trap.
-    /// A read-only entry whose final component is a symlink has to be remounted on
-    /// the link's own dentry. The check walks the components with `O_NOFOLLOW`
-    /// and hands back a descriptor, but the mount then re-walks them, and the
-    /// kernel follows the link, so the read-only bind lands on the destination
-    /// and the path the policy named keeps whatever access it had.
+    /// A read-only entry whose final component is a symlink cannot be honoured.
+    /// `mount` follows the final component, so placing the island by its path
+    /// lands the read-only bind on the link's destination and leaves the named
+    /// path writable against the host; and the kernel refuses a bind of a
+    /// symlink outright, so no descriptor route exists either. The run is
+    /// refused and names the path, which is the only answer that does not
+    /// quietly grant what the policy retracted.
     #[test]
-    fn a_read_only_island_lands_on_the_named_path_not_the_link_target() {
+    fn a_read_only_island_over_a_link_is_refused_rather_than_followed() {
         if !crate::backend::isolation::available() {
             eprintln!("skipping: user namespaces unavailable on this host");
             return;
@@ -844,23 +877,23 @@ mod tests {
             match libc::fork() {
                 -1 => false,
                 0 => {
-                    let code = i32::from(child_remounts_the_named_path().is_err());
-                    unsafe { libc::_exit(code) }
+                    let code = i32::from(child_refuses_a_named_link().is_err());
+                    libc::_exit(code)
                 }
                 pid => {
                     let mut status: libc::c_int = 0;
-                    unsafe { libc::waitpid(pid, &mut status, 0) };
+                    libc::waitpid(pid, &mut status, 0);
                     libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
                 }
             }
         };
-        assert!(ok, "the read-only island must land on the named path");
+        assert!(ok, "a read-only island over a link must be refused");
     }
 
     /// The body, run in a child with a private mount namespace. Establishes the
-    /// island over a symlink and checks which dentry the read-only mount landed
-    /// on, so the parent's answer is one bit.
-    fn child_remounts_the_named_path() -> io::Result<()> {
+    /// island over a symlink and checks the run refuses and names the path, so
+    /// the parent's answer is one bit.
+    fn child_refuses_a_named_link() -> io::Result<()> {
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
         unshare(CloneFlags::CLONE_NEWUSER).map_err(errno)?;
@@ -884,18 +917,13 @@ mod tests {
         std::fs::create_dir_all(&destination).unwrap();
         std::os::unix::fs::symlink(&destination, new_root.join("link")).unwrap();
 
-        remount_read_only(&new_root, &[PathBuf::from("/link")])?;
-
-        // The link's own dentry is now a read-only mount, so writing through the
-        // link fails; the destination is untouched and stays writable.
-        if std::fs::File::create(new_root.join("link/inside")).is_ok() {
-            return Err(io::Error::other(
-                "a write through the link must be refused, so the read-only \
-                 mount did not land on the link's own dentry",
-            ));
+        let error = remount_read_only(&new_root, &[PathBuf::from("/link")])
+            .expect_err("a read-only island over a link must be refused, not followed");
+        if !error.to_string().contains("/link") {
+            return Err(io::Error::other(format!(
+                "the refusal must name the path: {error}"
+            )));
         }
-        std::fs::File::create(destination.join("inside"))
-            .map_err(|err| io::Error::other(format!("the destination must keep the access it had: {err}")))?;
         Ok(())
     }
 
