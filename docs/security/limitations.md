@@ -241,6 +241,11 @@ anyway. What weakens is everything that depended on a mount staying put:
 - A `deny` beneath a grant is an empty mount the target could remove, so the
   config refuses that combination too. A `deny` no grant reaches costs
   nothing and stays.
+- An egress allowance restricts outbound TCP by port, which is a Landlock rule
+  and therefore one of the things a `self_fuse` run has no ruleset for. The
+  config refuses the combination rather than report a restriction it cannot
+  make. Allow-everything and deny-everything are unaffected: the first promises
+  no restriction, and the second is held by the run's network namespace.
 - The read-only remounts bailey adds on its own, such as the metadata
   protection on read-granted paths, stay in place but are advisory: the
   target has the power to lift them, and only the target's own good behavior
