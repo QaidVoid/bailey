@@ -60,6 +60,36 @@ pub struct Conceal {
     pub is_dir: bool,
 }
 
+/// A path to re-mount read-only after binding, so a writable hierarchy can
+/// still have read-only islands in it.
+///
+/// Both names are carried because they answer different questions. `visible`
+/// is where the mount is placed, inside the reconstructed root. `host` is where
+/// the path really lives, which is the only spelling an `exists()` can answer
+/// anything about: asking it of `visible` for a relocated grant asks about a
+/// name that exists nowhere, so a lost path is skipped in silence and a name
+/// that happens to collide with a host directory errors on the wrong path.
+pub struct ReadOnly {
+    /// Where the path lives on the host.
+    pub host: PathBuf,
+    /// Where the target sees it, which is where the mount goes.
+    pub visible: PathBuf,
+}
+
+impl PartialEq for ReadOnly {
+    fn eq(&self, other: &Self) -> bool {
+        self.visible == other.visible
+    }
+}
+
+impl Eq for ReadOnly {}
+
+impl std::fmt::Debug for ReadOnly {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.visible.display())
+    }
+}
+
 /// The set of paths to reconstruct in the target's root.
 pub struct IsolationPlan {
     /// Paths to bind into the new root.
@@ -68,9 +98,8 @@ pub struct IsolationPlan {
     pub links: Vec<SymLink>,
     /// Paths to cover over after binding.
     pub conceal: Vec<Conceal>,
-    /// Paths to re-mount read-only after binding, so a writable hierarchy can
-    /// still have read-only islands in it.
-    pub read_only: Vec<PathBuf>,
+    /// Paths to re-mount read-only after binding.
+    pub read_only: Vec<ReadOnly>,
     /// Whether to also take the target out of the host's network namespace.
     pub network: bool,
     /// The private home: where it lives on the host, and where it appears
@@ -467,16 +496,57 @@ fn mount_tmpfs(target: &Path, size_bytes: u64, mode: &str) -> io::Result<()> {
 /// hierarchy: Landlock rules only ever add rights, but a read-only mount is
 /// enforced by the VFS whatever the ruleset says. The contents stay readable,
 /// which is what distinguishes this from concealment.
-fn remount_read_only(new_root: &Path, paths: &[PathBuf]) -> io::Result<()> {
-    for path in paths {
+fn remount_read_only(new_root: &Path, paths: &[ReadOnly]) -> io::Result<()> {
+    for entry in paths {
+        let path = &entry.visible;
         let relative = path.strip_prefix("/").unwrap_or(path);
-        // Checked for a planted link, then mounted by its real path: a
-        // `/proc/self/fd` name cannot be remounted, because the bind below
-        // creates a mount the descriptor does not refer to.
         if resolve_beneath(new_root, relative)?.is_none() {
+            // A path this host does not have was never bound, so there is
+            // nothing to remount and nothing to protect: a policy may name
+            // something a given host lacks. A path that does exist and is still
+            // not in the root is a path the sandbox lost, which is the case a
+            // silent skip turned into a writable host file.
+            //
+            // The existence test is asked of the host spelling. The visible one
+            // is where the mount goes, and for a relocated grant that is a name
+            // the host has never heard of, so asking it there answers nothing
+            // and a lost path is skipped in silence.
+            if entry.host.exists() {
+                return Err(io::Error::other(format!(
+                    "the read-only path {} exists on the host but is not in the \
+                     sandbox root, so it cannot be remounted read-only",
+                    entry.host.display()
+                )));
+            }
             continue;
         }
         let target = new_root.join(relative);
+        // A link at the named path is refused only when following it would leave
+        // the sandbox. `mount` follows the final component, so a link pointing
+        // outside the root lands the read-only bind on its destination and
+        // leaves the named path writable against the host. A link that stays
+        // inside is the ordinary case: bailey recreates a symlinked target as a
+        // link rather than binding through it, and the destination is itself
+        // bound and remounted in its own right, so there is nothing to move.
+        // A link whose destination, resolved under the new root, is not there is
+        // one that leaves the sandbox: the kernel will follow it to the host and
+        // the read-only bind lands wherever that goes. A link that does resolve
+        // inside is the ordinary case, including bailey's own recreated links for
+        // symlinked targets, and its destination is bound and remounted in its
+        // own right.
+        let link_target = std::fs::read_link(&target).ok();
+        let escapes = link_target
+            .as_ref()
+            .is_some_and(|to| !resolves_inside(new_root, &target, to));
+        if let Some(to) = link_target.filter(|_| escapes) {
+            return Err(io::Error::other(format!(
+                "the read-only path {} is a symlink to {}, which leaves the \
+                 sandbox, and a read-only mount cannot be placed on one: the \
+                 kernel follows the link when the mount is placed by its path",
+                path.display(),
+                to.display()
+            )));
+        }
         mount(
             Some(&target),
             &target,
@@ -644,6 +714,47 @@ fn resolve_beneath(root: &Path, relative: &Path) -> io::Result<Option<(PathBuf, 
     Ok(Some((path, dir)))
 }
 
+/// Whether a link at `target` points somewhere still inside `root`.
+///
+/// The question is the one the guard is asking: does following this link leave
+/// the sandbox. `Path::join` does not normalise, so a relative destination
+/// written with `..` keeps those components, and an `exists()` on the joined
+/// form then asks the host about a path that has already climbed out of the
+/// root. The components are walked here instead, so a `..` that would rise
+/// above the root is what answers no, and the destination is only asked about
+/// once it is known to be inside.
+fn resolves_inside(root: &Path, target: &Path, to: &Path) -> bool {
+    let joined = if to.is_absolute() {
+        root.join(to.strip_prefix("/").unwrap_or(to))
+    } else {
+        match target.parent() {
+            Some(parent) => parent.join(to),
+            None => return false,
+        }
+    };
+    let Ok(rest) = joined.strip_prefix(root) else {
+        return false;
+    };
+    let mut inside = root.to_path_buf();
+    for component in rest.components() {
+        match component {
+            std::path::Component::Normal(name) => inside.push(name),
+            std::path::Component::ParentDir => {
+                if inside == root {
+                    return false;
+                }
+                if !inside.pop() {
+                    return false;
+                }
+            }
+            std::path::Component::CurDir => {}
+            // A root or a prefix is not a destination beneath the root.
+            _ => return false,
+        }
+    }
+    inside.starts_with(root) && inside.exists()
+}
+
 /// Create a path beneath `root` without following a symlink on the way.
 ///
 /// The private home is a directory the target writes and bailey reuses on the
@@ -784,5 +895,220 @@ mod tests {
     #[test]
     fn a_strictatime_mount_says_so() {
         assert_eq!(locked_flags(0), MsFlags::MS_STRICTATIME);
+    }
+
+    /// A read-only entry naming a path the host has but the sandbox root does
+    /// not used to be skipped in silence, which is how a lost path became a
+    /// writable host file with nothing said. The run now refuses and names it.
+    #[test]
+    fn a_lost_read_only_entry_is_an_error() {
+        if !crate::backend::isolation::available() {
+            eprintln!("skipping: user namespaces unavailable on this host");
+            return;
+        }
+        let host = tempfile::tempdir().unwrap();
+        let held = host.path().join("held");
+        std::fs::create_dir_all(&held).unwrap();
+        let empty_root = tempfile::tempdir().unwrap();
+        let new_root = empty_root.path().join("root");
+        std::fs::create_dir_all(&new_root).unwrap();
+
+        let error = remount_read_only(
+            &new_root,
+            &[ReadOnly {
+                host: held.clone(),
+                visible: held.clone(),
+            }],
+        )
+        .expect_err("a path the root lost must be an error");
+        let message = error.to_string();
+        assert!(
+            message.contains(&*held.to_string_lossy()),
+            "the error must name the path it could not remount: {message}"
+        );
+    }
+
+    /// A link whose destination is reached by climbing out of the root is
+    /// refused, and the reason it needs its own test is that the obvious
+    /// implementation of the check gets this case wrong.
+    ///
+    /// `Path::join` does not normalise, so a relative destination written with
+    /// `..` keeps those components, and an `exists()` on the joined form asks the
+    /// host about a path that has already left the root. When the host happens
+    /// to have that path the check says the link stays inside, and the read-only
+    /// bind lands on a host file the policy never named. Relative links with
+    /// `..` in them are ordinary in `/bin`, `/lib` and `/sbin`, and bailey
+    /// recreates them verbatim, so this is the common case rather than an
+    /// exotic one.
+    #[test]
+    fn a_relative_link_that_climbs_out_of_the_root_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let new_root = root.path().join("root");
+        std::fs::create_dir_all(new_root.join("a").join("b")).unwrap();
+        // A destination the host really has, outside the root, which is what
+        // makes the old check answer yes.
+        std::fs::create_dir_all(root.path().join("outside")).unwrap();
+        std::fs::create_dir_all(new_root.join("a").join("b").join("inside")).unwrap();
+        std::os::unix::fs::symlink(
+            "../../../outside",
+            new_root.join("a").join("b").join("climbs"),
+        )
+        .unwrap();
+
+        let target = new_root.join("a").join("b").join("climbs");
+        assert!(
+            !resolves_inside(&new_root, &target, Path::new("../../../outside")),
+            "a link that climbs above the root must not be read as staying inside"
+        );
+        assert!(
+            resolves_inside(&new_root, &target, Path::new("inside")),
+            "a link that stays beneath the root must still be allowed"
+        );
+        assert!(
+            !resolves_inside(&new_root, &target, Path::new("/etc")),
+            "an absolute link outside the root must be refused"
+        );
+    }
+
+    /// The existence test in `remount_read_only` is asked of the host spelling,
+    /// not the visible one. For a relocated grant the visible name is where the
+    /// mount goes and is a name the host has never heard of, so asking it there
+    /// answers nothing: a path the root lost is skipped in silence, and a name
+    /// that happens to collide with a real host directory errors while naming
+    /// the wrong path.
+    #[test]
+    fn a_lost_relocated_entry_is_an_error_naming_the_host_path() {
+        if !crate::backend::isolation::available() {
+            eprintln!("skipping: user namespaces unavailable on this host");
+            return;
+        }
+        let host = tempfile::tempdir().unwrap();
+        let source = host.path().join("srv-data");
+        std::fs::create_dir_all(&source).unwrap();
+        let empty_root = tempfile::tempdir().unwrap();
+        let new_root = empty_root.path().join("root");
+        std::fs::create_dir_all(&new_root).unwrap();
+
+        // The relocated entry: the host has the source, the root lost it, and
+        // the visible spelling is the `at` name, which exists nowhere.
+        let error = remount_read_only(
+            &new_root,
+            &[ReadOnly {
+                host: source.clone(),
+                visible: PathBuf::from("/data"),
+            }],
+        )
+        .expect_err("a path the host has but the root lost must be an error");
+        let message = error.to_string();
+        assert!(
+            message.contains(&*source.to_string_lossy()),
+            "the error must name the host path, which is the one the operator \
+             can act on: {message}"
+        );
+        assert!(
+            !message.contains("/data"),
+            "the error must not name the visible spelling, which exists nowhere \
+             on the host: {message}"
+        );
+    }
+
+    /// A path this host does not have was never bound, so there is nothing to
+    /// remount and nothing to protect. A policy may name something a given host
+    /// lacks, and refusing over it would make every optional entry a trap.
+    /// A read-only entry whose final component is a symlink cannot be honoured.
+    /// `mount` follows the final component, so placing the island by its path
+    /// lands the read-only bind on the link's destination and leaves the named
+    /// path writable against the host; and the kernel refuses a bind of a
+    /// symlink outright, so no descriptor route exists either. The run is
+    /// refused and names the path, which is the only answer that does not
+    /// quietly grant what the policy retracted.
+    #[test]
+    fn a_read_only_island_over_a_link_is_refused_rather_than_followed() {
+        if !crate::backend::isolation::available() {
+            eprintln!("skipping: user namespaces unavailable on this host");
+            return;
+        }
+        // The remount is a mount, so it needs a namespace of its own to be
+        // allowed in, and the test cannot disturb the host's. The child forks
+        // and reports, the way the capability probe does.
+        let ok = unsafe {
+            match libc::fork() {
+                -1 => false,
+                0 => {
+                    let code = i32::from(child_refuses_a_named_link().is_err());
+                    libc::_exit(code)
+                }
+                pid => {
+                    let mut status: libc::c_int = 0;
+                    libc::waitpid(pid, &mut status, 0);
+                    libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0
+                }
+            }
+        };
+        assert!(ok, "a read-only island over a link must be refused");
+    }
+
+    /// The body, run in a child with a private mount namespace. Establishes the
+    /// island over a symlink and checks the run refuses and names the path, so
+    /// the parent's answer is one bit.
+    fn child_refuses_a_named_link() -> io::Result<()> {
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        unshare(CloneFlags::CLONE_NEWUSER).map_err(errno)?;
+        fs::write("/proc/self/setgroups", "deny")?;
+        fs::write("/proc/self/gid_map", format!("{gid} {gid} 1"))?;
+        fs::write("/proc/self/uid_map", format!("{uid} {uid} 1"))?;
+        unshare(CloneFlags::CLONE_NEWNS).map_err(errno)?;
+        mount(
+            None::<&str>,
+            "/",
+            None::<&str>,
+            MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+            None::<&str>,
+        )
+        .map_err(errno)?;
+
+        let dir = tempfile::tempdir().unwrap();
+        let new_root = dir.path().join("root");
+        let destination = dir.path().join("real");
+        std::fs::create_dir_all(&new_root).unwrap();
+        std::fs::create_dir_all(&destination).unwrap();
+        std::os::unix::fs::symlink(&destination, new_root.join("link")).unwrap();
+
+        let error = remount_read_only(
+            &new_root,
+            &[ReadOnly {
+                host: PathBuf::from("/link"),
+                visible: PathBuf::from("/link"),
+            }],
+        )
+        .expect_err("a read-only island over a link must be refused, not followed");
+        if !error.to_string().contains("/link") {
+            return Err(io::Error::other(format!(
+                "the refusal must name the path: {error}"
+            )));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_absent_read_only_entry_is_not_an_error() {
+        if !crate::backend::isolation::available() {
+            eprintln!("skipping: user namespaces unavailable on this host");
+            return;
+        }
+        let empty_root = tempfile::tempdir().unwrap();
+        let new_root = empty_root.path().join("root");
+        std::fs::create_dir_all(&new_root).unwrap();
+        let absent = empty_root.path().join("nothing-here");
+        assert!(!absent.exists());
+        remount_read_only(
+            &new_root,
+            &[ReadOnly {
+                host: absent.clone(),
+                visible: absent,
+            }],
+        )
+        .expect("an absent path needs no mount");
     }
 }
