@@ -1,5 +1,45 @@
 # Changelog
 
+## [0.2.4](https://github.com/QaidVoid/bailey/compare/v0.2.3...v0.2.4) - 2026-10-12
+
+### ⛰️  Features
+
+- *(cli)* Add quick-grant flags above all config layers - ([64a8215](https://github.com/QaidVoid/bailey/commit/64a821534b5e704a4760fa443db50a8b9d76bc9f))
+- *(config)* Let the target mount its own FUSE filesystems - ([f196c6d](https://github.com/QaidVoid/bailey/commit/f196c6d1cf22406d79930820879310d945671448))
+- *(config)* Forward host TCP ports into the sandbox - ([73cca6f](https://github.com/QaidVoid/bailey/commit/73cca6f79df4cd983a07706eed621626ff9f0c8e))
+- *(config)* Broker URL opens from inside the sandbox - ([78b8954](https://github.com/QaidVoid/bailey/commit/78b895464c1c37b6f43ea25b991c65fab57d7928))
+- *(config)* Relay desktop service sockets into the sandbox - ([bf26fdd](https://github.com/QaidVoid/bailey/commit/bf26fdd2a3698afe2f9faa8a442a0dcc3d2a346f))
+- *(config)* Mount FUSE filesystems for the target - ([f2bdef0](https://github.com/QaidVoid/bailey/commit/f2bdef010183350993d294775e7bd4f7e62b0876))
+- *(isolation)* Refuse the run when a granted path is unreadable - ([785eaca](https://github.com/QaidVoid/bailey/commit/785eacab4121add4dfcf654cb1c7f259760e952d))
+
+### 🐛 Bug Fixes
+
+- *(cli)* Report the hooks a config runs in trust and show ([#65](https://github.com/QaidVoid/bailey/pull/65)) - ([5cdfc13](https://github.com/QaidVoid/bailey/commit/5cdfc135e986d8edc40baae0bd5ab646e24ad1c1))
+- *(config)* Compare grant and deny paths in one canonical form ([#71](https://github.com/QaidVoid/bailey/pull/71)) - ([87c545e](https://github.com/QaidVoid/bailey/commit/87c545ecceae3873782ca1c997a2afada5b1db30))
+- *(config)* Ignore a relative XDG_CONFIG_HOME value ([#63](https://github.com/QaidVoid/bailey/pull/63)) - ([6df4b1c](https://github.com/QaidVoid/bailey/commit/6df4b1ca25a0ecedc1cd4df324f587eb4e1b239b))
+- *(config)* Hash and apply one read of each config layer ([#62](https://github.com/QaidVoid/bailey/pull/62)) - ([19f32f4](https://github.com/QaidVoid/bailey/commit/19f32f42e9b2a6fcf09b6b2740e84b3c3c25a9d8))
+- *(config)* Refuse self_fuse beside a partial egress allowance ([#58](https://github.com/QaidVoid/bailey/pull/58)) - ([5d987c1](https://github.com/QaidVoid/bailey/commit/5d987c1da77c929d39120ecc65cb2efd6dd73414))
+- *(enforce)* Build the reconstructed root in a fresh directory ([#70](https://github.com/QaidVoid/bailey/pull/70)) - ([ef5ace5](https://github.com/QaidVoid/bailey/commit/ef5ace5539fd912cc9261741df965153e046637e))
+- *(enforce)* Report landlock only when its ruleset applied ([#59](https://github.com/QaidVoid/bailey/pull/59)) - ([2bbf882](https://github.com/QaidVoid/bailey/commit/2bbf882a6a747f552add55e43ef62904f434d60d))
+- *(forward)* Close an idle forwarded connection at a deadline ([#66](https://github.com/QaidVoid/bailey/pull/66)) - ([a579335](https://github.com/QaidVoid/bailey/commit/a5793359a1980eb7ee1a8bcb18bcc0774d5c50ed))
+- *(forward)* Name the egress allowance when refusing forwards - ([da44294](https://github.com/QaidVoid/bailey/commit/da4429408569ce4f1a3f6e728860ac420b4727f2))
+- *(forward)* Serve the relay while the target runs - ([06b1859](https://github.com/QaidVoid/bailey/commit/06b185997cf91e06f7c3483ab02c21aa7337757f))
+- *(isolation)* Name the host path a read-only island lost ([#61](https://github.com/QaidVoid/bailey/pull/61)) - ([7391425](https://github.com/QaidVoid/bailey/commit/7391425dbcaa72b6982d45f8cf3155d7e6e309ae))
+- *(isolation)* Refuse a read-only entry the sandbox root lost ([#60](https://github.com/QaidVoid/bailey/pull/60)) - ([b73ee60](https://github.com/QaidVoid/bailey/commit/b73ee60d543e5d3b3fd060d4b800fff4129121c9))
+- *(isolation)* Reap sandbox orphans from a supervisor init - ([fc433bc](https://github.com/QaidVoid/bailey/commit/fc433bc7c44a680d149b826fedea5c6c2f80875d))
+- *(probe)* Answer cgroup delegation the way the run behaves ([#69](https://github.com/QaidVoid/bailey/pull/69)) - ([f3e5746](https://github.com/QaidVoid/bailey/commit/f3e57468ac2b001e99e91c42535db8ade8958236))
+- *(trust)* Refuse a record whose parent directories are exposed ([#72](https://github.com/QaidVoid/bailey/pull/72)) - ([8e4f240](https://github.com/QaidVoid/bailey/commit/8e4f240e1a21c4b52a386e94394a14610ff87c56))
+- *(trust)* Resolve symlinks in the exposed-parents walk ([#68](https://github.com/QaidVoid/bailey/pull/68)) - ([25f3a07](https://github.com/QaidVoid/bailey/commit/25f3a0710cf9b08c62732f998370b6bb47473261))
+- *(trust)* Open the staging file exclusively ([#64](https://github.com/QaidVoid/bailey/pull/64)) - ([2902684](https://github.com/QaidVoid/bailey/commit/2902684a2a29955422dc2a7b7de00b6a291e32aa))
+
+### 🎨 Styling
+
+- Apply rustfmt's stock defaults ([#40](https://github.com/QaidVoid/bailey/pull/40)) - ([891436d](https://github.com/QaidVoid/bailey/commit/891436d41091bc0f4e46f458311a6bc83a7da9f8))
+
+### ⚙️ Miscellaneous Tasks
+
+- Satisfy the lints the current toolchain flags ([#41](https://github.com/QaidVoid/bailey/pull/41)) - ([3f1790a](https://github.com/QaidVoid/bailey/commit/3f1790a0a2e6041d188cfb675a925f47acf00c88))
+
 ## [0.2.3](https://github.com/QaidVoid/bailey/compare/v0.2.2...v0.2.3) - 2026-09-29
 
 ### 🐛 Bug Fixes
