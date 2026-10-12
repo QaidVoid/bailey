@@ -381,11 +381,13 @@ pub fn exposure_of(path: &Path) -> Option<Rejected> {
 /// Whether any directory holding `path` can be written by someone else.
 ///
 /// The parent chain is resolved through symlinks before the walk, so every
-/// directory is judged by the metadata of the one that actually holds the
-/// next component, and a rejection names that real directory. Walked upwards
-/// to the root. A sticky directory is not counted: `/tmp` is world-writable by
-/// design, and the sticky bit is what stops one user replacing another's
-/// entry there.
+/// directory in the resolved chain is judged by the metadata of the one that
+/// actually holds the next component, and a rejection names that real
+/// directory. The chain as typed is not walked as well: the kernel traverses
+/// both halves, and the half that holds a symlink is left unjudged, which is a
+/// gap this walk shares with the one it replaced. Walked upwards to the root.
+/// A sticky directory is not counted: `/tmp` is world-writable by design, and
+/// the sticky bit is what stops one user replacing another's entry there.
 fn exposed_parents(path: &Path) -> Option<Rejected> {
     let parent = path.parent()?;
     let Ok(resolved) = fs::canonicalize(parent) else {

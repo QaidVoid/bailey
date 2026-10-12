@@ -740,6 +740,10 @@ fn policy_with_relays(policy: &Policy, relays: &[relay::Relay]) -> Policy {
 /// Cleanup used to happen only on the success path, so a `pre_exec` that failed
 /// after creating the directory, or a caller that dropped the run without
 /// waiting, left one behind for every attempt.
+///
+/// A signal still does not unwind, so it leaves a directory behind. The sweep
+/// at the start of the next run is what heals that, which is why the staging
+/// name carries the pid.
 struct StagingGuard {
     dir: Option<PathBuf>,
 }
@@ -1019,8 +1023,17 @@ fn staging_dir() -> io::Result<PathBuf> {
 }
 
 /// Create a staging directory with a fresh name under `parent`.
+///
+/// The name carries the run's pid alongside the unpredictable suffix, so a
+/// later run can tell whose a leftover was and whether that run is still
+/// alive, which is what makes it sweepable. The suffix is what stops another
+/// user naming the path in advance: the pid is observable, the suffix is not.
 fn fresh_dir(parent: &Path) -> io::Result<PathBuf> {
-    claim_staging(&parent.join(format!("{STAGING_PREFIX}{}", random_suffix())))
+    claim_staging(&parent.join(format!(
+        "{STAGING_PREFIX}{}.{}",
+        std::process::id(),
+        random_suffix()
+    )))
 }
 
 /// Create `path` as a private staging directory, refusing one that is taken.
@@ -1049,15 +1062,23 @@ fn claim_staging(path: &Path) -> io::Result<PathBuf> {
 /// manager where one exists, so a directory created there cannot be
 /// pre-created or named by another user. Any other mode does not qualify and
 /// the run falls back to an unpredictable name in the temp directory.
+///
+/// The mode alone is not the test: a 0700 directory owned by someone else is
+/// unreadable to us but not ours, and a run that staged in one would fail on
+/// the create rather than fall back. Ownership is asked as well.
 fn runtime_dir_host() -> Option<PathBuf> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     let dir = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR")?);
     if !dir.is_absolute() {
         return None;
     }
-    let mode = dir.metadata().ok()?.permissions().mode();
-    (mode & 0o777 == 0o700).then_some(dir)
+    let meta = dir.metadata().ok()?;
+    let me = unsafe { libc::geteuid() };
+    if meta.uid() != me {
+        return None;
+    }
+    (meta.permissions().mode() & 0o777 == 0o700).then_some(dir)
 }
 
 /// A suffix another process cannot predict.
@@ -1073,7 +1094,7 @@ fn random_suffix() -> String {
     format!("{:016x}", hasher.finish())
 }
 
-/// Remove the staging leftover named for this run's own pid, if any.
+/// Remove the staging leftovers of runs that are no longer alive.
 ///
 /// [`StagingGuard`] removes the directory on every path a run can return by,
 /// but a signal does not unwind: a Ctrl-C, or anything else that kills bailey
@@ -1081,17 +1102,62 @@ fn random_suffix() -> String {
 /// a leftover heals on the next run rather than accumulating one per
 /// interrupted run.
 ///
-/// Only the exact name this run's pid identifies is removed. The shared temp
-/// directory cannot tell one user's leftover from another's, so nothing else
-/// is matched, and the empty directories earlier versions left behind wait
-/// for the system's temp cleanup instead.
+/// A leftover is identified by the pid its name carries, and removed only when
+/// that pid is gone and the entry is this user's own directory. A run still
+/// alive may well be a concurrent one, and another user's staging is not ours
+/// to remove, so neither is touched.
+///
+/// Both places a run may stage are swept, because a run that staged under the
+/// session runtime directory leaves a directory the temp directory never sees.
 fn sweep_stale_staging() {
-    sweep_staging(&std::env::temp_dir());
+    let temp = std::env::temp_dir();
+    sweep_staging(&temp);
+    if let Some(runtime) = runtime_dir_host()
+        && runtime != temp
+    {
+        sweep_staging(&runtime);
+    }
 }
 
-/// Remove this run's own leftover staging directory from `dir`.
+/// Remove the dead runs' staging leftovers from `dir`.
 fn sweep_staging(dir: &Path) {
-    let _ = std::fs::remove_dir_all(dir.join(format!("{STAGING_PREFIX}{}", std::process::id())));
+    use std::os::unix::fs::MetadataExt;
+
+    let me = unsafe { libc::geteuid() };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Some(rest) = name.strip_prefix(STAGING_PREFIX) else {
+            continue;
+        };
+        // The name is `<pid>.<suffix>`; anything else is not ours to interpret.
+        let Some((pid, _)) = rest.split_once('.') else {
+            continue;
+        };
+        if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        // A process id that is still running belongs to a run in progress,
+        // which may well be a concurrent one.
+        if Path::new("/proc").join(pid).exists() {
+            continue;
+        }
+        // Another user's leftovers are not ours to remove, and saying so would
+        // be noise on every run. The entry is a directory we own, so the
+        // removal cannot reach past it.
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_dir() || meta.uid() != me {
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(entry.path());
+    }
 }
 
 /// The host path behind one the target sees, following a relocated grant.
@@ -2421,6 +2487,12 @@ mod tests {
             name.starts_with(STAGING_PREFIX),
             "the staging directory is named for bailey: {name}"
         );
+        // The name carries the pid so a later run can tell whose a leftover
+        // was, and an unpredictable suffix so nobody else can name it first.
+        let rest = name.strip_prefix(STAGING_PREFIX).unwrap();
+        let (pid, suffix) = rest.split_once('.').expect("the name is <pid>.<suffix>");
+        assert_eq!(pid, std::process::id().to_string(), "the pid is carried");
+        assert!(!suffix.is_empty(), "the suffix is carried: {name}");
         assert_ne!(
             name,
             format!("{STAGING_PREFIX}{}", std::process::id()),
@@ -2463,35 +2535,74 @@ mod tests {
         let _ = std::fs::remove_dir(&second);
     }
 
-    /// The sweep takes only the leftover named for this run's own pid.
+    /// The sweep heals a leftover and touches nothing it cannot prove is ours.
     ///
-    /// A directory left by a run of another identity, or planted by any user,
-    /// is neither matched nor touched: the shared temp directory cannot tell
-    /// whose a leftover is, so nothing that is not ours by name is removed.
+    /// A leftover is matched by the pid its name carries, and removed only when
+    /// that pid is gone and the entry is a directory this user owns. A run
+    /// still alive may be a concurrent one, so its staging stays.
     #[test]
-    fn the_sweep_takes_only_its_own_leftover() {
+    fn the_sweep_heals_a_leftover_and_leaves_the_rest_alone() {
         let dir = tempfile::tempdir().unwrap();
-        let foreign = dir.path().join(format!("{STAGING_PREFIX}987654321"));
-        std::fs::create_dir_all(&foreign).unwrap();
-        std::fs::write(foreign.join("decoy"), "not ours").unwrap();
-        let own = dir
+
+        // A leftover of a run whose pid is gone: the shape `fresh_dir` makes.
+        let healed = dir
             .path()
-            .join(format!("{STAGING_PREFIX}{}", std::process::id()));
-        std::fs::create_dir_all(&own).unwrap();
+            .join(format!("{STAGING_PREFIX}987654321.deadbeefdeadbeef"));
+        std::fs::create_dir_all(&healed).unwrap();
+        // A live run's staging, which may well be a concurrent one.
+        let live = dir
+            .path()
+            .join(format!("{STAGING_PREFIX}{}.cafe", std::process::id()));
+        std::fs::create_dir_all(&live).unwrap();
+        // A name that carries no pid is not ours to interpret.
+        let unparsed = dir.path().join(format!("{STAGING_PREFIX}nonsense"));
+        std::fs::create_dir_all(&unparsed).unwrap();
+        std::fs::write(unparsed.join("decoy"), "not ours").unwrap();
 
         sweep_staging(dir.path());
 
+        assert!(!healed.exists(), "a dead run's leftover is healed");
+        assert!(live.is_dir(), "a live run's staging is left alone");
         assert!(
-            foreign.is_dir(),
-            "another run's staging is not ours to remove"
+            unparsed.join("decoy").is_file(),
+            "a name carrying no pid is left alone"
         );
-        assert!(
-            foreign.join("decoy").is_file(),
-            "nothing inside it is touched"
-        );
-        assert!(!own.exists(), "this run's own leftover is removed");
 
-        let _ = std::fs::remove_dir_all(&foreign);
+        let _ = std::fs::remove_dir_all(&live);
+        let _ = std::fs::remove_dir_all(&unparsed);
+    }
+
+    /// A session runtime directory that is not this user's own is refused, even
+    /// at mode 0700.
+    ///
+    /// The mode alone is not the test: a private directory owned by somebody
+    /// else is unreadable to us but not ours, and a run that staged in one
+    /// would fail on the create rather than fall back to the temp directory.
+    /// What is pinned here is the mode half and the own-directory half; a
+    /// directory of another uid cannot be created in a test, so the ownership
+    /// branch is read rather than executed.
+    #[test]
+    fn a_runtime_directory_must_be_private_and_ours() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env = crate::test_support::env_lock();
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", dir.path()) };
+        assert_eq!(
+            runtime_dir_host(),
+            Some(dir.path().to_path_buf()),
+            "this process's own 0700 directory qualifies"
+        );
+
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            runtime_dir_host(),
+            None,
+            "a directory that is not 0700 does not qualify"
+        );
+
+        unsafe { std::env::remove_var("XDG_RUNTIME_DIR") };
     }
 
     /// The classifier reads what a path is really on, so a plain directory is

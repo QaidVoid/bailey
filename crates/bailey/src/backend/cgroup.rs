@@ -52,7 +52,7 @@ pub fn own() -> Option<PathBuf> {
 /// Walks up from bailey's own cgroup, because the delegated subtree is normally
 /// an ancestor: the session manager hands the user a directory and the user's
 /// processes live in a leaf of it.
-pub fn usable_root(needed: &[&str]) -> Option<PathBuf> {
+pub fn usable_root(needed: &[&'static str]) -> Option<PathBuf> {
     if let Some(path) = std::env::var_os(ROOT_OVERRIDE) {
         let path = PathBuf::from(path);
         return can_host_runs(&path, needed).then_some(path);
@@ -78,40 +78,51 @@ pub fn usable_root(needed: &[&str]) -> Option<PathBuf> {
 
 /// Whether a run's cgroup could be created under `dir` and actually carry
 /// limits.
-fn can_host_runs(dir: &Path, needed: &[&str]) -> bool {
+pub(crate) fn can_host_runs(dir: &Path, needed: &[&'static str]) -> bool {
+    carries_all(dir, needed).len() == needed.len()
+}
+
+/// Which of `needed` a child created under `dir` would carry.
+///
+/// A controller reaches a child only once `dir` delegates it, so a child is
+/// created and asked rather than `dir`'s own listing, which reflects what
+/// `dir`'s parent delegated to `dir` and says nothing about what `dir` may hand
+/// on. A controller `dir` may delegate but has not yet is enabled, which is
+/// what a run needs and what [`usable_root`] has always done.
+pub(crate) fn carries_all(dir: &Path, needed: &[&'static str]) -> Vec<&'static str> {
     if !dir.is_dir() {
-        return false;
+        return Vec::new();
     }
     let probe = dir.join(format!("bailey.probe.{}", std::process::id()));
     if fs::create_dir(&probe).is_err() {
-        return false;
+        return Vec::new();
     }
-    // The controller files only appear in the child once the parent delegates
-    // them, so ask the child rather than trusting the parent's listing.
-    let missing: Vec<_> = needed
+    let missing: Vec<&'static str> = needed
         .iter()
-        .filter(|controller| !probe.join(control_file(controller)).exists())
         .copied()
+        .filter(|controller| !probe.join(control_file(controller)).exists())
         .collect();
     let _ = fs::remove_dir(&probe);
 
     if missing.is_empty() {
-        return true;
+        return needed.to_vec();
     }
     // Not delegated yet. Enabling is allowed only when this cgroup has no
     // processes of its own, which is exactly the case for a delegated root.
     if enable(dir, &missing).is_err() {
-        return false;
+        return Vec::new();
     }
     let probe = dir.join(format!("bailey.probe.{}", std::process::id()));
     if fs::create_dir(&probe).is_err() {
-        return false;
+        return Vec::new();
     }
-    let ok = needed
+    let carried: Vec<&'static str> = needed
         .iter()
-        .all(|controller| probe.join(control_file(controller)).exists());
+        .copied()
+        .filter(|controller| probe.join(control_file(controller)).exists())
+        .collect();
     let _ = fs::remove_dir(&probe);
-    ok
+    carried
 }
 
 fn enable(dir: &Path, controllers: &[&str]) -> std::io::Result<()> {

@@ -1160,18 +1160,25 @@ pub fn expand_flag_path(raw: &str) -> Result<PathBuf, String> {
 }
 
 /// Collapse `.` and `..` components without touching the filesystem, so that
-/// equivalent spellings of a path resolve to the same key during merge. A
-/// `..` above the root is dropped, because an absolute path has nothing above
-/// `/`, and a key that kept one would match no rule.
+/// equivalent spellings of a path resolve to the same key during merge.
+///
+/// A `..` above the root is dropped, because an absolute path has nothing above
+/// `/`, and a key that kept one would match no rule. A relative path that pops
+/// past its own start keeps the `..`, because collapsing it to nothing would
+/// produce the empty path, which is a prefix of every path and so matches
+/// every rule.
 fn normalize_lexical(path: &Path) -> PathBuf {
     use std::path::Component;
 
+    let absolute = path.is_absolute();
     let mut out = PathBuf::new();
     for component in path.components() {
         match component {
             Component::CurDir => {}
             Component::ParentDir => {
-                out.pop();
+                if !out.pop() && !absolute {
+                    out.push("..");
+                }
             }
             other => out.push(other),
         }
@@ -2010,6 +2017,14 @@ mod tests {
         assert_eq!(
             normalize_lexical(Path::new("/a/./b")),
             PathBuf::from("/a/b")
+        );
+        // A relative path that pops past its own start keeps its `..`, because
+        // the empty path is a prefix of everything and would match every rule.
+        assert_eq!(normalize_lexical(Path::new("..")), PathBuf::from(".."));
+        assert_eq!(normalize_lexical(Path::new("a/../..")), PathBuf::from(".."));
+        assert_eq!(
+            normalize_lexical(Path::new("a/b/../../..")),
+            PathBuf::from("..")
         );
     }
 
