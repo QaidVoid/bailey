@@ -230,13 +230,18 @@ fn no_staging_directory_is_left_behind() {
 
     // A staging directory exists for the lifetime of the run that owns it, and
     // other tests run concurrently, so only directories whose owning process is
-    // gone count as leaked.
+    // gone count as leaked. The name is `<pid>.<suffix>`, and a name that
+    // carries no pid is not a staging directory this version made.
     let leftovers: Vec<_> = fs::read_dir("/tmp")
         .unwrap()
         .filter_map(Result::ok)
         .filter_map(|entry| {
             let name = entry.file_name().to_string_lossy().into_owned();
-            let pid = name.strip_prefix(".bailey-root.")?;
+            let rest = name.strip_prefix(".bailey-root.")?;
+            let (pid, _) = rest.split_once('.')?;
+            if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
             let owner_alive = Path::new(&format!("/proc/{pid}")).exists();
             if owner_alive {
                 None
@@ -290,13 +295,15 @@ fn granting_the_real_home_still_opts_out() {
     );
 }
 
-/// The sweep removes only the staging directory named for the run's own pid.
+/// A leftover of a run that is gone is healed, and one that is still alive is
+/// left alone.
 ///
-/// A directory left by a run of another identity, or planted by any user, is
-/// neither matched nor touched: the shared temp directory cannot tell whose a
-/// leftover is, so nothing that is not ours by name is removed.
+/// A leftover is matched by the pid its name carries, so the sweep can tell a
+/// dead run's from a live one's. The plant and the run's sweep both look in
+/// this private temp directory, so a concurrent bailey elsewhere cannot reach
+/// either.
 #[test]
-fn a_staging_directory_of_another_run_is_left_alone() {
+fn a_dead_runs_staging_is_swept_and_a_live_one_is_not() {
     if !isolation_active() {
         eprintln!("skipping: isolation unavailable on this host");
         return;
@@ -304,18 +311,30 @@ fn a_staging_directory_of_another_run_is_left_alone() {
 
     let dir = tempfile::tempdir().unwrap();
 
-    // A process id that has certainly finished, standing in for a directory
-    // some other run left behind. The plant and the run's sweep both look in
-    // this private temp directory, so a concurrent bailey elsewhere cannot
-    // reach either.
+    // A process id that has certainly finished, standing in for a run that was
+    // interrupted before its guard could run.
+    let finished = Command::new("/bin/true").output().unwrap();
+    assert!(finished.status.success());
     let owner = Command::new("/bin/sh")
         .args(["-c", "echo $$"])
         .env("TMPDIR", dir.path())
         .output()
         .unwrap();
     let owner = String::from_utf8_lossy(&owner.stdout).trim().to_owned();
-    let stale = dir.path().join(format!(".bailey-root.{owner}"));
+    if Path::new(&format!("/proc/{owner}")).exists() {
+        eprintln!("skipping: pid {owner} was reused");
+        return;
+    }
+    let stale = dir
+        .path()
+        .join(format!(".bailey-root.{owner}.deadbeefdeadbeef"));
     fs::create_dir(&stale).unwrap();
+
+    // A run whose pid is alive, standing in for a concurrent one.
+    let live = dir
+        .path()
+        .join(format!(".bailey-root.{}.cafe", std::process::id()));
+    fs::create_dir(&live).unwrap();
 
     let output = Command::new(bailey())
         .args(["run", "/bin/true"])
@@ -325,12 +344,14 @@ fn a_staging_directory_of_another_run_is_left_alone() {
         .unwrap();
     assert!(output.status.success());
 
-    let untouched = stale.is_dir();
-    let _ = fs::remove_dir(&stale);
+    let swept = !stale.exists();
+    let kept = live.is_dir();
+    let _ = fs::remove_dir_all(&live);
     assert!(
-        untouched,
-        "a run must leave staging directories it does not own alone"
+        swept,
+        "a dead run's leftover must be healed, not left to accumulate"
     );
+    assert!(kept, "a live run's staging must be left alone");
 }
 
 #[test]

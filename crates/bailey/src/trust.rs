@@ -305,6 +305,18 @@ impl Store {
             }
             return Err(message);
         }
+        if let Some(exposure) = exposed_parents(&path) {
+            let mut message = format!(
+                "refusing to trust `{}`: {}, so its contents could change after \
+                 you accepted them",
+                path.display(),
+                exposure.reason()
+            );
+            if let Some(remedy) = exposure.remedy(&path) {
+                message.push_str(&format!("; {remedy}"));
+            }
+            return Err(message);
+        }
         let digest = digest(&path).map_err(|err| err.to_string())?;
         self.entries.insert(path.clone(), digest);
         Ok(path)
@@ -350,28 +362,32 @@ pub fn store_path() -> Option<PathBuf> {
         .map(|home| home.join(".local/share/bailey").join(STORE_NAME))
 }
 
-/// Whether `path` can be changed by someone other than the running user.
+/// Whether `path` or any directory holding it can be changed by someone other
+/// than the running user.
 ///
 /// The same question `trust` asks of a discovered config, asked of files that
 /// need no trust record: a profile and the global config are the user's own, but
 /// "in your config directory" is a claim about provenance, not about who can
 /// write there now.
 pub fn exposure_of(path: &Path) -> Option<Rejected> {
-    match fs::metadata(path) {
-        Ok(meta) => exposure(&meta),
-        Err(err) => Some(Rejected::Unreadable(err.to_string())),
-    }
+    let meta = match fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(err) => return Some(Rejected::Unreadable(err.to_string())),
+    };
+    exposure(&meta).or_else(|| exposed_parents(path))
 }
 
 /// Report how a file can be changed by someone other than the running user.
 /// Whether any directory holding `path` can be written by someone else.
 ///
 /// The parent chain is resolved through symlinks before the walk, so every
-/// directory is judged by the metadata of the one that actually holds the
-/// next component, and a rejection names that real directory. Walked upwards
-/// to the root. A sticky directory is not counted: `/tmp` is world-writable by
-/// design, and the sticky bit is what stops one user replacing another's
-/// entry there.
+/// directory in the resolved chain is judged by the metadata of the one that
+/// actually holds the next component, and a rejection names that real
+/// directory. The chain as typed is not walked as well: the kernel traverses
+/// both halves, and the half that holds a symlink is left unjudged, which is a
+/// gap this walk shares with the one it replaced. Walked upwards to the root.
+/// A sticky directory is not counted: `/tmp` is world-writable by design, and
+/// the sticky bit is what stops one user replacing another's entry there.
 fn exposed_parents(path: &Path) -> Option<Rejected> {
     let parent = path.parent()?;
     let Ok(resolved) = fs::canonicalize(parent) else {
@@ -728,12 +744,15 @@ mod tests {
 
         // The same file through a link to `inner`: the walk must judge the
         // resolved chain, where `elsewhere` is group-writable, and not stop at
-        // the destination of the first component.
+        // the destination of the first component. Trust is recorded while the
+        // chain is private, and the directory is exposed afterwards.
         let link = dir.path().join("link");
         std::os::unix::fs::symlink(&inner, &link).unwrap();
         let through = link.join("bailey.toml");
+        fs::set_permissions(&elsewhere, fs::Permissions::from_mode(0o700)).unwrap();
         let mut store = Store::default();
         store.record(&through).unwrap();
+        fs::set_permissions(&elsewhere, fs::Permissions::from_mode(0o770)).unwrap();
         let rejected = store
             .check(&through)
             .expect("the real parent of the config is group-writable");
@@ -742,5 +761,61 @@ mod tests {
         };
         assert_eq!(named, resolved, "the refusal names the resolved directory");
         assert!(who.starts_with("group "), "{who}");
+    }
+
+    #[test]
+    fn a_record_refuses_a_directory_the_next_run_would_refuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join("held");
+        fs::create_dir(&held).unwrap();
+        let path = config(&held, "[filesystem]\nread = [\"/a\"]\n");
+        fs::set_permissions(&held, fs::Permissions::from_mode(0o770)).unwrap();
+        let resolved = fs::canonicalize(&held).unwrap().display().to_string();
+
+        let mut store = Store::default();
+        let err = store.record(&path).expect_err("a group-writable parent");
+        assert!(
+            err.contains(&resolved),
+            "the refusal names the directory: {err}"
+        );
+        assert!(err.contains("chmod go-w"), "the fix is named: {err}");
+        assert!(!store.entries.contains_key(&path), "nothing was recorded");
+
+        // The same file behind a private directory is recorded, and the next
+        // run applies it.
+        fs::set_permissions(&held, fs::Permissions::from_mode(0o700)).unwrap();
+        store.record(&path).unwrap();
+        assert_eq!(store.check(&path), None);
+
+        // A file that is itself exposed is reported for itself, even when its
+        // directory is exposed too.
+        fs::set_permissions(&held, fs::Permissions::from_mode(0o770)).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+        let err = store.record(&path).expect_err("a world-writable config");
+        assert!(err.contains("it is writable by any user"), "{err}");
+    }
+
+    #[test]
+    fn an_exposure_of_reports_the_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join("held");
+        fs::create_dir(&held).unwrap();
+        let path = config(&held, "[filesystem]\nread = [\"/a\"]\n");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&held, fs::Permissions::from_mode(0o770)).unwrap();
+
+        let rejected = exposure_of(&path).expect("the parent is group-writable");
+        let Rejected::WritableParent { dir: named, who } = rejected else {
+            panic!("expected a writable parent, got {rejected:?}");
+        };
+        assert_eq!(
+            named,
+            fs::canonicalize(&held).unwrap().display().to_string(),
+            "the refusal names the resolved directory"
+        );
+        assert!(who.starts_with("group "), "{who}");
+
+        fs::set_permissions(&held, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(exposure_of(&path), None, "a private chain is no exposure");
     }
 }

@@ -126,22 +126,25 @@ pub fn runnable_as_caller(meta: &std::fs::Metadata) -> bool {
     owner_ok && meta.permissions().mode() & 0o022 == 0
 }
 
-/// The controllers a run could be given limits through: those carried by the
-/// cgroup named in `BAILEY_CGROUP_ROOT`, or, without it, by the delegated
-/// subtree the run's own search would pick. Empty when no cgroup can host a
-/// run.
+/// The controllers a run could be given limits through.
+///
+/// Asked exactly the way the run asks it, per controller, because a host that
+/// delegates one controller serves a policy that needs only that one. Without
+/// `BAILEY_CGROUP_ROOT` each controller is searched for independently, so the
+/// answer is the set a run asking for all three would actually get; with it,
+/// the named root is asked what it would carry.
 fn cgroup_delegated() -> Vec<&'static str> {
-    let base = std::env::var_os(cgroup::ROOT_OVERRIDE)
-        .map(PathBuf::from)
-        .or_else(|| cgroup::usable_root(&["memory"]));
-    let Some(base) = base else {
-        return Vec::new();
-    };
-    ["memory", "pids", "cpu"]
+    if let Some(base) = std::env::var_os(cgroup::ROOT_OVERRIDE).map(PathBuf::from) {
+        return cgroup::carries_all(&base, &CONTROLLERS);
+    }
+    CONTROLLERS
         .into_iter()
-        .filter(|controller| base.join(cgroup::control_file(controller)).exists())
+        .filter(|controller| cgroup::usable_root(&[controller]).is_some())
         .collect()
 }
+
+/// The controllers a run may be given limits through.
+const CONTROLLERS: [&str; 3] = ["memory", "pids", "cpu"];
 
 /// Start the audit helper and see whether it can load its programs.
 fn helper_status() -> HelperStatus {
@@ -243,47 +246,14 @@ mod tests {
         assert!(with(Some(6)).landlock_scope());
     }
 
-    /// A named root answers for the controllers it actually carries, so a
-    /// subtree delegating a subset reports the subset and one carrying every
-    /// controller answers with the set a policy asking for every limit needs.
+    /// A named root answers for the controllers a child of it would carry.
+    ///
     /// The tree is temporary: the host's own cgroup hierarchy is never touched.
+    /// A root that does not exist answers nothing, which is one of the two ways
+    /// the probe used to claim a controller the run would then refuse to use.
     #[test]
     fn a_named_root_answers_with_the_controllers_it_carries() {
         let _env = crate::test_support::env_lock();
-
-        let full = tempfile::tempdir().unwrap();
-        for file in ["cgroup.procs", "memory.max", "pids.max", "cpu.max"] {
-            std::fs::write(full.path().join(file), "").unwrap();
-        }
-        unsafe { std::env::set_var(cgroup::ROOT_OVERRIDE, full.path()) };
-        let all = cgroup_delegated();
-        unsafe { std::env::remove_var(cgroup::ROOT_OVERRIDE) };
-
-        let limits = crate::policy::ResourceLimits {
-            memory_bytes: Some(1),
-            pids_max: Some(2),
-            cpu_percent: Some(3),
-            ..crate::policy::ResourceLimits::default()
-        };
-        assert_eq!(
-            all,
-            cgroup::needed_controllers(&limits),
-            "a tree carrying every controller must answer with the set a policy \
-             setting every limit needs"
-        );
-
-        let memory_only = tempfile::tempdir().unwrap();
-        std::fs::write(memory_only.path().join("cgroup.procs"), "").unwrap();
-        std::fs::write(memory_only.path().join("memory.max"), "").unwrap();
-        unsafe { std::env::set_var(cgroup::ROOT_OVERRIDE, memory_only.path()) };
-        let subset = cgroup_delegated();
-        unsafe { std::env::remove_var(cgroup::ROOT_OVERRIDE) };
-        assert_eq!(
-            subset,
-            vec!["memory"],
-            "a tree carrying memory alone must answer memory, not nothing and \
-             not all three"
-        );
 
         unsafe { std::env::set_var(cgroup::ROOT_OVERRIDE, "/nonexistent/cgroup/root") };
         let missing = cgroup_delegated();
@@ -291,6 +261,39 @@ mod tests {
         assert!(
             missing.is_empty(),
             "a root that does not exist must answer nothing: {missing:?}"
+        );
+    }
+
+    /// The probe answers the question the run asks, so it may never claim a
+    /// controller a run could not actually use.
+    ///
+    /// A plain directory holding the controller filenames carries them because
+    /// something delegated them to *it*, which says nothing about what it may
+    /// hand to a child. The run asks by creating a child and looking there, so
+    /// a directory that is not a cgroup at all must answer nothing rather than
+    /// advertise every controller.
+    #[test]
+    fn the_probe_never_claims_a_controller_the_run_cannot_use() {
+        let _env = crate::test_support::env_lock();
+
+        let not_a_cgroup = tempfile::tempdir().unwrap();
+        for file in ["cgroup.procs", "memory.max", "pids.max", "cpu.max"] {
+            std::fs::write(not_a_cgroup.path().join(file), "").unwrap();
+        }
+        unsafe { std::env::set_var(cgroup::ROOT_OVERRIDE, not_a_cgroup.path()) };
+
+        let claimed = cgroup_delegated();
+        // The same question, asked the way `try_create_cgroup` asks it.
+        let usable = cgroup::usable_root(&["memory", "pids", "cpu"]).is_some();
+        unsafe { std::env::remove_var(cgroup::ROOT_OVERRIDE) };
+
+        assert!(
+            claimed.is_empty(),
+            "a directory that cannot host a run must answer nothing: {claimed:?}"
+        );
+        assert!(
+            !usable,
+            "and the run's own search must refuse it too, or the two disagree"
         );
     }
 }
