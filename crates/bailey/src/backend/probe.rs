@@ -8,6 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use crate::backend::cgroup;
 use crate::backend::isolation;
 
 /// `landlock_create_ruleset`, which reports the supported ABI when asked for the
@@ -46,8 +47,9 @@ pub struct Capabilities {
     pub unprivileged_userns: bool,
     /// Whether kernel BTF is available, which the audit programs need.
     pub btf: bool,
-    /// Whether a cgroup can be created for a run, which resource limits need.
-    pub cgroup_delegated: bool,
+    /// The controllers a cgroup for a run would carry, which resource limits
+    /// need. Empty when no cgroup can host a run.
+    pub cgroup_delegated: Vec<&'static str>,
     /// Whether the audit helper is present and permitted.
     pub helper: HelperStatus,
 }
@@ -124,10 +126,21 @@ pub fn runnable_as_caller(meta: &std::fs::Metadata) -> bool {
     owner_ok && meta.permissions().mode() & 0o022 == 0
 }
 
-/// Whether a run could be given resource limits: a cgroup this user may create
-/// runs in, whose children receive the controller files.
-fn cgroup_delegated() -> bool {
-    crate::backend::cgroup::usable_root(&["memory", "pids", "cpu"]).is_some()
+/// The controllers a run could be given limits through: those carried by the
+/// cgroup named in `BAILEY_CGROUP_ROOT`, or, without it, by the delegated
+/// subtree the run's own search would pick. Empty when no cgroup can host a
+/// run.
+fn cgroup_delegated() -> Vec<&'static str> {
+    let base = std::env::var_os(cgroup::ROOT_OVERRIDE)
+        .map(PathBuf::from)
+        .or_else(|| cgroup::usable_root(&["memory"]));
+    let Some(base) = base else {
+        return Vec::new();
+    };
+    ["memory", "pids", "cpu"]
+        .into_iter()
+        .filter(|controller| base.join(cgroup::control_file(controller)).exists())
+        .collect()
 }
 
 /// Start the audit helper and see whether it can load its programs.
@@ -219,7 +232,7 @@ mod tests {
             landlock_abi: abi,
             unprivileged_userns: false,
             btf: false,
-            cgroup_delegated: false,
+            cgroup_delegated: Vec::new(),
             helper: HelperStatus::Missing,
         };
 
@@ -228,5 +241,56 @@ mod tests {
         assert!(with(Some(4)).landlock_network());
         assert!(!with(Some(5)).landlock_scope());
         assert!(with(Some(6)).landlock_scope());
+    }
+
+    /// A named root answers for the controllers it actually carries, so a
+    /// subtree delegating a subset reports the subset and one carrying every
+    /// controller answers with the set a policy asking for every limit needs.
+    /// The tree is temporary: the host's own cgroup hierarchy is never touched.
+    #[test]
+    fn a_named_root_answers_with_the_controllers_it_carries() {
+        let _env = crate::test_support::env_lock();
+
+        let full = tempfile::tempdir().unwrap();
+        for file in ["cgroup.procs", "memory.max", "pids.max", "cpu.max"] {
+            std::fs::write(full.path().join(file), "").unwrap();
+        }
+        unsafe { std::env::set_var(cgroup::ROOT_OVERRIDE, full.path()) };
+        let all = cgroup_delegated();
+        unsafe { std::env::remove_var(cgroup::ROOT_OVERRIDE) };
+
+        let limits = crate::policy::ResourceLimits {
+            memory_bytes: Some(1),
+            pids_max: Some(2),
+            cpu_percent: Some(3),
+            ..crate::policy::ResourceLimits::default()
+        };
+        assert_eq!(
+            all,
+            cgroup::needed_controllers(&limits),
+            "a tree carrying every controller must answer with the set a policy \
+             setting every limit needs"
+        );
+
+        let memory_only = tempfile::tempdir().unwrap();
+        std::fs::write(memory_only.path().join("cgroup.procs"), "").unwrap();
+        std::fs::write(memory_only.path().join("memory.max"), "").unwrap();
+        unsafe { std::env::set_var(cgroup::ROOT_OVERRIDE, memory_only.path()) };
+        let subset = cgroup_delegated();
+        unsafe { std::env::remove_var(cgroup::ROOT_OVERRIDE) };
+        assert_eq!(
+            subset,
+            vec!["memory"],
+            "a tree carrying memory alone must answer memory, not nothing and \
+             not all three"
+        );
+
+        unsafe { std::env::set_var(cgroup::ROOT_OVERRIDE, "/nonexistent/cgroup/root") };
+        let missing = cgroup_delegated();
+        unsafe { std::env::remove_var(cgroup::ROOT_OVERRIDE) };
+        assert!(
+            missing.is_empty(),
+            "a root that does not exist must answer nothing: {missing:?}"
+        );
     }
 }
