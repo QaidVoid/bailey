@@ -124,8 +124,8 @@ pub struct IsolationPlan {
     pub runtime_dir: Option<PathBuf>,
     /// Directory to start the target in, once the new root is in place.
     pub cwd: PathBuf,
-    /// Host directory the new root is staged in, removed by the parent after the
-    /// run.
+    /// Host directory the new root is staged in, created exclusively by the
+    /// parent before the run and removed by it after.
     pub staging: PathBuf,
 }
 
@@ -321,10 +321,16 @@ fn setup_root(plan: &IsolationPlan) -> io::Result<()> {
     )
     .map_err(errno)?;
 
-    // Staged at a path the parent chose, since the PID here is 1 in the new
+    // Created exclusively by the parent before the run, so the mountpoint is
+    // the one the parent's guard removes: the PID here is 1 in the new
     // namespace and would collide between concurrent runs.
     let new_root = plan.staging.clone();
-    fs::create_dir_all(&new_root)?;
+    if !new_root.is_dir() {
+        return Err(io::Error::other(format!(
+            "the staging directory `{}` is missing",
+            new_root.display()
+        )));
+    }
     mount(
         Some("tmpfs"),
         &new_root,

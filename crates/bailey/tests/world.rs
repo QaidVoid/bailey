@@ -290,42 +290,46 @@ fn granting_the_real_home_still_opts_out() {
     );
 }
 
-/// The guard cleans up on every path a run returns by, but a signal does not
-/// unwind: a Ctrl-C leaves the staging directory behind. The next run is what
-/// clears it.
+/// The sweep removes only the staging directory named for the run's own pid.
+///
+/// A directory left by a run of another identity, or planted by any user, is
+/// neither matched nor touched: the shared temp directory cannot tell whose a
+/// leftover is, so nothing that is not ours by name is removed.
 #[test]
-fn a_staging_directory_from_a_dead_run_is_swept() {
+fn a_staging_directory_of_another_run_is_left_alone() {
     if !isolation_active() {
         eprintln!("skipping: isolation unavailable on this host");
         return;
     }
 
-    // A process id that has certainly finished, standing in for a run that was
-    // interrupted before its guard could run.
-    let finished = Command::new("/bin/true").output().unwrap();
-    assert!(finished.status.success());
+    let dir = tempfile::tempdir().unwrap();
+
+    // A process id that has certainly finished, standing in for a directory
+    // some other run left behind. The plant and the run's sweep both look in
+    // this private temp directory, so a concurrent bailey elsewhere cannot
+    // reach either.
     let owner = Command::new("/bin/sh")
         .args(["-c", "echo $$"])
+        .env("TMPDIR", dir.path())
         .output()
         .unwrap();
     let owner = String::from_utf8_lossy(&owner.stdout).trim().to_owned();
-    if Path::new(&format!("/proc/{owner}")).exists() {
-        eprintln!("skipping: pid {owner} was reused");
-        return;
-    }
-
-    let stale = PathBuf::from(format!("/tmp/.bailey-root.{owner}"));
+    let stale = dir.path().join(format!(".bailey-root.{owner}"));
     fs::create_dir(&stale).unwrap();
 
-    let dir = tempfile::tempdir().unwrap();
-    let output = run_in(dir.path(), &["run", "/bin/true"]);
+    let output = Command::new(bailey())
+        .args(["run", "/bin/true"])
+        .env("XDG_DATA_HOME", dir.path())
+        .env("TMPDIR", dir.path())
+        .output()
+        .unwrap();
     assert!(output.status.success());
 
-    let swept = !stale.exists();
+    let untouched = stale.is_dir();
     let _ = fs::remove_dir(&stale);
     assert!(
-        swept,
-        "a run must remove staging directories whose owner is gone"
+        untouched,
+        "a run must leave staging directories it does not own alone"
     );
 }
 
