@@ -1103,9 +1103,10 @@ fn random_suffix() -> String {
 /// interrupted run.
 ///
 /// A leftover is identified by the pid its name carries, and removed only when
-/// that pid is gone and the entry is this user's own directory. A run still
-/// alive may well be a concurrent one, and another user's staging is not ours
-/// to remove, so neither is touched.
+/// that pid is gone, the entry is this user's own directory, and the directory
+/// is empty. A run still alive may well be a concurrent one, another user's
+/// staging is not ours to remove, and a directory with contents was filled by
+/// something else, so none of the three is touched.
 ///
 /// Both places a run may stage are swept, because a run that staged under the
 /// session runtime directory leaves a directory the temp directory never sees.
@@ -1135,10 +1136,11 @@ fn sweep_staging(dir: &Path) {
         let Some(rest) = name.strip_prefix(STAGING_PREFIX) else {
             continue;
         };
-        // The name is `<pid>.<suffix>`; anything else is not ours to interpret.
-        let Some((pid, _)) = rest.split_once('.') else {
-            continue;
-        };
+        // The name is `<pid>.<suffix>`. A bare pid is the shape the staging
+        // directory had before the suffix existed, so a leftover written by an
+        // older bailey is recognized too. Anything else is not ours to
+        // interpret.
+        let (pid, _) = rest.split_once('.').unwrap_or((rest, ""));
         if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
             continue;
         }
@@ -1148,15 +1150,20 @@ fn sweep_staging(dir: &Path) {
             continue;
         }
         // Another user's leftovers are not ours to remove, and saying so would
-        // be noise on every run. The entry is a directory we own, so the
-        // removal cannot reach past it.
+        // be noise on every run. The entry must also be a directory we own.
         let Ok(meta) = entry.metadata() else {
             continue;
         };
         if !meta.is_dir() || meta.uid() != me {
             continue;
         }
-        let _ = std::fs::remove_dir_all(entry.path());
+        // A staging directory is empty on the host by construction: the tmpfs
+        // is mounted over it inside the target's own mount namespace, so
+        // nothing a run does ever lands in it. Emptiness is what identifies
+        // one, so a directory that is not empty was filled by something else
+        // and is not ours however its name is spelled. `remove_dir` refusing a
+        // non-empty directory is the whole guarantee.
+        let _ = std::fs::remove_dir(entry.path());
     }
 }
 
@@ -2538,8 +2545,10 @@ mod tests {
     /// The sweep heals a leftover and touches nothing it cannot prove is ours.
     ///
     /// A leftover is matched by the pid its name carries, and removed only when
-    /// that pid is gone and the entry is a directory this user owns. A run
-    /// still alive may be a concurrent one, so its staging stays.
+    /// that pid is gone, the entry is a directory this user owns, and the
+    /// directory is empty. A run still alive may be a concurrent one, so its
+    /// staging stays. A bare pid is the shape an older bailey wrote, so a
+    /// leftover of that shape heals too.
     #[test]
     fn the_sweep_heals_a_leftover_and_leaves_the_rest_alone() {
         let dir = tempfile::tempdir().unwrap();
@@ -2549,6 +2558,9 @@ mod tests {
             .path()
             .join(format!("{STAGING_PREFIX}987654321.deadbeefdeadbeef"));
         std::fs::create_dir_all(&healed).unwrap();
+        // The shape a staging directory had before the suffix existed.
+        let old = dir.path().join(format!("{STAGING_PREFIX}987654320"));
+        std::fs::create_dir_all(&old).unwrap();
         // A live run's staging, which may well be a concurrent one.
         let live = dir
             .path()
@@ -2562,6 +2574,7 @@ mod tests {
         sweep_staging(dir.path());
 
         assert!(!healed.exists(), "a dead run's leftover is healed");
+        assert!(!old.exists(), "a leftover of the old name shape is healed");
         assert!(live.is_dir(), "a live run's staging is left alone");
         assert!(
             unparsed.join("decoy").is_file(),
@@ -2570,6 +2583,52 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&live);
         let _ = std::fs::remove_dir_all(&unparsed);
+    }
+
+    /// A directory with contents is not a staging leftover however its name is
+    /// spelled.
+    ///
+    /// A staging directory is empty on the host by construction: the tmpfs is
+    /// mounted over it inside the target's own mount namespace, so nothing a
+    /// run does ever lands in it. Emptiness is what identifies one, so files
+    /// under a staging-shaped name were put there by something else and are
+    /// not ours to remove. `remove_dir` refusing a non-empty directory is the
+    /// guarantee, the same one the sweep before the pid carried in its name
+    /// relied on.
+    #[test]
+    fn a_leftover_with_contents_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // The shape the current run makes, filled in.
+        let current = dir
+            .path()
+            .join(format!("{STAGING_PREFIX}987654321.feedface"));
+        std::fs::create_dir_all(current.join("nested")).unwrap();
+        std::fs::write(current.join("kept"), "not a staging directory").unwrap();
+        std::fs::write(
+            current.join("nested").join("kept"),
+            "not a staging directory",
+        )
+        .unwrap();
+        // The shape an older bailey made, also filled in.
+        let old = dir.path().join(format!("{STAGING_PREFIX}987654320"));
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("kept"), "not a staging directory").unwrap();
+
+        sweep_staging(dir.path());
+
+        assert!(
+            current.join("kept").is_file(),
+            "a filled directory is not swept"
+        );
+        assert!(
+            current.join("nested").join("kept").is_file(),
+            "the sweep does not recurse"
+        );
+        assert!(
+            old.join("kept").is_file(),
+            "a filled old-shape directory is not swept"
+        );
     }
 
     /// A session runtime directory that is not this user's own is refused, even
