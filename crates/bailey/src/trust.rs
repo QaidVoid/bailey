@@ -366,12 +366,19 @@ pub fn exposure_of(path: &Path) -> Option<Rejected> {
 /// Report how a file can be changed by someone other than the running user.
 /// Whether any directory holding `path` can be written by someone else.
 ///
-/// Walked upwards to the root. A sticky directory is not counted: `/tmp` is
-/// world-writable by design, and the sticky bit is what stops one user
-/// replacing another's entry there.
+/// The parent chain is resolved through symlinks before the walk, so every
+/// directory is judged by the metadata of the one that actually holds the
+/// next component, and a rejection names that real directory. Walked upwards
+/// to the root. A sticky directory is not counted: `/tmp` is world-writable by
+/// design, and the sticky bit is what stops one user replacing another's
+/// entry there.
 fn exposed_parents(path: &Path) -> Option<Rejected> {
+    let parent = path.parent()?;
+    let Ok(resolved) = fs::canonicalize(parent) else {
+        return None;
+    };
     let me = unsafe { libc::geteuid() };
-    let mut current = path.parent();
+    let mut current = Some(resolved.as_path());
     while let Some(dir) = current {
         let Ok(meta) = fs::metadata(dir) else {
             return None;
@@ -697,5 +704,43 @@ mod tests {
         let mode = fs::metadata(&parent).unwrap().mode() & 0o777;
         assert_eq!(mode, 0o700, "the directory is private: {mode:o}");
         assert_eq!(Store::load_from(&store_file).listing().len(), 1);
+    }
+
+    #[test]
+    fn a_config_reached_through_a_symlinked_parent_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        let inner = elsewhere.join("inner");
+        fs::create_dir_all(&inner).unwrap();
+        let path = config(&inner, "[filesystem]\nread = [\"/a\"]\n");
+        fs::set_permissions(&elsewhere, fs::Permissions::from_mode(0o770)).unwrap();
+        let resolved = fs::canonicalize(&elsewhere).unwrap().display().to_string();
+
+        // The direct spelling walks the real chain, and `elsewhere` is
+        // group-writable.
+        let rejected = Store::default()
+            .check(&path)
+            .expect("the direct spelling has an exposed parent");
+        assert!(
+            matches!(rejected, Rejected::WritableParent { .. }),
+            "{rejected:?}"
+        );
+
+        // The same file through a link to `inner`: the walk must judge the
+        // resolved chain, where `elsewhere` is group-writable, and not stop at
+        // the destination of the first component.
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&inner, &link).unwrap();
+        let through = link.join("bailey.toml");
+        let mut store = Store::default();
+        store.record(&through).unwrap();
+        let rejected = store
+            .check(&through)
+            .expect("the real parent of the config is group-writable");
+        let Rejected::WritableParent { dir: named, who } = rejected else {
+            panic!("expected a writable parent, got {rejected:?}");
+        };
+        assert_eq!(named, resolved, "the refusal names the resolved directory");
+        assert!(who.starts_with("group "), "{who}");
     }
 }
