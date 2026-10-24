@@ -18,6 +18,7 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -57,6 +58,59 @@ const DEFAULT_TMP_BYTES: u64 = 64 * 1024 * 1024;
 /// buffers, so it is more generous than `/tmp`.
 const DEFAULT_SHM_BYTES: u64 = 256 * 1024 * 1024;
 
+/// How a run ended.
+///
+/// A code alone does not say whether the target failed or was killed, and a
+/// reader who has to act on it needs the difference: a bug to look for, or a
+/// kill to account for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Exit {
+    /// The exit code, counting a signal death as `128 + signal` the way a
+    /// shell does.
+    pub code: i32,
+    /// The signal the wait saw kill the target, when it saw one.
+    pub signal: Option<i32>,
+}
+
+impl Exit {
+    /// Read how a finished process ended.
+    pub fn of(status: std::process::ExitStatus) -> Self {
+        let signal = status.signal();
+        let code = status
+            .code()
+            .unwrap_or_else(|| signal.map_or(-1, |signal| 128 + signal));
+        Exit { code, signal }
+    }
+
+    /// The line the run reports, or none when the target ended cleanly.
+    ///
+    /// A signal the wait saw is a fact, and is reported as one. A code above
+    /// 128 is not: the isolated path reaps the target inside its own PID
+    /// namespace and exits with `128 + signal` itself, so the parent sees an
+    /// ordinary exit and cannot tell that from a target that chose the same
+    /// code. Saying which of the two it has keeps the summary from claiming
+    /// more than it knows.
+    fn said(&self) -> Option<String> {
+        match (self.code, self.signal) {
+            (0, None) => None,
+            (_, Some(signal)) => Some(format!("bailey: target killed by {}", signal_name(signal))),
+            (code, None) if code > 128 => Some(format!(
+                "bailey: target exited with {code}, the shell code for {}",
+                signal_name(code - 128)
+            )),
+            (code, None) => Some(format!("bailey: target exited with {code}")),
+        }
+    }
+}
+
+/// A signal by the name and number a reader knows it by.
+fn signal_name(signal: i32) -> String {
+    match nix::sys::signal::Signal::try_from(signal) {
+        Ok(named) => format!("{} ({signal})", named.as_str()),
+        Err(_) => format!("signal {signal}"),
+    }
+}
+
 /// What a run actually enforced.
 ///
 /// Every layer can be absent or partial on a given host, and each one degrades
@@ -92,15 +146,15 @@ impl RunReport {
     }
 
     /// Print the summary for a person.
-    pub fn print(&self, exit_code: i32) {
+    pub fn print(&self, exit: Exit) {
         self.print_established();
-        if exit_code != 0 {
-            eprintln!("bailey: target exited with {exit_code}");
+        if let Some(line) = exit.said() {
+            eprintln!("{line}");
         }
     }
 
     /// Render the summary as JSON, for a caller that is not a person.
-    pub fn to_json(&self, exit_code: i32) -> String {
+    pub fn to_json(&self, exit: Exit) -> String {
         let applied: Vec<String> = self.applied.iter().map(|l| json_string(l)).collect();
         let skipped: Vec<String> = self
             .skipped
@@ -113,11 +167,14 @@ impl RunReport {
                 )
             })
             .collect();
+        let signal = exit
+            .signal
+            .map_or_else(|| "null".to_owned(), |signal| signal.to_string());
         format!(
-            "{{\"applied\":[{}],\"skipped\":[{}],\"exit_code\":{}}}",
+            "{{\"applied\":[{}],\"skipped\":[{}],\"exit_code\":{},\"signal\":{signal}}}",
             applied.join(","),
             skipped.join(","),
-            exit_code
+            exit.code
         )
     }
 }
@@ -795,14 +852,14 @@ impl Confined {
         // The forwarded listeners live on the relay thread, which ends with
         // the process; the sandbox's loopback stops existing with the last
         // holder of the namespace.
-        let code = status.code().unwrap_or(-1);
+        let exit = Exit::of(status);
         match self.summary {
-            Summary::Text => self.report.print(code),
-            Summary::Json => println!("{}", self.report.to_json(code)),
+            Summary::Text => self.report.print(exit),
+            Summary::Json => println!("{}", self.report.to_json(exit)),
             // Already printed, before the target ever ran.
             Summary::Established | Summary::Quiet => {}
         }
-        Ok(code)
+        Ok(exit.code)
     }
 }
 
@@ -2961,5 +3018,53 @@ mod arch_guard_tests {
             unsafe { libc::_exit(if pid > 0 { 0 } else { 1 }) };
         });
         assert_eq!(code, 0, "a native, undenied syscall must still run");
+    }
+
+    /// A number on its own does not say whether the target failed or was
+    /// killed. The wait saw this one die, so the summary says so.
+    #[test]
+    fn a_signal_the_wait_saw_is_named_in_the_summary() {
+        let killed = Exit::of(std::process::ExitStatus::from_raw(libc::SIGTERM));
+        assert_eq!(killed.code, 128 + libc::SIGTERM);
+        assert_eq!(killed.signal, Some(libc::SIGTERM));
+        let said = killed.said().expect("a killed target is reported");
+        assert!(said.contains("killed by SIGTERM (15)"), "{said}");
+    }
+
+    /// The isolated path reaps the target inside its own PID namespace and
+    /// exits with `128 + signal` itself, so the parent sees an ordinary exit
+    /// code. That code is named for what it means, not claimed as a signal
+    /// the parent saw.
+    #[test]
+    fn a_code_above_128_is_named_as_the_shell_code_it_is() {
+        let reaped = Exit::of(std::process::ExitStatus::from_raw(143 << 8));
+        assert_eq!(reaped.signal, None);
+        let said = reaped.said().expect("a failure is reported");
+        assert!(said.contains("exited with 143"), "{said}");
+        assert!(said.contains("SIGTERM"), "{said}");
+    }
+
+    #[test]
+    fn an_ordinary_exit_says_its_code_and_a_clean_one_says_nothing() {
+        let failed = Exit::of(std::process::ExitStatus::from_raw(3 << 8));
+        assert_eq!((failed.code, failed.signal), (3, None));
+        let said = failed.said().expect("a failure is reported");
+        assert!(said.contains("exited with 3"), "{said}");
+
+        let clean = Exit::of(std::process::ExitStatus::from_raw(0));
+        assert_eq!(clean.said(), None);
+    }
+
+    /// A caller parsing the JSON has to be able to tell the two apart too.
+    #[test]
+    fn the_json_carries_the_signal_beside_the_code() {
+        let report = RunReport::default();
+        let killed = report.to_json(Exit::of(std::process::ExitStatus::from_raw(libc::SIGTERM)));
+        assert!(killed.contains("\"exit_code\":143"), "{killed}");
+        assert!(killed.contains("\"signal\":15"), "{killed}");
+
+        let exited = report.to_json(Exit::of(std::process::ExitStatus::from_raw(3 << 8)));
+        assert!(exited.contains("\"exit_code\":3"), "{exited}");
+        assert!(exited.contains("\"signal\":null"), "{exited}");
     }
 }
