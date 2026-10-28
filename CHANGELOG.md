@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.5](https://github.com/QaidVoid/bailey/compare/v0.2.4...v0.2.5) - 2026-10-28
+
+### 🐛 Bug Fixes
+
+- *(enforce)* Name the signal that killed the target - ([98d74a6](https://github.com/QaidVoid/bailey/commit/98d74a6b14a57c5280c76ae5b0366d4d27fd01df))
+
 ## [0.2.4](https://github.com/QaidVoid/bailey/compare/v0.2.3...v0.2.4) - 2026-10-12
 
 ### ⛰️  Features
