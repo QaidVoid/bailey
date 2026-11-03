@@ -14,14 +14,14 @@ use clap::{Parser, Subcommand};
 use crate::backend::probe;
 use crate::backend::world::{self, World};
 use crate::backend::{
-    Backend, Target, audit::AuditBackend, enforce::EnforceBackend, enforce::Summary, isolation,
-    network,
+    Backend, Target, audit::AuditBackend, enforce::EnforceBackend, enforce::Summary, forward,
+    isolation, network,
 };
 use crate::config::{self, Resolved};
 use crate::event::Trace;
 use crate::hook::{self, Shell};
 use crate::hooks::{self, Hooks};
-use crate::policy::Access;
+use crate::policy::{Access, Egress, Policy, PortForward};
 use crate::profiles;
 use crate::reconcile::{self, Finding, Risk};
 use crate::trust;
@@ -217,10 +217,19 @@ struct RunArgs {
     /// Print what the run enforced as JSON.
     #[arg(long)]
     json: bool,
+    #[command(flatten)]
+    network: NetworkArgs,
+    /// The target executable, followed by its own arguments.
+    #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
+    command: Vec<String>,
+}
+
+#[derive(Debug, clap::Args)]
+struct NetworkArgs {
     /// Route egress through a private network namespace, so the session sees a
     /// synthetic address and MAC rather than the host's. Needs pasta and user
     /// namespaces; without them the run continues and says the host stays
-    /// visible.
+    /// visible. With configured forwards, missing prerequisites refuse the run.
     #[arg(long, conflicts_with = "no_proxy_net")]
     proxy_net: bool,
     /// Never use a private network namespace, even where one was available.
@@ -235,9 +244,11 @@ struct RunArgs {
     /// to open egress. `nft` must be present.
     #[arg(long, value_name = "ADDR:PORT", conflicts_with = "no_proxy_net")]
     egress_proxy: Option<String>,
-    /// The target executable, followed by its own arguments.
-    #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
-    command: Vec<String>,
+    /// Publish this sandbox TCP port on host loopback, so a service bound
+    /// inside the sandbox is reachable at `127.0.0.1:<PORT>` on the host.
+    /// Repeatable. Needs `--proxy-net` and namespace isolation.
+    #[arg(long = "publish-port", value_name = "PORT")]
+    publish_port: Vec<u16>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -258,6 +269,8 @@ struct ShellArgs {
     /// Run without namespace isolation, leaving only Landlock and seccomp.
     #[arg(long)]
     no_isolate: bool,
+    #[command(flatten)]
+    network: NetworkArgs,
 }
 
 #[derive(Debug, clap::Args)]
@@ -581,20 +594,8 @@ fn parse_egress_proxy(value: &str) -> anyhow::Result<(std::net::Ipv4Addr, u16)> 
     Ok((addr, port))
 }
 
-/// Locks the current network namespace to the egress broker at `addr:port`.
-///
-/// A default-drop output chain admits loopback, the one broker destination, and
-/// the return traffic of connections already allowed. Everything else, every
-/// other host, every other port, and all of IPv6, is dropped, so the session
-/// reaches the broker and nothing else. The process holds CAP_NET_ADMIN over
-/// its own namespace, which is what lets an unprivileged run install this.
-///
-/// Fail-closed: any error installing the rule is returned, and the caller
-/// refuses the run rather than proceed with open egress. A proxy that is asked
-/// for but not enforced is worse than none, because it is believed.
-/// Adds the broker port to a policy's egress allowance, so Landlock's port
-/// rule does not refuse the connection the netfilter rule already bounds.
-fn permit_broker_port(policy: &mut crate::policy::Policy, port: u16) {
+/// Permit a local endpoint's TCP port after netfilter bounds its destination.
+fn permit_egress_port(policy: &mut crate::policy::Policy, port: u16) {
     use crate::policy::{Egress, EgressRule};
     let rule = EgressRule {
         host: "*".to_string(),
@@ -608,15 +609,7 @@ fn permit_broker_port(policy: &mut crate::policy::Policy, port: u16) {
     }
 }
 
-/// Whether this run left the namespace the wrapper said it was in.
-///
-/// This catches a mistake, not an attack, and it is worth being plain about
-/// which. The value is the caller's to write: passing the namespace this
-/// process is really in is refused, and passing any other well-formed one is
-/// not, so a caller who means to reach the host's tables still can. Knowing
-/// which namespace this is cannot be settled by looking from inside it; it has
-/// to come from having created it. See the note on issue #24.
-///
+/// Lock this run's own namespace to the broker, refusing setup on nft failure.
 fn lock_egress_to_broker(addr: std::net::Ipv4Addr, port: u16) -> anyhow::Result<()> {
     // A dedicated table, so it is this rule that is added and removed and never
     // another's. IPv6 has no accept rule, so the inet chain drops it entirely.
@@ -643,20 +636,136 @@ fn lock_egress_to_broker(addr: std::net::Ipv4Addr, port: u16) -> anyhow::Result<
     })
 }
 
-/// Drops the namespace's forwarded loopback, so a session cannot reach a host
-/// service on `127.0.0.0/8`. Best-effort, for the plain `--proxy-net` path
-/// where egress is otherwise open: a policy-accept chain with the loopback
-/// destinations dropped. Under an egress proxy the stricter lockdown already
-/// covers this, so it is not called there.
-fn drop_host_loopback() -> anyhow::Result<()> {
-    let ruleset = "table inet bailey_loopback {\n\
+/// Restrict loopback to the explicitly forwarded and published TCP ports.
+fn proxy_loopback_ruleset(forwards: &[PortForward], publishes: &[u16], egress: &Egress) -> String {
+    let mut ruleset = String::from(
+        "table inet bailey_loopback {\n\
          \tchain output {\n\
-         \t\ttype filter hook output priority 0; policy accept;\n\
-         \t\tip daddr 127.0.0.0/8 drop\n\
-         \t\tip6 daddr ::1 drop\n\
-         \t}\n\
-         }\n";
-    run_nft(ruleset)
+         \t\ttype filter hook output priority 0; policy accept;\n",
+    );
+    if !forwards.is_empty() || !publishes.is_empty() {
+        ruleset.push_str("\t\tct state established accept\n");
+    }
+    for port in publishes {
+        // pasta's namespace-side socket dials the published loopback port.
+        ruleset.push_str(&format!("\t\tip daddr 127.0.0.1 tcp dport {port} accept\n"));
+    }
+    for forward in forwards {
+        ruleset.push_str(&format!(
+            "\t\tip daddr 127.0.0.1 tcp dport {} accept\n",
+            forward.port
+        ));
+    }
+    ruleset.push_str("\t\tip daddr 127.0.0.0/8 drop\n\t\tip6 daddr ::1 drop\n");
+    for forward in forwards {
+        let already_allowed = match egress {
+            Egress::AllowAll => true,
+            Egress::DenyAll => false,
+            Egress::Allow(rules) => rules
+                .iter()
+                .any(|rule| rule.port == Some(0) || rule.port == Some(forward.port)),
+        };
+        if already_allowed {
+            // pasta's listener must not also expose the host service through
+            // the namespace's non-loopback addresses.
+            ruleset.push_str(&format!(
+                "\t\tip daddr {PROXY_ADDRESS_V4} tcp dport {} drop\n\
+                 \t\tip6 daddr {PROXY_ADDRESS_V6} tcp dport {} drop\n",
+                forward.port, forward.port
+            ));
+        } else {
+            // Landlock permits connects by port, not address. Its added local
+            // port must not become a new remote egress allowance.
+            ruleset.push_str(&format!("\t\ttcp dport {} drop\n", forward.port));
+        }
+    }
+    ruleset.push_str("\t}\n}\n");
+    ruleset
+}
+
+/// Select forwards carried by pasta rather than the denied-egress backend.
+fn proxy_forwards(
+    policy: &Policy,
+    args: &NetworkArgs,
+    no_isolate: bool,
+) -> anyhow::Result<Vec<PortForward>> {
+    if policy.forwards.is_empty() {
+        return Ok(Vec::new());
+    }
+    if args.egress_proxy.is_some() {
+        anyhow::bail!(
+            "port forwards cannot be combined with --egress-proxy; the broker must remain the only egress"
+        );
+    }
+    if matches!(policy.network.egress, Egress::DenyAll) {
+        return Ok(Vec::new());
+    }
+    if !args.proxy_net || args.no_proxy_net {
+        anyhow::bail!("port forwards with allowed egress require --proxy-net");
+    }
+    if no_isolate {
+        anyhow::bail!("port forwards need namespace isolation; remove --no-isolate");
+    }
+    forward::validate(&policy.forwards, &policy.network.bind_ports).map_err(anyhow::Error::msg)
+}
+
+/// Select sandbox ports to publish on host loopback.
+fn proxy_publish_ports(
+    policy: &Policy,
+    args: &NetworkArgs,
+    no_isolate: bool,
+) -> anyhow::Result<Vec<u16>> {
+    let mut publishes: Vec<u16> = Vec::new();
+    for port in args
+        .publish_port
+        .iter()
+        .chain(policy.network.publish_ports.iter())
+    {
+        if *port == 0 {
+            anyhow::bail!("a published port must be a real port, not 0");
+        }
+        if !publishes.contains(port) {
+            publishes.push(*port);
+        }
+    }
+    if publishes.is_empty() {
+        return Ok(publishes);
+    }
+    if args.egress_proxy.is_some() {
+        anyhow::bail!(
+            "published ports cannot be combined with --egress-proxy; a brokered \
+             run has no route for the host to reach"
+        );
+    }
+    if matches!(policy.network.egress, Egress::DenyAll) {
+        anyhow::bail!(
+            "published ports need allowed egress; a denied network keeps the \
+             sandbox unreachable"
+        );
+    }
+    if !args.proxy_net || args.no_proxy_net {
+        anyhow::bail!("published ports require --proxy-net");
+    }
+    if no_isolate {
+        anyhow::bail!("published ports need namespace isolation; remove --no-isolate");
+    }
+    for forward in &policy.forwards {
+        if publishes.contains(&forward.port) {
+            anyhow::bail!(
+                "port {} is both forwarded and published; one sandbox port \
+                 cannot be an inbound forward and a published listener",
+                forward.port
+            );
+        }
+        if publishes.contains(&forward.host_port) {
+            anyhow::bail!(
+                "published port {} is the host side of a forward; the \
+                 publication listener would take the port the forward needs",
+                forward.host_port
+            );
+        }
+    }
+    Ok(publishes)
 }
 
 /// Feeds a ruleset to `nft -f -`, returning an error with nft's own message.
@@ -710,15 +819,9 @@ enum Wrapped {
 
 /// What pasta is asked for: a private network for egress, and nothing else.
 ///
-/// No port is forwarded in either direction. pasta defaults every forwarding
-/// option to `auto`, which mirrors each port bound on the host into the
-/// namespace and each port bound in the namespace back out to the host. The
-/// namespace serves nothing, so the outbound half buys nothing. The inbound
-/// half is worse than nothing: the mirrored sockets appear in the namespace's
-/// own `/proc/net` tables, which hands a confined program an inventory of the
-/// host's services, loopback-only ones included. The netfilter rule already
-/// refuses to carry a connection to any of them, but the list by itself says
-/// what runs on this host and on which port.
+/// Only named TCP forwards reach the host. Every other forwarding direction
+/// explicitly uses `none`: pasta's `auto` defaults would otherwise expose
+/// listeners and inventory host services in the namespace's `/proc/net` tables.
 ///
 /// `egress_addr` is the broker's namespace-visible address, when there is one.
 /// The host's loopback is mapped to it so a connection there reaches the
@@ -726,14 +829,38 @@ enum Wrapped {
 ///
 /// IPv6 only where the host has it: handing the namespace a v6 route the host
 /// cannot follow would leave a program stalling on v6 before it fell back.
-fn pasta_arguments(egress_addr: Option<&str>, host_has_ipv6: bool) -> Vec<String> {
+fn pasta_arguments(
+    egress_addr: Option<&str>,
+    host_has_ipv6: bool,
+    forwards: &[PortForward],
+    publishes: &[u16],
+) -> Vec<String> {
     let mut pasta_args: Vec<String> = ["--config-net", "--quiet", "--no-map-gw"]
         .iter()
         .map(|arg| (*arg).to_owned())
         .collect();
     for forwarding in ["-t", "-u", "-T", "-U"] {
-        pasta_args.push(forwarding.to_owned());
-        pasta_args.push("none".to_owned());
+        if forwarding == "-T" && !forwards.is_empty() {
+            for forward in forwards {
+                pasta_args.push(forwarding.to_owned());
+                pasta_args.push(format!("{}:{}", forward.port, forward.host_port));
+            }
+        } else if forwarding == "-t" && !publishes.is_empty() {
+            for port in publishes {
+                // The host listener is loopback only: a published development
+                // service must not become reachable from the local network.
+                pasta_args.push(forwarding.to_owned());
+                pasta_args.push(format!("127.0.0.1/{port}"));
+            }
+        } else {
+            pasta_args.push(forwarding.to_owned());
+            pasta_args.push("none".to_owned());
+        }
+    }
+    if !publishes.is_empty() {
+        // Deliver the connection to a service bound on the sandbox loopback,
+        // not only to one bound on every interface.
+        pasta_args.push("--host-lo-to-ns-lo".to_owned());
     }
     if let Some(addr) = egress_addr {
         pasta_args.push("--map-host-loopback".to_owned());
@@ -752,7 +879,10 @@ fn pasta_arguments(egress_addr: Option<&str>, host_has_ipv6: bool) -> Vec<String
 
 fn wrap_in_private_namespace(
     policy: &crate::policy::Policy,
-    args: &RunArgs,
+    args: &NetworkArgs,
+    forwards: &[PortForward],
+    publishes: &[u16],
+    announce: bool,
 ) -> anyhow::Result<Wrapped> {
     use crate::policy::Egress;
 
@@ -768,15 +898,23 @@ fn wrap_in_private_namespace(
         return Ok(Wrapped::Unwrapped);
     }
 
-    // With an egress proxy a missing dependency is fatal, not a downgrade: the
-    // point of the proxy is that egress is bounded, and continuing without the
-    // namespace would leave it open while the caller believed it closed.
-    let strict = args.egress_proxy.is_some();
+    // For a broker or explicit forwards the namespace is part of the access
+    // boundary, so a missing prerequisite must not downgrade to host networking.
+    let strict = args.egress_proxy.is_some() || !forwards.is_empty() || !publishes.is_empty();
+    let strict_feature = if args.egress_proxy.is_some() {
+        "--egress-proxy"
+    } else if !forwards.is_empty() && !publishes.is_empty() {
+        "port forwards and published ports with --proxy-net"
+    } else if !forwards.is_empty() {
+        "port forwards with --proxy-net"
+    } else {
+        "published ports with --proxy-net"
+    };
     let pasta = match resolve_helper("pasta") {
         Ok(path) => path,
         Err(_) if strict => {
             anyhow::bail!(
-                "--egress-proxy needs pasta, which is not in a trusted location; \
+                "{strict_feature} needs pasta, which is not in a trusted location; \
                  the run is refused"
             )
         }
@@ -791,7 +929,7 @@ fn wrap_in_private_namespace(
     if !isolation::available() {
         if strict {
             anyhow::bail!(
-                "--egress-proxy needs user namespaces, which are unavailable; the run is refused"
+                "{strict_feature} needs user namespaces, which are unavailable; the run is refused"
             );
         }
         eprintln!(
@@ -801,7 +939,7 @@ fn wrap_in_private_namespace(
         return Ok(Wrapped::Unwrapped);
     }
 
-    if !args.quiet && !args.json {
+    if announce {
         eprintln!(
             "bailey: egress runs through a private namespace; the host address \
              and MAC are not exposed"
@@ -818,7 +956,7 @@ fn wrap_in_private_namespace(
         Some(value) => Some(parse_egress_proxy(value)?.0.to_string()),
         None => None,
     };
-    let pasta_args = pasta_arguments(egress_addr.as_deref(), host_has_ipv6());
+    let pasta_args = pasta_arguments(egress_addr.as_deref(), host_has_ipv6(), forwards, publishes);
     // The namespace is made here rather than by pasta, and pasta is pointed at
     // it. Whoever installs the lockdown rule has to know which namespace it
     // lands in, and that cannot be established by looking: every reference a
@@ -1034,27 +1172,25 @@ fn host_uid_of_root(map: &str) -> Option<u32> {
     None
 }
 
-fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
-    refuse_root()?;
-    let (program, program_args) = split_command(args.command.clone())?;
-    let profile = select_profile(args.profile.as_deref(), &program)?;
-    let mut resolved = resolve(
-        &profile,
-        &program,
-        args.config.as_deref(),
-        &args.quick_grants,
-    )?;
-    report_untrusted(&program, args.config.as_deref());
-    warn_if_target_denied(&resolved.policy, &program);
-
-    // Wrap before the hooks and the backend, so the confinement, the cgroup,
-    // and the pre-launch hooks all run in the inner process that pasta places
-    // in the private namespace, never twice.
-    let made_the_namespace = match wrap_in_private_namespace(&resolved.policy, &args)? {
-        Wrapped::Parent(code) => return Ok(code),
-        Wrapped::Creator => true,
-        Wrapped::Unwrapped => false,
-    };
+/// Establish shared network confinement before hooks or target execution.
+fn prepare_network(
+    policy: &mut Policy,
+    args: &NetworkArgs,
+    no_isolate: bool,
+    announce: bool,
+) -> anyhow::Result<Wrapped> {
+    // Validate publications first: a run that asks for both should be told
+    // about the publication it got wrong, not about a forward it configured
+    // correctly.
+    let proxy_publishes = proxy_publish_ports(policy, args, no_isolate)?;
+    let proxy_forwards = proxy_forwards(policy, args, no_isolate)?;
+    let made_the_namespace =
+        match wrap_in_private_namespace(policy, args, &proxy_forwards, &proxy_publishes, announce)?
+        {
+            Wrapped::Parent(code) => return Ok(Wrapped::Parent(code)),
+            Wrapped::Creator => true,
+            Wrapped::Unwrapped => false,
+        };
 
     // Inside the namespace now, whether by the wrap above or a re-exec into it.
     // The lockdown goes on before the target is confined and run, so there is
@@ -1075,15 +1211,79 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
         // policy's ports. The netfilter rule already holds egress to the broker
         // address, so permitting its port here widens nothing a session can
         // reach; it only stops Landlock from refusing the one allowed hop.
-        permit_broker_port(&mut resolved.policy, port);
+        permit_egress_port(policy, port);
     } else if made_the_namespace {
-        // Plain --proxy-net still forwards the namespace loopback to the host,
-        // so a session could reach a host service on an allowed port. Drop that
-        // reach. Best-effort here, matching --proxy-net's own degradation: the
-        // hard guarantee is --egress-proxy above.
-        if let Err(err) = drop_host_loopback() {
+        let ruleset =
+            proxy_loopback_ruleset(&proxy_forwards, &proxy_publishes, &policy.network.egress);
+        if let Err(err) = run_nft(&ruleset) {
+            if !proxy_forwards.is_empty() || !proxy_publishes.is_empty() {
+                anyhow::bail!(
+                    "the forwarding firewall could not be installed, so the run is refused: {err}"
+                );
+            }
             eprintln!("bailey: warning: host loopback stays reachable: {err}");
         }
+        for forward in &proxy_forwards {
+            permit_egress_port(policy, forward.port);
+            if announce {
+                eprintln!(
+                    "bailey: forward 127.0.0.1:{} to host port {} through pasta",
+                    forward.port, forward.host_port
+                );
+            }
+        }
+        for port in &proxy_publishes {
+            if announce {
+                eprintln!(
+                    "bailey: publish host 127.0.0.1:{port} to sandbox port {port} through pasta"
+                );
+            }
+        }
+        if !proxy_forwards.is_empty() {
+            policy.forwards.clear();
+        }
+        if !proxy_publishes.is_empty() {
+            // Publishing implies the sandbox may bind the port. An empty bind
+            // list means binds are unrestricted already, so only a list that
+            // already restricts them needs the published port added.
+            if !policy.network.bind_ports.is_empty() {
+                for port in &proxy_publishes {
+                    if !policy.network.bind_ports.contains(port) {
+                        policy.network.bind_ports.push(*port);
+                    }
+                }
+            }
+            policy.network.publish_ports.clear();
+        }
+    }
+
+    Ok(if made_the_namespace {
+        Wrapped::Creator
+    } else {
+        Wrapped::Unwrapped
+    })
+}
+
+fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
+    refuse_root()?;
+    let (program, program_args) = split_command(args.command.clone())?;
+    let profile = select_profile(args.profile.as_deref(), &program)?;
+    let mut resolved = resolve(
+        &profile,
+        &program,
+        args.config.as_deref(),
+        &args.quick_grants,
+    )?;
+    report_untrusted(&program, args.config.as_deref());
+    warn_if_target_denied(&resolved.policy, &program);
+
+    if let Wrapped::Parent(code) = prepare_network(
+        &mut resolved.policy,
+        &args.network,
+        args.no_isolate,
+        !args.quiet && !args.json,
+    )? {
+        return Ok(code);
     }
 
     let target = Target {
@@ -1107,7 +1307,7 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
         },
         always_cgroup: false,
         implicit_write: Vec::new(),
-        egress_broker: args.egress_proxy.is_some(),
+        egress_broker: args.network.egress_proxy.is_some(),
     };
     let code = backend.run(&resolved.policy, &target)?;
     if let Err(err) = resolved.hooks.run_post_exit(code) {
@@ -1155,6 +1355,12 @@ fn cmd_shell(args: ShellArgs) -> anyhow::Result<i32> {
         .set
         .insert("BAILEY_SANDBOX_DIR".into(), dir.display().to_string());
 
+    if let Wrapped::Parent(code) =
+        prepare_network(&mut resolved.policy, &args.network, args.no_isolate, true)?
+    {
+        return Ok(code);
+    }
+
     let target = Target {
         program: shell,
         args: Vec::new(),
@@ -1171,7 +1377,7 @@ fn cmd_shell(args: ShellArgs) -> anyhow::Result<i32> {
         // The launch directory is granted for writing on the user's behalf, so
         // a narrower grant their config makes beneath it is kept narrow.
         implicit_write: vec![dir.clone()],
-        egress_broker: false,
+        egress_broker: args.network.egress_proxy.is_some(),
     };
     let code = backend.run(&resolved.policy, &target)?;
     if let Err(err) = resolved.hooks.run_post_exit(code) {
@@ -1905,6 +2111,8 @@ fn print_policy_to(out: &mut impl io::Write, resolved: &Resolved, target: &Path)
     writeln!(out, "  egress: {:?}", policy.network.egress).expect("writing the policy report");
     writeln!(out, "  bind_ports: {:?}", policy.network.bind_ports)
         .expect("writing the policy report");
+    writeln!(out, "  publish_ports: {:?}", policy.network.publish_ports)
+        .expect("writing the policy report");
     let mode = network::select(policy, isolation::available());
     writeln!(out, "  mode: {}", mode.describe()).expect("writing the policy report");
 
@@ -2083,7 +2291,7 @@ mod tests {
     /// connection for the netfilter rule to refuse.
     #[test]
     fn a_private_network_forwards_no_port_in_either_direction() {
-        let args = pasta_arguments(Some("169.254.169.1"), true);
+        let args = pasta_arguments(Some("169.254.169.1"), true, &[], &[]);
 
         for forwarding in ["-t", "-u", "-T", "-U"] {
             let at = args
@@ -2106,11 +2314,298 @@ mod tests {
     /// with no IPv6 gets none rather than a route it cannot follow.
     #[test]
     fn a_plain_private_network_maps_no_host_and_no_absent_route() {
-        let args = pasta_arguments(None, false);
+        let args = pasta_arguments(None, false, &[], &[]);
 
         assert!(!args.iter().any(|arg| arg == "--map-host-loopback"));
         assert!(args.iter().any(|arg| arg == "-4"));
         assert!(!args.iter().any(|arg| arg == PROXY_ADDRESS_V6));
+    }
+
+    fn proxy_args(options: &[&str]) -> RunArgs {
+        let cli = Cli::try_parse_from(
+            ["bailey", "run"]
+                .into_iter()
+                .chain(options.iter().copied())
+                .chain(["/bin/true"]),
+        )
+        .unwrap();
+        match cli.command {
+            Command::Run(args) => args,
+            _ => unreachable!(),
+        }
+    }
+
+    fn parsed_proxy_forwards(
+        policy: &Policy,
+        options: &[&str],
+    ) -> anyhow::Result<Vec<PortForward>> {
+        let args = proxy_args(options);
+        proxy_forwards(policy, &args.network, args.no_isolate)
+    }
+
+    #[test]
+    fn online_forwards_require_explicit_isolated_proxy_networking() {
+        let mut policy = Policy::default();
+        policy.forwards.push(PortForward {
+            port: 8081,
+            host_port: 8080,
+        });
+        assert!(parsed_proxy_forwards(&policy, &[]).unwrap().is_empty());
+        assert!(parsed_proxy_forwards(&policy, &["--egress-proxy", "169.254.169.1:8443"]).is_err());
+        policy.network.egress = Egress::AllowAll;
+        assert!(parsed_proxy_forwards(&policy, &[]).is_err());
+        assert!(parsed_proxy_forwards(&policy, &["--no-proxy-net"]).is_err());
+        assert!(parsed_proxy_forwards(&policy, &["--proxy-net", "--no-isolate"]).is_err());
+        assert!(parsed_proxy_forwards(&policy, &["--egress-proxy", "169.254.169.1:8443"]).is_err());
+        assert_eq!(
+            parsed_proxy_forwards(&policy, &["--proxy-net"]).unwrap(),
+            policy.forwards
+        );
+    }
+
+    #[test]
+    fn run_and_shell_accept_the_same_network_flags_and_conflicts() {
+        for command in ["run", "shell"] {
+            let parse = |options: &[&str]| {
+                Cli::try_parse_from(
+                    ["bailey", command]
+                        .into_iter()
+                        .chain(options.iter().copied())
+                        .chain((command == "run").then_some("/bin/true")),
+                )
+            };
+            for (options, proxy, disabled, broker) in [
+                (vec!["--proxy-net"], true, false, None),
+                (vec!["--no-proxy-net"], false, true, None),
+                (
+                    vec!["--egress-proxy", "169.254.169.1:8443"],
+                    false,
+                    false,
+                    Some("169.254.169.1:8443"),
+                ),
+            ] {
+                let network = match parse(&options).unwrap().command {
+                    Command::Run(args) => args.network,
+                    Command::Shell(args) => args.network,
+                    _ => unreachable!(),
+                };
+                assert_eq!(network.proxy_net, proxy);
+                assert_eq!(network.no_proxy_net, disabled);
+                assert_eq!(network.egress_proxy.as_deref(), broker);
+            }
+            assert!(parse(&["--proxy-net", "--no-proxy-net"]).is_err());
+            assert!(parse(&["--egress-proxy", "169.254.169.1:8443", "--no-proxy-net"]).is_err());
+        }
+    }
+
+    #[test]
+    fn proxy_network_maps_only_explicit_tcp_forwards() {
+        let forwards = [
+            PortForward {
+                port: 8081,
+                host_port: 8080,
+            },
+            PortForward {
+                port: 5433,
+                host_port: 5432,
+            },
+        ];
+        let args = pasta_arguments(None, false, &forwards, &[]);
+        let mappings: Vec<_> = args
+            .windows(2)
+            .filter(|pair| pair[0] == "-T")
+            .map(|pair| pair[1].as_str())
+            .collect();
+        assert_eq!(mappings, ["8081:8080", "5433:5432"]);
+        for direction in ["-t", "-u", "-U"] {
+            let at = args.iter().position(|arg| arg == direction).unwrap();
+            assert_eq!(args[at + 1], "none");
+        }
+        assert!(args.iter().any(|arg| arg == "--no-map-gw"));
+        assert!(
+            !args
+                .iter()
+                .any(|arg| arg == "auto" || arg == "--map-host-loopback")
+        );
+    }
+
+    #[test]
+    fn proxy_loopback_default_blocks_all_loopback() {
+        let rules = proxy_loopback_ruleset(&[], &[], &Egress::AllowAll);
+        assert!(rules.contains("policy accept;"));
+        assert!(rules.contains("ip daddr 127.0.0.0/8 drop"));
+        assert!(rules.contains("ip6 daddr ::1 drop"));
+        assert!(!rules.contains("dport"));
+        assert!(!rules.contains("ct state"));
+    }
+
+    #[test]
+    fn proxy_loopback_accepts_only_exact_forwarded_tcp_endpoints() {
+        let forwards = [PortForward {
+            port: 8081,
+            host_port: 8080,
+        }];
+        let rules = proxy_loopback_ruleset(&forwards, &[], &Egress::AllowAll);
+        let permit = rules
+            .find("ip daddr 127.0.0.1 tcp dport 8081 accept")
+            .unwrap();
+        let deny = rules.find("ip daddr 127.0.0.0/8 drop").unwrap();
+        assert!(permit < deny);
+        assert!(rules.find("ct state established accept").unwrap() < permit);
+        assert!(rules.contains("policy accept;"));
+        assert!(rules.contains("ip6 daddr ::1 drop"));
+        assert!(rules.contains("ip daddr 10.0.2.15 tcp dport 8081 drop"));
+        assert!(rules.contains("ip6 daddr fd00::2 tcp dport 8081 drop"));
+        assert!(!rules.contains("udp"));
+        assert!(!rules.contains("dport 8080"));
+        assert!(!rules.contains("oif lo accept"));
+    }
+
+    #[test]
+    fn proxy_forward_connect_ports_do_not_widen_partial_remote_egress() {
+        use crate::policy::EgressRule;
+        let mut policy = Policy::default();
+        policy.network.egress = Egress::Allow(vec![EgressRule {
+            host: "*".into(),
+            port: Some(443),
+        }]);
+        let forwards = [PortForward {
+            port: 8081,
+            host_port: 8080,
+        }];
+        let rules = proxy_loopback_ruleset(&forwards, &[], &policy.network.egress);
+        let permit = rules
+            .find("ip daddr 127.0.0.1 tcp dport 8081 accept")
+            .unwrap();
+        let deny_remote = rules.find("\t\ttcp dport 8081 drop").unwrap();
+        assert!(permit < deny_remote);
+        assert!(!rules.contains("tcp dport 443 drop"));
+        permit_egress_port(&mut policy, 8081);
+        assert!(
+            matches!(policy.network.egress, Egress::Allow(ref ports) if ports.iter().any(|rule| rule.port == Some(8081)))
+        );
+    }
+
+    #[test]
+    fn proxy_forwards_preserve_existing_remote_port_allowances() {
+        use crate::policy::EgressRule;
+        let forwards = [PortForward {
+            port: 8081,
+            host_port: 8080,
+        }];
+        for port in [0, 8081] {
+            let egress = Egress::Allow(vec![EgressRule {
+                host: "*".into(),
+                port: Some(port),
+            }]);
+            let rules = proxy_loopback_ruleset(&forwards, &[], &egress);
+            assert!(!rules.contains("\t\ttcp dport 8081 drop"));
+        }
+    }
+
+    fn publish_args(options: &[&str]) -> NetworkArgs {
+        proxy_args(options).network
+    }
+
+    #[test]
+    fn published_ports_require_explicit_isolated_proxy_networking() {
+        let args = publish_args(&["--proxy-net", "--publish-port", "3800"]);
+        let policy = |egress: Egress| {
+            let mut policy = Policy::default();
+            policy.network.egress = egress;
+            policy
+        };
+        assert_eq!(
+            proxy_publish_ports(&policy(Egress::AllowAll), &args, false).unwrap(),
+            vec![3800]
+        );
+        assert!(proxy_publish_ports(&policy(Egress::DenyAll), &args, false).is_err());
+        assert!(proxy_publish_ports(&policy(Egress::AllowAll), &args, true).is_err());
+        assert!(
+            proxy_publish_ports(
+                &policy(Egress::AllowAll),
+                &publish_args(&["--publish-port", "3800"]),
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            proxy_publish_ports(
+                &policy(Egress::AllowAll),
+                &publish_args(&[
+                    "--egress-proxy",
+                    "169.254.169.1:8443",
+                    "--publish-port",
+                    "3800"
+                ]),
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            proxy_publish_ports(
+                &policy(Egress::AllowAll),
+                &publish_args(&["--publish-port", "0"]),
+                false
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn published_ports_do_not_collide_with_forwards() {
+        let mut policy = Policy::default();
+        policy.network.egress = Egress::AllowAll;
+        policy.forwards.push(PortForward {
+            port: 8081,
+            host_port: 8080,
+        });
+        let publish = |port: &str| {
+            let args = publish_args(&["--proxy-net", "--publish-port", port]);
+            proxy_publish_ports(&policy, &args, false)
+        };
+        assert!(publish("8081").is_err(), "the forward's sandbox port");
+        assert!(publish("8080").is_err(), "the forward's host port");
+        assert_eq!(publish("3800").unwrap(), vec![3800]);
+    }
+
+    #[test]
+    fn publication_maps_only_loopback_and_keeps_other_directions_off() {
+        let args = pasta_arguments(None, false, &[], &[3800, 4000]);
+        let mappings: Vec<_> = args
+            .windows(2)
+            .filter(|pair| pair[0] == "-t")
+            .map(|pair| pair[1].as_str())
+            .collect();
+        assert_eq!(mappings, ["127.0.0.1/3800", "127.0.0.1/4000"]);
+        assert!(args.iter().any(|arg| arg == "--host-lo-to-ns-lo"));
+        for direction in ["-u", "-T", "-U"] {
+            let at = args.iter().position(|arg| arg == direction).unwrap();
+            assert_eq!(args[at + 1], "none");
+        }
+        assert!(!args.iter().any(|arg| arg == "auto"));
+    }
+
+    #[test]
+    fn publication_rules_admit_the_local_connection_before_the_loopback_drop() {
+        let rules = proxy_loopback_ruleset(&[], &[3800], &Egress::AllowAll);
+        let established = rules.find("ct state established accept").unwrap();
+        let accept = rules
+            .find("ip daddr 127.0.0.1 tcp dport 3800 accept")
+            .unwrap();
+        let drop = rules.find("ip daddr 127.0.0.0/8 drop").unwrap();
+        assert!(established < accept && accept < drop);
+        assert!(rules.contains("ip6 daddr ::1 drop"));
+        // A publication is not an egress allowance, so it gets no remote drop.
+        assert!(!rules.contains("\t\ttcp dport 3800 drop"));
+        assert!(!rules.contains("udp"));
+        assert!(!rules.contains("oif lo accept"));
+    }
+
+    #[test]
+    fn publication_only_rules_keep_established_replies() {
+        let rules = proxy_loopback_ruleset(&[], &[3800], &Egress::AllowAll);
+        assert!(rules.contains("ct state established accept"));
     }
 
     #[test]
@@ -2137,7 +2632,7 @@ mod tests {
             host: "*".into(),
             port: Some(443),
         }]);
-        permit_broker_port(&mut policy, 8443);
+        permit_egress_port(&mut policy, 8443);
         match &policy.network.egress {
             Egress::Allow(rules) => {
                 assert!(rules.iter().any(|r| r.port == Some(443)));
@@ -2149,7 +2644,7 @@ mod tests {
         // AllowAll already permits every port, so it is left alone.
         let mut open = Policy::default();
         open.network.egress = Egress::AllowAll;
-        permit_broker_port(&mut open, 8443);
+        permit_egress_port(&mut open, 8443);
         assert_eq!(open.network.egress, Egress::AllowAll);
     }
     /// A hook runs as the caller, unconfined, before the sandbox exists, so

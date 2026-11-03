@@ -323,6 +323,8 @@ struct RawNetwork {
     egress_allow: Vec<RawEgressRule>,
     #[serde(default)]
     bind_ports: Vec<u16>,
+    #[serde(default)]
+    publish_ports: Vec<u16>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -379,6 +381,7 @@ struct Accumulator {
     /// same reason as `self_fuse` above.
     egress: Option<(Egress, PathBuf)>,
     bind_ports: Vec<u16>,
+    publish_ports: Vec<u16>,
     devices: BTreeMap<PathBuf, Access>,
     resources: ResourceLimits,
     hooks: Hooks,
@@ -558,6 +561,7 @@ fn apply_layer(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> 
         acc.sockets.clear();
         // A port forward is the same kind of promise, made about a TCP port.
         acc.forwards.clear();
+        acc.publish_ports.clear();
     }
     // After the reset, with this layer's grants: a layer that resets and
     // relocates in one breath means to keep its own placement, and clearing
@@ -590,6 +594,17 @@ fn apply_layer(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> 
         for port in &network.bind_ports {
             if !acc.bind_ports.contains(port) {
                 acc.bind_ports.push(*port);
+            }
+        }
+        for port in &network.publish_ports {
+            if *port == 0 {
+                return Err(ConfigError::Invalid {
+                    path: layer.path.clone(),
+                    reason: "a published port must be a real port, not 0".into(),
+                });
+            }
+            if !acc.publish_ports.contains(port) {
+                acc.publish_ports.push(*port);
             }
         }
     }
@@ -949,6 +964,7 @@ fn finalize(mut acc: Accumulator) -> Result<Resolved, ConfigError> {
                     .map(|(egress, _)| egress)
                     .unwrap_or(Egress::DenyAll),
                 bind_ports: acc.bind_ports,
+                publish_ports: acc.publish_ports,
             },
             devices,
             resources: acc.resources,
@@ -1390,6 +1406,45 @@ mod tests {
             "[[forward]]\nport = 8080\nhost_port = 80\n[[forward]]\nport = 8080\nhost_port = 81",
         )];
         assert!(merge(&layers).is_err());
+    }
+
+    /// A misspelled key is an error rather than a rule that quietly does
+    /// nothing, which is the promise `deny_unknown_fields` makes.
+    #[test]
+    fn an_unknown_network_key_is_refused() {
+        assert!(toml::from_str::<RawLayer>("[network]\npublish_port = [3800]").is_err());
+    }
+
+    #[test]
+    fn publish_ports_accumulate_and_deduplicate() {
+        let layers = [
+            layer("/base", "[network]\npublish_ports = [3800, 4000]"),
+            layer("/base", "[network]\npublish_ports = [4000, 4567]"),
+        ];
+        let resolved = merge(&layers).unwrap();
+        assert_eq!(
+            resolved.policy.network.publish_ports,
+            vec![3800, 4000, 4567]
+        );
+    }
+
+    #[test]
+    fn publish_port_zero_is_refused() {
+        let layers = [layer("/base", "[network]\npublish_ports = [0]")];
+        assert!(merge(&layers).is_err());
+    }
+
+    #[test]
+    fn a_reset_clears_published_ports() {
+        let layers = [
+            layer("/base", "[network]\npublish_ports = [3800]"),
+            layer(
+                "/base",
+                "[filesystem]\nreset = true\n[network]\npublish_ports = [4000]",
+            ),
+        ];
+        let resolved = merge(&layers).unwrap();
+        assert_eq!(resolved.policy.network.publish_ports, vec![4000]);
     }
 
     #[test]

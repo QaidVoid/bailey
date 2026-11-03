@@ -241,6 +241,14 @@ impl EnforceBackend {
     /// run.
     pub fn spawn(&self, policy: &Policy, target: &Target) -> Result<Confined, BackendError> {
         report_degradation(policy);
+        // Publication is arranged by the proxy network setup above this
+        // backend. A policy that still asks for it here was never set up, and
+        // running it would silently drop the promise.
+        if !policy.network.publish_ports.is_empty() {
+            return Err(BackendError::Command(
+                "published ports need the proxy network setup; run with --proxy-net".into(),
+            ));
+        }
 
         let seccomp = build_seccomp_filter(policy.self_fuse)
             .map_err(|err| BackendError::Unsupported(format!("seccomp: {err}")))?;
@@ -460,33 +468,8 @@ impl EnforceBackend {
                 };
                 return Err(BackendError::Command(reason.into()));
             }
-            // The same file can arrive twice, explicit and discovered, and
-            // layers can name a forward again. An identical repeat collapses;
-            // two destinations for one inside port is a contradiction.
-            let mut forwards: Vec<PortForward> = Vec::new();
-            for forward in &policy.forwards {
-                match forwards.iter_mut().find(|named| named.port == forward.port) {
-                    Some(named) if named.host_port == forward.host_port => {}
-                    Some(named) => {
-                        return Err(BackendError::Command(format!(
-                            "two forwards dial out from port {}: one to host \
-                             port {}, one to {}",
-                            forward.port, named.host_port, forward.host_port
-                        )));
-                    }
-                    None => forwards.push(forward.clone()),
-                }
-            }
-            for forward in &forwards {
-                if policy.network.bind_ports.contains(&forward.port) {
-                    return Err(BackendError::Command(format!(
-                        "a forward and a bound port share {}; the forward's \
-                         listener needs the port inside the sandbox, the bind \
-                         needs it on the host, and one number cannot be both",
-                        forward.port
-                    )));
-                }
-            }
+            let forwards = forward::validate(&policy.forwards, &policy.network.bind_ports)
+                .map_err(BackendError::Command)?;
             let (announce, child_end) = UnixStream::pair().map_err(BackendError::Io)?;
             forward_child_end = Some(child_end);
             forward_announce = Some(announce);

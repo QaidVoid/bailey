@@ -5,9 +5,14 @@
 //! the property the command exists for.
 
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 fn bailey() -> &'static str {
     env!("CARGO_BIN_EXE_bailey")
@@ -53,6 +58,34 @@ fn shell(store: &Path, cwd: &Path, script: &str, env: &[(&str, &str)]) -> Output
     }
 
     let mut child = command.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+fn isolated_shell_command(root: &Path, cwd: &Path) -> Command {
+    let mut command = Command::new(bailey());
+    command
+        .current_dir(cwd)
+        .env("HOME", root.join("home"))
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_DATA_HOME", root.join("data"));
+    command
+}
+
+fn network_shell(root: &Path, cwd: &Path, args: &[&str], script: &str) -> Output {
+    let mut child = isolated_shell_command(root, cwd)
+        .args(["shell", "--shell", "/bin/sh"])
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
     child
         .stdin
         .take()
@@ -376,4 +409,403 @@ fn what_was_enforced_is_reported_before_the_shell_runs() {
         summary < from_shell,
         "the summary belongs before the shell takes the terminal: {shown}"
     );
+}
+
+#[test]
+fn proxy_net_preserves_a_denied_egress_shells_exit_status() {
+    let (root, project, _private) = workspace();
+    let output = network_shell(
+        root.path(),
+        &project,
+        &["--proxy-net"],
+        "echo \"marker=$BAILEY_SANDBOX dir=$BAILEY_SANDBOX_DIR\"\npwd\ncat notes.txt\necho written > new.txt\necho private > \"$HOME/shell-note\"\necho shell-output >&2\nexit 7\n",
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "a denied-egress shell must accept --proxy-net: {}",
+        stderr(&output)
+    );
+    let shown = stdout(&output);
+    assert!(
+        shown.contains(&format!(
+            "marker=1 dir={}\n{}\nproject file\n",
+            project.display(),
+            project.display()
+        )),
+        "{shown}"
+    );
+    assert_eq!(
+        fs::read_to_string(project.join("new.txt")).unwrap(),
+        "written\n"
+    );
+    let shown = stderr(&output);
+    let summary = shown.find("bailey: enforced:").expect(&shown);
+    let shell_output = shown.find("shell-output").expect(&shown);
+    assert!(summary < shell_output, "{shown}");
+
+    let other = root.path().join("other").join("project");
+    fs::create_dir_all(&other).unwrap();
+    let output = network_shell(
+        root.path(),
+        &other,
+        &["--proxy-net"],
+        "test ! -e \"$HOME/shell-note\" && echo private-home\n",
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "private-home\n");
+    let homes: Vec<_> = fs::read_dir(root.path().join("data/bailey/shell"))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(homes.len(), 2, "private homes must be keyed by directory");
+    assert_eq!(
+        homes
+            .iter()
+            .filter(|home| home.path().join("home/shell-note").exists())
+            .count(),
+        1,
+        "only the first shell's home should contain its note"
+    );
+}
+
+fn python() -> Option<&'static str> {
+    ["/usr/bin/python3", "/bin/python3"]
+        .into_iter()
+        .find(|path| Path::new(path).exists())
+}
+
+fn proxy_net_available() -> bool {
+    if python().is_none() || !bailey::backend::isolation::available() {
+        eprintln!("skipping: needs python3 and user namespaces");
+        return false;
+    }
+    for helper in ["pasta", "nft"] {
+        if let Err(err) = bailey::cli::resolve_helper(helper) {
+            eprintln!("skipping: needs trusted {helper}: {err}");
+            return false;
+        }
+    }
+    // Probe kernel support independently of Bailey's firewall installation.
+    let nft = bailey::cli::resolve_helper("nft").unwrap();
+    let program = format!(
+        r#"import ctypes, os, subprocess
+uid, gid = os.getuid(), os.getgid()
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.unshare(0x10000000 | 0x40000000):
+    raise OSError(ctypes.get_errno(), 'unshare')
+with open('/proc/self/setgroups', 'w') as f:
+    f.write('deny')
+with open('/proc/self/uid_map', 'w') as f:
+    f.write(f'0 {{uid}} 1')
+with open('/proc/self/gid_map', 'w') as f:
+    f.write(f'0 {{gid}} 1')
+subprocess.run([{nft:?}, '-f', '-'], input='table inet bailey_test {{\n chain output {{\n type filter hook output priority 0; policy accept;\n }}\n}}\n', text=True, check=True)
+"#,
+        nft = nft.to_str().unwrap()
+    );
+    let output = Command::new(python().unwrap())
+        .args(["-c", &program])
+        .output()
+        .unwrap();
+    if !output.status.success() {
+        eprintln!(
+            "skipping: nft is unavailable in a private user/network namespace: {}",
+            stderr(&output)
+        );
+        return false;
+    }
+    true
+}
+
+struct TcpEcho {
+    port: u16,
+    stop: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl TcpEcho {
+    fn start() -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = Arc::clone(&stop);
+        let worker = std::thread::spawn(move || {
+            while !stopped.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut client, _)) => {
+                        client
+                            .set_read_timeout(Some(Duration::from_secs(2)))
+                            .unwrap();
+                        client
+                            .set_write_timeout(Some(Duration::from_secs(2)))
+                            .unwrap();
+                        let mut buf = [0; 64];
+                        if let Ok(n) = client.read(&mut buf) {
+                            let _ = client.write_all(&buf[..n]);
+                        }
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(err) => panic!("host TCP listener failed: {err}"),
+                }
+            }
+        });
+        Self {
+            port,
+            stop,
+            worker: Some(worker),
+        }
+    }
+}
+
+impl Drop for TcpEcho {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if self.worker.take().unwrap().join().is_err() && !std::thread::panicking() {
+            panic!("host TCP echo worker panicked");
+        }
+    }
+}
+
+#[test]
+fn proxy_net_forwards_only_selected_host_ports_for_shell_children() {
+    if !proxy_net_available() {
+        return;
+    }
+    let (root, project, private) = workspace();
+    let echo = TcpEcho::start();
+    let hidden = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let hidden_port = hidden.local_addr().unwrap().port();
+    let inside = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let inside_port = inside.local_addr().unwrap().port();
+    let vendor = project.join("vendor");
+    fs::create_dir(&vendor).unwrap();
+    fs::write(vendor.join("lib.txt"), "original").unwrap();
+    let hook_log = private.join("hooks.log");
+    let config = project.join("bailey.toml");
+    fs::write(
+        &config,
+        format!(
+            r#"[network]
+egress_allow = [{{ host = "*", port = 443 }}]
+[[forward]]
+port = {inside_port}
+host_port = {}
+[filesystem]
+read = ["{}"]
+[hooks]
+pre_launch = ['echo pre >> "{}"']
+post_exit = ['echo "post=$BAILEY_EXIT_CODE" >> "{}"']
+"#,
+            echo.port,
+            vendor.display(),
+            hook_log.display(),
+            hook_log.display()
+        ),
+    )
+    .unwrap();
+    let trusted = isolated_shell_command(root.path(), &project)
+        .arg("trust")
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(trusted.status.success(), "{}", stderr(&trusted));
+    fs::write(
+        project.join("probe.py"),
+        format!(
+            r#"import os, pathlib, socket, sys
+label = sys.argv[1]
+assert os.environ['BAILEY_SANDBOX'] == '1'
+assert os.environ['BAILEY_SANDBOX_DIR'] == os.getcwd()
+with socket.create_connection(('127.0.0.1', {inside_port}), timeout=3) as s:
+    payload = ('echo-' + label).encode()
+    s.sendall(payload)
+    assert s.recv(64) == payload
+print(label + ':echo-ok')
+for port in ({hidden_port}, {host_port}):
+    try:
+        with socket.create_connection(('127.0.0.1', port), timeout=1):
+            raise AssertionError('reached unforwarded host port ' + str(port))
+    except OSError:
+        pass
+print(label + ':host-ports-refused')
+assert pathlib.Path('vendor/lib.txt').read_text() == 'original'
+try:
+    pathlib.Path('vendor/lib.txt').write_text('tampered')
+    raise AssertionError('implicit cwd grant widened a read-only grant')
+except OSError:
+    print(label + ':read-only')
+"#,
+            host_port = echo.port
+        ),
+    )
+    .unwrap();
+    let python = python().unwrap();
+    let output = network_shell(
+        root.path(),
+        &project,
+        &["--proxy-net"],
+        &format!(
+            "{python} probe.py shell\n/bin/sh -c '{python} probe.py child'\necho shell-output >&2\nexit 7\n"
+        ),
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "stdout: {} stderr: {}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert_eq!(
+        stdout(&output),
+        "shell:echo-ok\nshell:host-ports-refused\nshell:read-only\nchild:echo-ok\nchild:host-ports-refused\nchild:read-only\n",
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(
+        fs::read_to_string(vendor.join("lib.txt")).unwrap(),
+        "original"
+    );
+    assert_eq!(fs::read_to_string(hook_log).unwrap(), "pre\npost=7\n");
+    let shown = stderr(&output);
+    let summary = shown.find("bailey: enforced:").expect(&shown);
+    let shell_output = shown.find("shell-output").expect(&shown);
+    assert!(summary < shell_output, "{shown}");
+}
+
+#[test]
+fn proxy_net_with_denied_egress_keeps_only_private_loopback() {
+    if python().is_none() || !bailey::backend::isolation::available() {
+        eprintln!("skipping: needs python3 and user namespaces");
+        return;
+    }
+    let (root, project, _private) = workspace();
+    let hidden = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = hidden.local_addr().unwrap().port();
+    fs::write(
+        project.join("probe.py"),
+        format!(
+            r#"import socket
+assert [name for _, name in socket.if_nameindex()] == ['lo']
+try:
+    with socket.create_connection(('127.0.0.1', {port}), timeout=1):
+        raise AssertionError('reached the host network')
+except OSError:
+    print('host-refused')
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+    s.bind(('127.0.0.1', 0))
+    s.settimeout(2)
+    s.sendto(b'loopback', s.getsockname())
+    assert s.recv(64) == b'loopback'
+print('private-loopback-ok')
+"#
+        ),
+    )
+    .unwrap();
+    for args in [&[][..], &["--proxy-net"][..]] {
+        let output = network_shell(
+            root.path(),
+            &project,
+            args,
+            &format!("{} probe.py\n", python().unwrap()),
+        );
+        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+        assert_eq!(
+            stdout(&output),
+            "host-refused\nprivate-loopback-ok\n",
+            "{args:?}: {}",
+            stderr(&output)
+        );
+    }
+}
+
+#[test]
+fn brokered_shell_children_reach_only_the_selected_egress_proxy() {
+    if !proxy_net_available() {
+        return;
+    }
+    let (root, project, _private) = workspace();
+    let broker = TcpEcho::start();
+    let hidden = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let hidden_port = hidden.local_addr().unwrap().port();
+    fs::write(
+        project.join("probe.py"),
+        format!(
+            r#"import os, socket
+assert os.environ['BAILEY_SANDBOX_NET'] == 'broker'
+with socket.create_connection(('169.254.169.1', {broker_port}), timeout=3) as s:
+    s.sendall(b'broker-child')
+    assert s.recv(64) == b'broker-child'
+print('broker-echo-ok')
+for address, port in (('127.0.0.1', {broker_port}),
+                      ('127.0.0.1', {hidden_port}),
+                      ('169.254.169.1', {hidden_port})):
+    try:
+        with socket.create_connection((address, port), timeout=1):
+            raise AssertionError('reached endpoint outside broker')
+    except OSError:
+        pass
+print('other-host-ports-refused')
+"#,
+            broker_port = broker.port,
+        ),
+    )
+    .unwrap();
+    let address = format!("169.254.169.1:{}", broker.port);
+    let output = network_shell(
+        root.path(),
+        &project,
+        &["--egress-proxy", &address],
+        &format!("/bin/sh -c '{} probe.py'\nexit 7\n", python().unwrap()),
+    );
+    assert_eq!(output.status.code(), Some(7), "{}", stderr(&output));
+    assert_eq!(
+        stdout(&output),
+        "broker-echo-ok\nother-host-ports-refused\n",
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn no_proxy_net_keeps_an_allowed_egress_shell_on_the_host_network() {
+    if python().is_none() {
+        eprintln!("skipping: needs python3");
+        return;
+    }
+    let (root, project, _private) = workspace();
+    let echo = TcpEcho::start();
+    let config = project.join("bailey.toml");
+    fs::write(&config, "[network]\negress = \"allow\"\n").unwrap();
+    let trusted = isolated_shell_command(root.path(), &project)
+        .arg("trust")
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(trusted.status.success(), "{}", stderr(&trusted));
+    fs::write(
+        project.join("probe.py"),
+        format!(
+            r#"import os, socket
+assert os.environ['BAILEY_SANDBOX_NET'] == 'host'
+with socket.create_connection(('127.0.0.1', {}), timeout=3) as s:
+    s.sendall(b'host-echo')
+    assert s.recv(64) == b'host-echo'
+print('host-echo-ok')
+"#,
+            echo.port
+        ),
+    )
+    .unwrap();
+    let output = network_shell(
+        root.path(),
+        &project,
+        &["--no-proxy-net"],
+        &format!("{} probe.py\n", python().unwrap()),
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "host-echo-ok\n", "{}", stderr(&output));
 }

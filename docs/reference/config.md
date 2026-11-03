@@ -100,6 +100,7 @@ before the run starts.
 | `egress` | `"deny"` or `"allow"` | Outbound policy. Default `"deny"` |
 | `egress_allow` | list of tables | Permitted destinations, `{ host, port }` |
 | `bind_ports` | list of integers | TCP ports the target may bind |
+| `publish_ports` | list of integers | Sandbox TCP ports published on the host at `127.0.0.1:PORT`; requires `--proxy-net` and allowed egress |
 
 ```toml
 [network]
@@ -109,6 +110,22 @@ bind_ports = [27015]
 
 `egress_allow` takes precedence over `egress` when both are present. `bind_ports`
 accumulate across layers; `egress` is replaced by the nearest layer that sets it.
+
+`publish_ports = [3800]` makes a TCP service bound inside the sandbox on
+`127.0.0.1:3800` or `0.0.0.0:3800` reachable from the host at
+`127.0.0.1:3800`, not at the host's LAN addresses. Entries accumulate across
+layers and are cleared alongside forwards by `[filesystem] reset = true`.
+Port 0 is a config error. A publication matching either a forward's sandbox
+port or its host port is refused.
+
+Publication requires explicit `--proxy-net`, namespace isolation, and allowed
+egress. It is refused with `--no-proxy-net`, `--no-isolate`, `--egress-proxy`,
+`egress = "deny"`, or audit. Missing pasta, working unprivileged user namespaces,
+or `nft`, or failure to install the firewall, refuses the run rather than
+degrading it. Each publication is reported before the target starts.
+Publication grants no outbound egress and leaves unrelated host loopback
+services blocked. Only TCP over IPv4 is published, never UDP or IPv6. See
+[publishing a sandbox service](/guide/network#publishing-a-sandbox-service).
 
 - `host` is advisory. Landlock matches on TCP port only, and bailey warns when
   `host` is anything other than `*`.
@@ -226,8 +243,8 @@ resolution error, because the relay exists to keep the directory ungranted.
 
 An array of tables, one per host TCP port carried onto the sandbox's own
 loopback. The target dials `127.0.0.1:port` the way it would dial a local
-daemon, and bailey carries the connection out to the host. The network
-namespace keeps its edge: nothing beyond the named ports is reachable.
+daemon, and bailey carries the connection to `127.0.0.1:host_port` on the host.
+Other host loopback services remain blocked in the private network namespace.
 
 | Key | Type | Description |
 | --- | --- | --- |
@@ -245,10 +262,20 @@ host_port = 15432
 
 Entries accumulate across layers and are cleared by `filesystem.reset = true`.
 Two different host ports for one sandbox port is refused, as is a forward
-sharing a port the policy already binds. Isolation is required: the listeners
-are bound inside the target's own loopback and handed to bailey over a file
-descriptor before exec, which is what keeps them off the host. Egress stays
-denied; the forward is the one exception, and it carries only what dials it.
+sharing a port the policy already binds. Isolation is required. With denied
+egress, only the forwarded services are reachable.
+
+With `egress = "allow"` or `egress_allow`, forwards require an explicit
+`--proxy-net` on `bailey run` or `bailey shell`. Pasta, working unprivileged
+user namespaces, and `nft` are mandatory; failure refuses the run rather than dropping the protection.
+Omitting `--proxy-net`, using `--no-isolate`, or combining forwards with
+`--egress-proxy` is refused. The existing internet allowance is preserved,
+not widened to include forward-only TCP ports on remote hosts.
+
+Only explicit TCP forwards are enabled, with no automatic, inbound, or UDP
+forwarding. They are private to the sandbox. Denied-egress forwards serve
+connections sequentially per port; online forwards use pasta and support
+concurrent connections. See [desktop services and mounts](/guide/desktop).
 
 ## `[resources]`
 

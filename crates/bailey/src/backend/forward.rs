@@ -21,6 +21,38 @@ use std::time::{Duration, Instant};
 
 use crate::policy::PortForward;
 
+/// Validate and deduplicate forwards without changing their order.
+pub(crate) fn validate(
+    forwards: &[PortForward],
+    bind_ports: &[u16],
+) -> Result<Vec<PortForward>, String> {
+    let mut unique: Vec<PortForward> = Vec::new();
+    for forward in forwards {
+        if forward.port == 0 || forward.host_port == 0 {
+            return Err("a forward needs nonzero sandbox and host ports".into());
+        }
+        if let Some(existing) = unique.iter().find(|entry| entry.port == forward.port) {
+            if existing.host_port != forward.host_port {
+                return Err(format!(
+                    "two forwards dial out from port {}: one to host port {}, one to {}",
+                    forward.port, existing.host_port, forward.host_port
+                ));
+            }
+            continue;
+        }
+        if bind_ports.contains(&forward.port) {
+            return Err(format!(
+                "a forward and a bound port share {}; the forward's listener needs \
+                 the port inside the sandbox, the bind needs it on the host, and \
+                 one number cannot be both",
+                forward.port
+            ));
+        }
+        unique.push(forward.clone());
+    }
+    Ok(unique)
+}
+
 /// Bind the forward listeners from inside the sandbox and hand them over.
 ///
 /// Runs in `pre_exec`, after the network namespace exists and before any
@@ -406,6 +438,59 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    #[test]
+    fn validation_deduplicates_without_reordering() {
+        let forwards = [
+            PortForward {
+                port: 8081,
+                host_port: 8080,
+            },
+            PortForward {
+                port: 8082,
+                host_port: 8080,
+            },
+            PortForward {
+                port: 8081,
+                host_port: 8080,
+            },
+        ];
+        assert_eq!(validate(&forwards, &[]).unwrap(), forwards[..2]);
+    }
+
+    #[test]
+    fn validation_refuses_ambiguous_bindings_and_zero_ports() {
+        let mapping = PortForward {
+            port: 8081,
+            host_port: 8080,
+        };
+        let conflict = PortForward {
+            port: 8081,
+            host_port: 8082,
+        };
+        assert!(validate(&[mapping.clone(), conflict], &[]).is_err());
+        assert!(validate(&[mapping], &[8081]).is_err());
+        assert!(
+            validate(
+                &[PortForward {
+                    port: 0,
+                    host_port: 8080
+                }],
+                &[]
+            )
+            .is_err()
+        );
+        assert!(
+            validate(
+                &[PortForward {
+                    port: 8080,
+                    host_port: 0
+                }],
+                &[]
+            )
+            .is_err()
+        );
+    }
 
     /// The idle deadline the tests wait out: the real one divided by three
     /// hundred, so a test measures a second instead of five minutes.

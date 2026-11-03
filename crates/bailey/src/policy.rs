@@ -80,6 +80,10 @@ pub struct NetworkPolicy {
     pub egress: Egress,
     /// TCP ports the target is allowed to bind.
     pub bind_ports: Vec<u16>,
+    /// TCP ports on which the host may reach a service bound inside the
+    /// sandbox. Each is published on host loopback only, and only when the run
+    /// uses a private network namespace.
+    pub publish_ports: Vec<u16>,
 }
 
 impl Default for NetworkPolicy {
@@ -87,6 +91,7 @@ impl Default for NetworkPolicy {
         Self {
             egress: Egress::DenyAll,
             bind_ports: Vec::new(),
+            publish_ports: Vec::new(),
         }
     }
 }

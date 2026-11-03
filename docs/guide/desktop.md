@@ -121,19 +121,49 @@ port = 5432
 host_port = 15432
 ```
 
-The forward is a hole with a number on it. The network namespace still denies
-everything else; only the named port is carried, and only for connections the
-target itself dials. The listener lives on the sandbox's own loopback, bound
-inside the namespace and handed to bailey before exec, so the host never
-listens on it and nothing from outside the sandbox can reach it. Egress stays
-denied: a forward is not an internet allowance, and a policy with both a
-forward and `egress_allow` keeps the forward to its one port.
+With denied egress, the forward is the only way out of the private network
+namespace. It carries only TCP connections the target initiates to the named
+port, not inbound connections from outside the sandbox.
 
-::: warning A forward carries one connection at a time
-Each forwarded port serves its connections sequentially. A local daemon that
-holds one connection per client is the shape this is built for; a port shared
-by many concurrent clients queues them instead. Prefer the service's own
-socket relay (`[[socket]]`) when one exists.
+### Keeping internet access alongside a forward
+
+To reach a host service such as zai-proxy on `127.0.0.1:8080` while retaining
+internet access, use the same forward syntax with an egress allowance:
+
+```toml
+[network]
+egress = "allow"
+
+[[forward]]
+port = 8080
+```
+
+Launch with an explicit `--proxy-net`:
+
+```sh
+bailey shell --proxy-net
+```
+
+Inside the sandbox, `127.0.0.1:8080` reaches zai-proxy on the host. General
+internet egress remains allowed, but unrelated host loopback services stay
+blocked. With `egress_allow` instead, internet access remains limited to its
+permitted TCP ports. A forward does not add its port to the internet allowance.
+
+Online forwards require isolation, pasta, working unprivileged user namespaces,
+and `nft`. The run is refused if any requirement is missing, if `--proxy-net`
+is omitted, or if `--egress-proxy` is used. The broker remains the sole egress
+path in brokered runs. The same options apply to `bailey run` and
+`bailey shell`.
+
+Only the configured TCP ports are forwarded. No automatic, inbound, or UDP
+forwarding is enabled, and the forwards remain private to the sandbox.
+
+::: warning Denied-egress forwards carry one connection at a time
+With denied egress, each forwarded port serves its connections sequentially.
+A local daemon that holds one connection per client is the shape this backend
+is built for; concurrent clients queue instead. Online forwards use pasta and
+support concurrent connections. Prefer the service's own socket relay
+(`[[socket]]`) when one exists.
 :::
 
 ## Where relays, mounts, and forwards end
@@ -145,8 +175,8 @@ socket relay (`[[socket]]`) when one exists.
   exists to keep a directory ungranted, and both at once is a contradiction.
 - A FUSE entry and `--no-isolate` are refused the same way, because a mount
   placed for the target needs a root to place it in.
-- A forward needs the network namespace of its own that isolation provides;
-  its listener is bound inside it and handed to bailey, which keeps it off
-  the host.
+- A forward needs a private network namespace. Denied-egress forwards use a
+  listener inside it; online forwards require `--proxy-net`. Neither exposes
+  a listener to outside clients.
 - On a machine without working relays, mounts, or forwards, the refusal names
   what was missing. Nothing is silently dropped from a policy.

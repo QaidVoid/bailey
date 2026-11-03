@@ -35,6 +35,10 @@ exit status.
 | `--deny <PATH>` | Deny a path outright, retracting any grant. Repeatable |
 | `--allow-net <PORT>` | Allow outbound TCP to this port, on any host. Repeatable |
 | `-p, --profile <NAME>` | Profile used as the base, bundled or your own. Defaults to one that claims the target, else `untrusted` |
+| `--proxy-net` | Use a private network namespace with pasta connectivity. Required explicitly for publications and forwards with allowed egress |
+| `--publish-port <PORT>` | Publish a sandbox TCP port at host `127.0.0.1:PORT`. Repeatable; requires `--proxy-net`, isolation, and allowed egress |
+| `--no-proxy-net` | Disable proxy networking |
+| `--egress-proxy <ADDR:PORT>` | Restrict egress to a host broker. Implies `--proxy-net`; cannot be combined with forwards or publications |
 | `--no-isolate` | Run without namespace isolation, leaving Landlock and seccomp |
 | `--isolate` | Accepted and redundant: isolation is the default |
 | `--quiet` | Do not print what the run enforced |
@@ -51,6 +55,28 @@ an error rather than a policy for a file that does not exist.
 The target executable is granted read and execute implicitly, as the lowest
 config layer, so a binary outside the system paths runs without config. Any user
 layer can retract that grant.
+
+For `[[forward]]` entries with allowed egress, `--proxy-net` requires isolation,
+pasta, working unprivileged user namespaces, and `nft`. Missing prerequisites
+refuse the run. Only the configured TCP loopback services are exposed, while
+the existing internet allowance is retained and other host loopback services
+stay blocked. See [network confinement](/guide/network).
+
+For example, with an egress allowance in the policy, publish a sandbox dev
+server on port 3800:
+
+```sh
+bailey run --proxy-net --publish-port 3800 /usr/bin/python3 -m http.server 3800 --bind 127.0.0.1
+```
+
+`--publish-port` is repeatable for both `run` and `shell`. It does not grant
+egress. Publication is IPv4 TCP only and host-loopback-only, never LAN-facing.
+Port 0 and ports matching either end of a forward are refused, as are
+`--no-proxy-net`, `--no-isolate`, `--egress-proxy`, and denied egress.
+Pasta, working unprivileged user namespaces, and `nft` are mandatory; a missing
+prerequisite or firewall installation failure refuses the run. Each publication
+is reported before the target starts. Unrelated host loopback services stay
+blocked. See [publishing a sandbox service](/guide/network#publishing-a-sandbox-service).
 
 ## `bailey shell`
 
@@ -73,12 +99,24 @@ the same policy without being invoked through bailey.
 | `--deny <PATH>` | Deny a path outright, retracting any grant. Repeatable |
 | `--allow-net <PORT>` | Allow outbound TCP to this port, on any host. Repeatable |
 | `-p, --profile <NAME>` | Profile used as the base |
+| `--proxy-net` | Use a private network namespace with pasta connectivity. Required explicitly for publications and forwards with allowed egress |
+| `--publish-port <PORT>` | Publish a sandbox TCP port at host `127.0.0.1:PORT`. Repeatable; requires `--proxy-net`, isolation, and allowed egress |
+| `--no-proxy-net` | Disable proxy networking |
+| `--egress-proxy <ADDR:PORT>` | Restrict egress to a host broker. Implies `--proxy-net`; cannot be combined with forwards or publications |
 | `--no-isolate` | Run without namespace isolation, leaving Landlock and seccomp |
+
+Network options have the same behavior as for `bailey run`. Online TCP forwards
+require explicit `--proxy-net`, isolation, pasta, working unprivileged user
+namespaces, and `nft`; missing prerequisites refuse the launch. Broker mode is
+also fail-closed and cannot be combined with forwards, publications, or
+`--no-isolate`.
+`--proxy-net` alone does not add connectivity when policy denies egress. See
+[network confinement](/guide/network).
 
 The launch directory is granted read, write, and execute as the lowest layer, so
 a shell is useful in a directory with no config; any layer can retract it. The
 shell gets a private home derived from that directory, and its environment
-carries `BAILEY_SANDBOX` and `BAILEY_SANDBOX_DIR`.
+carries `BAILEY_SANDBOX`, `BAILEY_SANDBOX_NET`, and `BAILEY_SANDBOX_DIR`.
 
 The quick-grant flags describe the highest config layer there is, above
 `--config`, and need no file and no trust step: you typed them, which is the
@@ -116,6 +154,8 @@ generated into a profile. See [auditing a program](/guide/audit).
 Unlike `run`, audit does not isolate. The recorder needs the target held at
 `exec`, and that stop is not inherited across the fork that puts it in a PID
 namespace, so `--isolate` is rejected with an explanation rather than ignored.
+
+Port publication is not available in audit, including entries from config.
 
 Requires the privileged audit helper. See [installation](/guide/installation).
 

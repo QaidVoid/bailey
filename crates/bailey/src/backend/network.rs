@@ -80,7 +80,9 @@ pub fn select(policy: &Policy, userns_available: bool) -> NetworkMode {
 /// Worth saying out loud: the policy names a port, and in this mode nothing
 /// outside can connect to it.
 pub fn bind_is_loopback_only(policy: &Policy, mode: NetworkMode) -> bool {
-    mode == NetworkMode::Isolated && !policy.network.bind_ports.is_empty()
+    mode == NetworkMode::Isolated
+        && !policy.network.bind_ports.is_empty()
+        && policy.network.publish_ports.is_empty()
 }
 
 /// Report the confinement that is actually in force, when it is weaker than the
@@ -305,6 +307,7 @@ mod tests {
                 port: Some(443),
             }]),
             bind_ports: Vec::new(),
+            publish_ports: Vec::new(),
         });
         assert_eq!(select(&policy, true), NetworkMode::LandlockOnly);
     }
@@ -317,6 +320,7 @@ mod tests {
         let policy = policy_with(NetworkPolicy {
             egress: Egress::DenyAll,
             bind_ports: vec![27015],
+            publish_ports: Vec::new(),
         });
         assert_eq!(select(&policy, true), NetworkMode::Isolated);
         assert!(bind_is_loopback_only(&policy, NetworkMode::Isolated));
@@ -340,6 +344,7 @@ mod tests {
                 port: Some(8443),
             }]),
             bind_ports: Vec::new(),
+            publish_ports: Vec::new(),
         });
         assert_eq!(select(&policy, true), NetworkMode::LandlockOnly);
     }
@@ -369,6 +374,7 @@ mod tests {
         let policy = policy_with(NetworkPolicy {
             egress: Egress::Allow(vec![]),
             bind_ports: vec![27015],
+            publish_ports: Vec::new(),
         });
         assert_eq!(select(&policy, true), NetworkMode::LandlockOnly);
     }

@@ -5,8 +5,14 @@
 //! namespaces are unavailable, since the network namespace depends on them.
 
 use std::fs;
+use std::io::{Read, Write};
+use std::net::{TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 fn bailey() -> &'static str {
     env!("CARGO_BIN_EXE_bailey")
@@ -22,14 +28,30 @@ fn netns_available() -> bool {
     bailey::backend::isolation::available()
 }
 
+fn isolated_command(dir: &Path) -> Command {
+    let mut command = Command::new(bailey());
+    command
+        .current_dir(dir)
+        .env("HOME", dir)
+        .env("XDG_CONFIG_HOME", dir.join("config"))
+        .env("XDG_DATA_HOME", dir.join("data"));
+    command
+}
+
 /// Run a short python program under enforcement with the given config body.
 fn run_python(config_body: &str, program: &str) -> std::process::Output {
+    run_python_with_args(config_body, program, &[])
+}
+
+fn run_python_with_args(config_body: &str, program: &str, args: &[&str]) -> std::process::Output {
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("bailey.toml");
     fs::write(&config, config_body).unwrap();
 
-    Command::new(bailey())
-        .args(["run", "-c"])
+    isolated_command(dir.path())
+        .arg("run")
+        .args(args)
+        .arg("-c")
         .arg(&config)
         .args([python().unwrap(), "-c", program])
         .output()
@@ -109,7 +131,8 @@ fn only_loopback_is_visible() {
         eprintln!("skipping: user namespaces unavailable");
         return;
     }
-    let output = Command::new(bailey())
+    let dir = tempfile::tempdir().unwrap();
+    let output = isolated_command(dir.path())
         .args([
             "run",
             "/bin/sh",
@@ -197,7 +220,7 @@ fn allowed_egress_reports_that_only_tcp_is_covered() {
     )
     .unwrap();
 
-    let output = Command::new(bailey())
+    let output = isolated_command(dir.path())
         .args(["run", "-c"])
         .arg(&config)
         .arg("/bin/true")
@@ -211,103 +234,622 @@ fn allowed_egress_reports_that_only_tcp_is_covered() {
     );
 }
 
-/// A forward carries one host port onto the sandbox's loopback, and a port
-/// the policy does not name stays unreachable even though the host serves it.
+/// Host TCP and UDP services whose sockets stay held until their workers stop.
+struct EchoServer {
+    port: u16,
+    stop: Arc<AtomicBool>,
+    udp_received: Arc<AtomicUsize>,
+    workers: Vec<JoinHandle<()>>,
+}
+
+impl EchoServer {
+    fn start() -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let udp = UdpSocket::bind(("127.0.0.1", port)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        udp.set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let tcp_stop = Arc::clone(&stop);
+        let tcp = std::thread::spawn(move || {
+            while !tcp_stop.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut client, _)) => {
+                        client
+                            .set_read_timeout(Some(Duration::from_secs(2)))
+                            .unwrap();
+                        client
+                            .set_write_timeout(Some(Duration::from_secs(2)))
+                            .unwrap();
+                        let mut buf = [0; 64];
+                        if let Ok(n) = client.read(&mut buf) {
+                            let _ = client.write_all(&buf[..n]);
+                        }
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(err) => panic!("host TCP listener failed: {err}"),
+                }
+            }
+        });
+        let udp_stop = Arc::clone(&stop);
+        let udp_received = Arc::new(AtomicUsize::new(0));
+        let received = Arc::clone(&udp_received);
+        let udp = std::thread::spawn(move || {
+            let mut buf = [0; 64];
+            while !udp_stop.load(Ordering::Relaxed) {
+                match udp.recv_from(&mut buf) {
+                    Ok((n, peer)) => {
+                        received.fetch_add(1, Ordering::Relaxed);
+                        let _ = udp.send_to(&buf[..n], peer);
+                    }
+                    Err(err)
+                        if matches!(
+                            err.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(err) => panic!("host UDP listener failed: {err}"),
+                }
+            }
+        });
+        Self {
+            port,
+            stop,
+            udp_received,
+            workers: vec![tcp, udp],
+        }
+    }
+}
+
+impl Drop for EchoServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        for worker in self.workers.drain(..) {
+            if worker.join().is_err() && !std::thread::panicking() {
+                panic!("host echo worker panicked");
+            }
+        }
+    }
+}
+
+fn proxy_net_available() -> bool {
+    if python().is_none() || !netns_available() {
+        eprintln!("skipping: needs python3 and user namespaces");
+        return false;
+    }
+    for helper in ["pasta", "nft"] {
+        if let Err(err) = bailey::cli::resolve_helper(helper) {
+            eprintln!("skipping: needs trusted {helper}: {err}");
+            return false;
+        }
+    }
+    // Probe nft independently, so only missing kernel support can skip a test.
+    // A failure in Bailey's own firewall installation must fail the test.
+    let nft = bailey::cli::resolve_helper("nft").unwrap();
+    let program = format!(
+        r#"import ctypes, os, subprocess
+uid, gid = os.getuid(), os.getgid()
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.unshare(0x10000000 | 0x40000000):
+    raise OSError(ctypes.get_errno(), 'unshare')
+with open('/proc/self/setgroups', 'w') as f:
+    f.write('deny')
+with open('/proc/self/uid_map', 'w') as f:
+    f.write(f'0 {{uid}} 1')
+with open('/proc/self/gid_map', 'w') as f:
+    f.write(f'0 {{gid}} 1')
+subprocess.run([{nft:?}, '-f', '-'], input='table inet bailey_test {{\n chain output {{\n type filter hook output priority 0; policy accept;\n }}\n}}\n', text=True, check=True)
+"#,
+        nft = nft.to_str().unwrap()
+    );
+    let output = Command::new(python().unwrap())
+        .args(["-c", &program])
+        .output()
+        .unwrap();
+    if !output.status.success() {
+        eprintln!(
+            "skipping: nft is unavailable in a private user/network namespace: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return false;
+    }
+    true
+}
+
+/// A denied-egress forward still carries to the host without a private proxy.
 #[test]
 fn forwarded_ports_carry_to_the_host_and_others_stay_dead() {
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Duration;
-
     if python().is_none() || !netns_available() {
         eprintln!("skipping: needs python3 and user namespaces");
         return;
     }
-
-    // The host services live on ports the test itself holds, so a sandbox
-    // that somehow shared the host stack would reach both of them.
-    fn held_server(stop: Arc<AtomicBool>) -> u16 {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        listener.set_nonblocking(true).unwrap();
-        std::thread::spawn(move || {
-            while !stop.load(Ordering::Relaxed) {
-                match listener.accept() {
-                    // Held but served with silence: a forwarded dial to this
-                    // port would hang, and an unforwarded one must not land.
-                    Ok((client, _)) => drop(client),
-                    Err(_) => std::thread::sleep(Duration::from_millis(10)),
-                }
-            }
-        });
-        port
-    }
-
-    fn echo_server(stop: Arc<AtomicBool>) -> u16 {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
-        listener.set_nonblocking(true).unwrap();
-        std::thread::spawn(move || {
-            while !stop.load(Ordering::Relaxed) {
-                match listener.accept() {
-                    Ok((mut client, _)) => {
-                        let mut buf = [0u8; 64];
-                        match client.read(&mut buf) {
-                            Ok(0) | Err(_) => {}
-                            Ok(n) => {
-                                let _ = client.write_all(&buf[..n]);
-                            }
-                        }
-                    }
-                    Err(_) => std::thread::sleep(Duration::from_millis(10)),
-                }
-            }
-        });
-        port
-    }
-
-    let echo_stop = Arc::new(AtomicBool::new(false));
-    let hold_stop = Arc::new(AtomicBool::new(false));
-    let forwarded = echo_server(Arc::clone(&echo_stop));
-    let hidden = held_server(Arc::clone(&hold_stop));
-
-    let dir = tempfile::tempdir().unwrap();
-    let config = dir.path().join("bailey.toml");
-    fs::write(&config, format!("[[forward]]\nport = {forwarded}\n")).unwrap();
-
-    let program = format!(
-        "import socket\n\
-         s = socket.create_connection(('127.0.0.1', {forwarded}), timeout=5)\n\
-         s.sendall(b'ping-forward')\n\
-         s.shutdown(socket.SHUT_WR)\n\
-         print('echo-' + s.recv(64).decode())\n\
-         s.close()\n\
-         try:\n\
-         \x20   socket.create_connection(('127.0.0.1', {hidden}), timeout=2)\n\
-         \x20   print('reached-hidden')\n\
-         except OSError:\n\
-         \x20   print('hidden-refused')\n"
+    let echo = EchoServer::start();
+    let hidden = EchoServer::start();
+    let output = run_python(
+        &format!("[[forward]]\nport = {}\n", echo.port),
+        &format!(
+            r#"import socket
+s = socket.create_connection(('127.0.0.1', {}), timeout=3)
+s.sendall(b'ping-forward')
+print('echo-' + s.recv(64).decode())
+s.close()
+try:
+    socket.create_connection(('127.0.0.1', {}), timeout=1)
+    print('reached-hidden')
+except OSError:
+    print('hidden-refused')
+"#,
+            echo.port, hidden.port
+        ),
     );
-    let output = Command::new(bailey())
-        .args(["run", "-c"])
-        .arg(&config)
-        .args([python().unwrap(), "-c", &program])
-        .output()
-        .unwrap();
-
-    echo_stop.store(true, Ordering::Relaxed);
-    hold_stop.store(true, Ordering::Relaxed);
-
-    let stdout = stdout_of(&output);
     assert!(
-        stdout.contains("echo-ping-forward"),
-        "the forwarded port must carry to the host service: {stdout} stderr: {}",
+        output.status.success(),
+        "forwarded target failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert_eq!(stdout_of(&output), "echo-ping-forward\nhidden-refused");
+}
+
+fn check_proxy_net_forward(network: &str) {
+    if !proxy_net_available() {
+        return;
+    }
+    let echo = EchoServer::start();
+    let hidden = EchoServer::start();
+    // Holding a third host listener also guarantees an explicit, distinct remap.
+    let inside = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let inside_port = inside.local_addr().unwrap().port();
+    assert_ne!(inside_port, echo.port);
+    let output = run_python_with_args(
+        &format!(
+            "[network]\n{network}\n[[forward]]\nport = {inside_port}\nhost_port = {}\n",
+            echo.port
+        ),
+        &format!(
+            r#"import concurrent.futures, socket
+inside, host, hidden = {inside_port}, {host}, {hidden}
+def echo(i):
+    payload = ('ping-forward-' + str(i)).encode()
+    with socket.create_connection(('127.0.0.1', inside), timeout=3) as s:
+        s.sendall(payload)
+        assert s.recv(64) == payload
+with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+    list(pool.map(echo, range(4)))
+print('concurrent-echo-ok')
+for address, port in (('127.0.0.1', host), ('127.0.0.1', hidden),
+                      ('10.0.2.15', inside), ('127.0.0.2', inside), ('::1', inside)):
+    try:
+        with socket.create_connection((address, port), timeout=1):
+            raise AssertionError('reached unforwarded endpoint ' + str((address, port)))
+    except OSError:
+        pass
+print('other-host-ports-refused')
+for port in (inside, host, hidden):
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.settimeout(0.3)
+        try:
+            s.sendto(b'udp-must-not-cross', ('127.0.0.1', port))
+            s.recv(64)
+            raise AssertionError('forward opened UDP port ' + str(port))
+        except OSError:
+            pass
+print('udp-refused')
+"#,
+            host = echo.port,
+            hidden = hidden.port,
+        ),
+        &["--proxy-net"],
+    );
     assert!(
-        stdout.contains("hidden-refused"),
-        "a host port the policy does not forward must stay unreachable: {stdout}"
+        output.status.success(),
+        "private-network forward failed: status {} stdout: {} stderr: {}",
+        output.status,
+        stdout_of(&output),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        stdout_of(&output),
+        "concurrent-echo-ok\nother-host-ports-refused\nudp-refused"
+    );
+    assert_eq!(echo.udp_received.load(Ordering::Relaxed), 0);
+    assert_eq!(hidden.udp_received.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn proxy_net_forwards_remap_only_selected_tcp_host_ports() {
+    check_proxy_net_forward("egress = \"allow\"");
+}
+
+#[test]
+fn proxy_net_partial_egress_allows_only_selected_host_forward() {
+    check_proxy_net_forward("egress_allow = [{ host = \"*\", port = 443 }]");
+}
+
+#[test]
+fn proxy_net_without_forwards_blocks_host_loopback() {
+    if !proxy_net_available() {
+        return;
+    }
+    let host = EchoServer::start();
+    let output = run_python_with_args(
+        "[network]\negress = \"allow\"\n",
+        &format!(
+            r#"import socket
+try:
+    with socket.create_connection(('127.0.0.1', {}), timeout=1):
+        raise AssertionError('default proxy network reached host loopback')
+except OSError:
+    print('host-refused')
+"#,
+            host.port
+        ),
+        &["--proxy-net"],
+    );
+    assert!(
+        output.status.success(),
+        "private-network control failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(stdout_of(&output), "host-refused");
+}
+
+#[test]
+fn allowed_egress_forward_requires_proxy_net() {
+    if python().is_none() {
+        eprintln!("skipping: needs python3");
+        return;
+    }
+    let host = EchoServer::start();
+    let output = run_python(
+        &format!(
+            "[network]\negress = \"allow\"\n[[forward]]\nport = {}\n",
+            host.port
+        ),
+        "print('target-ran')",
+    );
+    assert!(
+        !output.status.success(),
+        "an unsafe forward must be refused"
+    );
+    assert!(!stdout_of(&output).contains("target-ran"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--proxy-net"),
+        "the rejection must explain the required private network: {stderr}"
+    );
+}
+
+struct PublishingChild {
+    child: std::process::Child,
+    stdout: PathBuf,
+    stderr: PathBuf,
+}
+
+impl PublishingChild {
+    fn spawn(command: &mut Command, dir: &Path) -> Self {
+        let stdout = dir.join("child.stdout");
+        let stderr = dir.join("child.stderr");
+        let child = command
+            .stdout(fs::File::create(&stdout).unwrap())
+            .stderr(fs::File::create(&stderr).unwrap())
+            .spawn()
+            .unwrap();
+        Self {
+            child,
+            stdout,
+            stderr,
+        }
+    }
+
+    fn diagnostics(&self) -> String {
+        format!(
+            "stdout: {}\nstderr: {}",
+            fs::read_to_string(&self.stdout).unwrap(),
+            fs::read_to_string(&self.stderr).unwrap()
+        )
+    }
+
+    fn wait_for_ready(&mut self) -> u16 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let stdout = fs::read_to_string(&self.stdout).unwrap();
+            if let Some(port) = stdout.lines().find_map(|line| line.strip_prefix("ready ")) {
+                return port.parse().unwrap();
+            }
+            assert!(
+                self.child.try_wait().unwrap().is_none(),
+                "publication target exited before readiness: {}",
+                self.diagnostics()
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "publication target never became ready: {}",
+                self.diagnostics()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn wait_for_exit(&mut self) -> std::process::ExitStatus {
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                return status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "publication target did not exit: {}",
+                self.diagnostics()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+impl Drop for PublishingChild {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn publication_echo(port: u16, payload: &[u8]) -> std::io::Result<()> {
+    let mut client = std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        Duration::from_millis(250),
+    )?;
+    client.set_read_timeout(Some(Duration::from_millis(500)))?;
+    client.set_write_timeout(Some(Duration::from_millis(500)))?;
+    client.write_all(payload)?;
+    let mut echoed = vec![0; payload.len()];
+    client.read_exact(&mut echoed)?;
+    assert_eq!(echoed, payload);
+    Ok(())
+}
+
+fn non_loopback_host_address() -> Option<std::net::Ipv4Addr> {
+    let output = Command::new(python().unwrap())
+        .args([
+            "-c",
+            r#"import fcntl, ipaddress, socket, struct
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+    for _, name in sorted(socket.if_nameindex()):
+        request = struct.pack('256s', name.encode()[:15])
+        try:
+            flags = struct.unpack_from('H', fcntl.ioctl(s, 0x8913, request), 16)[0]
+            address = socket.inet_ntoa(fcntl.ioctl(s, 0x8915, request)[20:24])
+        except OSError:
+            continue
+        ip = ipaddress.ip_address(address)
+        if flags & 1 and not (ip.is_loopback or ip.is_unspecified or ip.is_link_local):
+            print(address)
+            break
+"#,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "could not enumerate host interfaces: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let address = stdout_of(&output);
+    if address.is_empty() {
+        None
+    } else {
+        Some(address.parse().unwrap())
+    }
+}
+
+#[test]
+fn proxy_net_publishes_only_requested_loopback_tcp_and_keeps_forwarding() {
+    if !proxy_net_available() {
+        return;
+    }
+    let forward = EchoServer::start();
+    let hidden = EchoServer::start();
+    let inside = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let inside_port = inside.local_addr().unwrap().port();
+    let publication = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = publication.local_addr().unwrap().port();
+    let publication_udp = UdpSocket::bind(("127.0.0.1", port)).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("bailey.toml");
+    fs::write(
+        &config,
+        format!(
+            "[network]\negress = \"allow\"\npublish_ports = [{port}]\n\
+             [[forward]]\nport = {inside_port}\nhost_port = {}\n",
+            forward.port
+        ),
+    )
+    .unwrap();
+    let program = format!(
+        r#"import selectors, socket, time
+with socket.create_connection(('127.0.0.1', {inside_port}), timeout=3) as client:
+    client.sendall(b'remapped-forward')
+    assert client.recv(64) == b'remapped-forward'
+print('forward-ok', flush=True)
+for port in ({host_port}, {hidden_port}):
+    try:
+        with socket.create_connection(('127.0.0.1', port), timeout=1):
+            raise AssertionError('publication allowed unrelated host loopback: ' + str(port))
+    except OSError:
+        pass
+print('host-loopback-blocked', flush=True)
+with selectors.DefaultSelector() as selector:
+    published = socket.socket()
+    published.bind(('127.0.0.1', {port}))
+    published.listen()
+    unpublished = socket.socket()
+    unpublished.bind(('127.0.0.1', 0))
+    unpublished.listen()
+    udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp.bind(('127.0.0.1', {port}))
+    selector.register(published, selectors.EVENT_READ, 'published')
+    selector.register(unpublished, selectors.EVENT_READ, 'unpublished')
+    selector.register(udp, selectors.EVENT_READ, 'udp')
+    print('ready ' + str(unpublished.getsockname()[1]), flush=True)
+    deadline, done, received = time.monotonic() + 20, False, 0
+    while not done and time.monotonic() < deadline:
+        for key, _ in selector.select(timeout=0.1):
+            if key.data == 'udp':
+                payload, peer = udp.recvfrom(64)
+                received += 1
+                udp.sendto(payload, peer)
+            else:
+                with key.fileobj.accept()[0] as client:
+                    client.settimeout(1)
+                    payload = client.recv(64)
+                    assert key.data == 'published', 'unrequested ingress reached sandbox'
+                    client.sendall(payload)
+                    done = payload == b'stop'
+    print('udp-received=' + str(received), flush=True)
+    assert done, 'host never stopped publication server'
+    assert received == 0, 'TCP publication also forwarded UDP'
+"#,
+        host_port = forward.port,
+        hidden_port = hidden.port,
+    );
+    drop(publication_udp);
+    drop(publication);
+    let mut command = isolated_command(dir.path());
+    command
+        .args(["run", "--proxy-net", "-c"])
+        .arg(&config)
+        .args([python().unwrap(), "-c", &program]);
+    let mut child = PublishingChild::spawn(&mut command, dir.path());
+    let unpublished_port = child.wait_for_ready();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match publication_echo(port, b"host-to-sandbox") {
+            Ok(()) => break,
+            Err(error) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "published loopback TCP port was unreachable: {error}; {}",
+                    child.diagnostics()
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+    if let Some(address) = non_loopback_host_address() {
+        assert!(
+            std::net::TcpStream::connect_timeout(
+                &std::net::SocketAddr::from((address, port)),
+                Duration::from_millis(500),
+            )
+            .is_err(),
+            "published TCP port was reachable on non-loopback address {address}"
+        );
+    } else {
+        eprintln!("skipping non-loopback assertion: no active non-loopback IPv4 address");
+    }
+    assert!(
+        std::net::TcpStream::connect_timeout(
+            &std::net::SocketAddr::from(([127, 0, 0, 1], unpublished_port)),
+            Duration::from_millis(500),
+        )
+        .is_err(),
+        "an unpublished sandbox TCP listener was reachable from the host"
+    );
+    let udp = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+    udp.set_read_timeout(Some(Duration::from_millis(400)))
+        .unwrap();
+    udp.send_to(b"udp-must-not-be-published", ("127.0.0.1", port))
+        .unwrap();
+    let mut buf = [0; 64];
+    assert!(udp.recv_from(&mut buf).is_err(), "publication exposed UDP");
+    publication_echo(port, b"stop").unwrap();
+    assert!(
+        child.wait_for_exit().success(),
+        "publication target failed: {}",
+        child.diagnostics()
+    );
+    let stdout = fs::read_to_string(&child.stdout).unwrap();
+    assert!(stdout.contains("forward-ok\nhost-loopback-blocked\nready "));
+    assert!(stdout.contains("udp-received=0"));
+    assert_eq!(forward.udp_received.load(Ordering::Relaxed), 0);
+    assert_eq!(hidden.udp_received.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn proxy_net_occupied_publication_fails_before_hooks_or_target() {
+    if !proxy_net_available() {
+        return;
+    }
+    let occupied = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let occupied_port = occupied.local_addr().unwrap().port();
+    let free = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let free_port = free.local_addr().unwrap().port();
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("bailey.toml");
+    let hook_marker = dir.path().join("hook-ran");
+    let target_marker = dir.path().join("target-ran");
+    fs::write(
+        &config,
+        format!(
+            "[network]\negress = \"allow\"\npublish_ports = [{free_port}, {occupied_port}]\n\
+             [filesystem]\nwrite = [{directory:?}]\n\
+             [hooks]\npre_launch = [\"touch '{hook}'\"]\n",
+            directory = dir.path().to_str().unwrap(),
+            hook = hook_marker.display(),
+        ),
+    )
+    .unwrap();
+    drop(free);
+    let mut command = isolated_command(dir.path());
+    command
+        .args(["run", "--proxy-net", "-c"])
+        .arg(&config)
+        .args([python().unwrap(), "-c"])
+        .arg(format!(
+            "from pathlib import Path; Path({:?}).touch()",
+            target_marker.to_str().unwrap()
+        ));
+    let mut child = PublishingChild::spawn(&mut command, dir.path());
+    assert!(
+        !child.wait_for_exit().success(),
+        "an occupied host publication must fail: {}",
+        child.diagnostics()
+    );
+    assert!(
+        !hook_marker.exists() && !target_marker.exists(),
+        "publication preflight ran a hook or target before rejecting the occupied port: {}",
+        child.diagnostics()
+    );
+    let stderr = fs::read_to_string(&child.stderr).unwrap();
+    assert!(
+        stderr.contains(&occupied_port.to_string()),
+        "rejection must identify the occupied port: {}",
+        child.diagnostics()
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        match TcpListener::bind(("127.0.0.1", free_port)) {
+            Ok(listener) => {
+                drop(listener);
+                break;
+            }
+            Err(error) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "failed publication left the free port occupied: {error}; {}",
+                    child.diagnostics()
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+    assert!(
+        std::net::TcpStream::connect_timeout(
+            &std::net::SocketAddr::from(([127, 0, 0, 1], free_port)),
+            Duration::from_millis(250),
+        )
+        .is_err(),
+        "failed publication left the free port accepting connections"
     );
 }

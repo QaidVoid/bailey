@@ -1,14 +1,19 @@
 # Network confinement
 
-There are two modes, chosen from the policy and from what the host can do.
-`bailey show <target>` prints which one applies.
+The base network mode follows the policy. `bailey show <target>` prints it;
+`bailey run --proxy-net` or `bailey shell --proxy-net` can add a private
+namespace with connectivity for allowed egress.
 
 | Policy | Mode | What is enforced |
 | --- | --- | --- |
-| `egress = "deny"`, no bound ports | **isolated** | Own network namespace, loopback only. Nothing reaches off the host, at any protocol |
-| Any egress allowed, or a bound port | **landlock only** | Landlock rules over TCP ports. Other protocols are unrestricted |
+| `egress = "deny"` | **isolated** | Own network namespace, loopback only. Only explicit forwards reach host services |
+| Any egress allowed, without `--proxy-net` | **landlock only** | Landlock rules over TCP ports. Other protocols are unrestricted |
+| Any egress allowed, with `--proxy-net` | **proxy network** | Private namespace with pasta connectivity. Explicit forwards and publications require fail-closed setup |
 
-The default policy denies egress, so the default mode is isolated.
+The default policy denies egress, so the default mode is isolated. Explicit
+`[[forward]]` entries can carry selected host TCP services into a private
+namespace without exposing other host loopback services. With allowed egress,
+these entries require explicit `--proxy-net` on `bailey run` or `bailey shell`.
 
 ## Isolated mode
 
@@ -81,22 +86,92 @@ bailey run --proxy-net /usr/bin/ip -o addr show scope global
 # a private address such as 10.0.2.15, never the host's
 ```
 
-It needs pasta on `PATH` and unprivileged user namespaces. Without either, the
-run continues and says the host address stays visible rather than failing. The
-namespace is given a private IPv6 address as well, where the host has one to
+It needs pasta in a trusted system location and unprivileged user namespaces.
+Without either, the run continues and says the host address stays visible rather
+than failing, unless forwards, publications, or `--egress-proxy` require fail-closed isolation.
+The namespace is given a private IPv6 address as well, where the host has one to
 reach, so the host's global IPv6 and the MAC embedded in it are never formed; on
 a host with no IPv6, the namespace gets none rather than a route it cannot
 follow. This addresses the host-identity exposure above; it does not tighten the
-egress surface, which the policy's ports already govern.
+egress surface, which the policy's ports already govern. With denied egress,
+`--proxy-net` does not add connectivity.
 
-pasta forwards the namespace's own `127.0.0.0/8` to the host's loopback, so
-without more a session could reach a host service on a permitted port. Under
-`--proxy-net` bailey drops that forwarded loopback with a netfilter rule, so a
-session cannot reach the host on `127.0.0.1` whatever port the policy allows.
-It is best-effort here and needs `nft`; the run says so if the rule cannot be
-installed. The default landlock-only mode shares the host network namespace,
-so there is no separate loopback to isolate and this rule does not apply;
-`--proxy-net` is what gives a session a loopback of its own to protect.
+pasta can forward namespace loopback to the host's loopback. Under
+`--proxy-net`, bailey blocks that access with a netfilter rule. Without
+forwards or publications, this protection is best-effort and needs `nft`; the run reports if
+the rule cannot be installed. The default landlock-only mode shares the host
+network namespace, so there is no separate loopback to protect there.
+
+### Reaching selected host services while online
+
+Use `[[forward]]` with `--proxy-net` to expose selected host TCP services while
+keeping the policy's internet access:
+
+```toml
+[network]
+egress = "allow"
+
+[[forward]]
+port = 8080
+```
+
+```sh
+bailey shell --proxy-net
+```
+
+The sandbox's `127.0.0.1:8080` now reaches a host service such as zai-proxy on
+`127.0.0.1:8080`. Set `host_port` to use a different host port. General internet
+egress stays available, while unrelated host loopback services remain blocked.
+With `egress_allow`, the existing TCP port allowance is retained instead.
+Forward-only ports do not become new internet permissions.
+
+Online forwards require explicit `--proxy-net`, isolation, pasta, working
+unprivileged user namespaces, and `nft`. Missing prerequisites or failure to
+install the firewall refuse the run. The firewall permits the selected TCP
+loopback connections and established replies, then blocks other host loopback
+access. Only explicit TCP forwards are enabled, with no automatic, inbound, or
+UDP forwarding. The forwards stay private to the sandbox.
+
+Forwards without `--proxy-net` are supported only with denied egress. Combining
+forwards with `--egress-proxy` is refused so the broker remains the sole egress
+path. Both `bailey run` and `bailey shell` support these options. See
+[desktop services and mounts](/guide/desktop) for remapping and concurrency.
+
+### Publishing a sandbox service
+
+Publication is the reverse of a forward: it makes a TCP service inside the
+sandbox reachable from the host, only at `127.0.0.1:PORT`. For a dev server on
+3800, use a policy with allowed egress and permission to bind that port:
+
+```toml
+[network]
+egress_allow = [{ host = "*", port = 443 }]
+bind_ports = [3800]
+```
+
+```sh
+bailey shell --proxy-net --publish-port 3800
+# Inside the confined shell:
+python3 -m http.server 3800 --bind 127.0.0.1
+```
+
+From a separate host terminal, open `http://127.0.0.1:3800`. A server bound to
+sandbox `0.0.0.0:3800` works too. The host's LAN addresses do not expose it.
+Instead of the repeatable `--publish-port` flag, add `publish_ports = [3800]`
+to `[network]`. Entries accumulate across layers and are cleared alongside
+forwards by `[filesystem] reset = true`.
+
+Publication does not grant outbound egress or unblock unrelated host loopback
+services. It publishes IPv4 TCP only, never UDP or IPv6. Port 0 is a config
+error, and a published port matching either a forward's sandbox port or its
+host port is refused. Each publication is reported before the target starts.
+
+Publishing requires explicit `--proxy-net`, namespace isolation, and allowed
+egress. It is unavailable in audit or without the proxy network setup, and is
+refused with `--no-proxy-net`, `--no-isolate`, `--egress-proxy`, or
+`egress = "deny"`. Missing pasta, working unprivileged user namespaces, or
+`nft`, or failure to install the firewall, refuses the run rather than
+degrading it.
 
 ### Forcing egress through a broker with `--egress-proxy`
 
@@ -111,6 +186,9 @@ except one to ADDR:PORT.
 bailey run --egress-proxy 169.254.169.1:8443 -- curl https://example.com
 # reaches the broker at 169.254.169.1:8443 and nothing else; 1.1.1.1:443 is dropped
 ```
+
+`bailey shell --egress-proxy 169.254.169.1:8443` applies the same lockdown
+to an interactive shell. Broker mode cannot be combined with publications or `--no-isolate`.
 
 The broker is whatever the caller runs there: it admits an allowlist of hosts
 and refuses the rest, so a session reaches the endpoints it needs and no relay
@@ -161,7 +239,10 @@ is dropped, along with the protection.
 - **UDP filtering.** There is no mode that allows some UDP and denies the rest.
 - **Ingress.** A sandbox in isolated mode has no address, so nothing outside can
   reach it; a port it binds is reachable from inside the sandbox and nowhere
-  else. In landlock-only mode, which is what allowing egress gives, `bind_ports`
-  governs what it may listen on and the port is reachable as usual.
+  else. In landlock-only mode without `--proxy-net`, `bind_ports` governs what
+  it may listen on and the port is reachable as usual. Online forwards under
+  `--proxy-net` do not enable inbound access. Explicit `publish_ports` entries
+  or `--publish-port` flags expose only the selected IPv4 TCP ports on the
+  host loopback.
 
 See [known limitations](/security/limitations) for the full list.
