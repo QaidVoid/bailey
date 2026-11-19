@@ -12,14 +12,22 @@
 #     read = ["."]
 #     write = ["."]
 #
-# Pair it with `--isolate`, which is what makes a `deny` inside the project
-# enforceable and puts your other projects out of the agent's reach.
+# Isolation is on by default; keep it on, since it is what makes a `deny`
+# inside the project enforceable and puts your other projects out of the
+# agent's reach.
 #
-# The cost of allowing egress at all: a partial allowance gives up the network
-# namespace, so the agent shares the host's, where UDP, DNS and the host's
-# loopback are reachable and only TCP ports are enforced. There is no way around
-# that today for a program that must call an API. For an agent that must not
-# reach the network, use the `untrusted` floor, which denies it outright.
+# What this egress rule enforces depends on the network mode. In the host's
+# network namespace, the default when a policy allows egress, only TCP ports
+# are enforced: the agent reaches any host on 443, and UDP, DNS and the host's
+# loopback are unrestricted there. That gap belongs to the host mode alone.
+# `--proxy-net` moves the run into a private namespace that hides the host's
+# address and the host's loopback services, and `--egress-proxy ADDR:PORT`
+# confines egress further, to a broker on the host that admits only the
+# destinations it allows. The modes and their reasons are in the network
+# guide, docs/guide/network.md.
+#
+# For an agent that must not reach the network, use the `untrusted` floor,
+# which denies it outright.
 #
 # Certificates come from the floor's read access to /usr and /etc.
 

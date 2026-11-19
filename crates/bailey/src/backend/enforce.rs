@@ -11,6 +11,12 @@
 //! libraries are themselves filesystem access, a policy must grant read and
 //! execute on the system paths a program needs, or it will not start. The
 //! bundled profiles exist to supply those defaults.
+//!
+//! Every refusal the seccomp filter makes lives in one of the named tables in
+//! this file, and a unit test holds the enforcement page of the documentation
+//! to the union of those tables. A refusal written without a named table, one
+//! in the hand-built prologue for instance, is invisible to that test and must
+//! be documented by hand alongside it.
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -1859,60 +1865,63 @@ const SYS_KEXEC_FILE_LOAD: libc::c_long = 294;
 #[cfg(not(all(target_arch = "aarch64", target_env = "musl")))]
 const SYS_KEXEC_FILE_LOAD: libc::c_long = libc::SYS_kexec_file_load;
 
-/// Syscalls denied to the target. These are not needed by normal applications
-/// and are common building blocks for sandbox escape, privilege escalation, or
-/// tampering with other processes.
-fn denied_syscalls() -> &'static [i64] {
+/// Syscalls denied to the target, each entry carrying the kernel name the
+/// documentation page uses. These are not needed by normal applications and
+/// are common building blocks for sandbox escape, privilege escalation, or
+/// tampering with other processes. Every new refusal goes into this table or
+/// one of the other named tables below, so the docs test can hold the page
+/// and the filter to the same list.
+fn denied_syscalls() -> &'static [(&'static str, i64)] {
     &[
-        libc::SYS_ptrace,
-        libc::SYS_add_key,
-        libc::SYS_request_key,
-        libc::SYS_keyctl,
-        libc::SYS_kexec_load,
-        SYS_KEXEC_FILE_LOAD,
-        libc::SYS_init_module,
-        libc::SYS_finit_module,
-        libc::SYS_delete_module,
-        libc::SYS_bpf,
-        libc::SYS_perf_event_open,
-        libc::SYS_userfaultfd,
-        libc::SYS_swapon,
-        libc::SYS_swapoff,
-        libc::SYS_reboot,
-        libc::SYS_pivot_root,
-        libc::SYS_setns,
-        libc::SYS_unshare,
-        libc::SYS_process_vm_readv,
-        libc::SYS_process_vm_writev,
-        libc::SYS_open_by_handle_at,
-        libc::SYS_acct,
+        ("ptrace", libc::SYS_ptrace),
+        ("add_key", libc::SYS_add_key),
+        ("request_key", libc::SYS_request_key),
+        ("keyctl", libc::SYS_keyctl),
+        ("kexec_load", libc::SYS_kexec_load),
+        ("kexec_file_load", SYS_KEXEC_FILE_LOAD),
+        ("init_module", libc::SYS_init_module),
+        ("finit_module", libc::SYS_finit_module),
+        ("delete_module", libc::SYS_delete_module),
+        ("bpf", libc::SYS_bpf),
+        ("perf_event_open", libc::SYS_perf_event_open),
+        ("userfaultfd", libc::SYS_userfaultfd),
+        ("swapon", libc::SYS_swapon),
+        ("swapoff", libc::SYS_swapoff),
+        ("reboot", libc::SYS_reboot),
+        ("pivot_root", libc::SYS_pivot_root),
+        ("setns", libc::SYS_setns),
+        ("unshare", libc::SYS_unshare),
+        ("process_vm_readv", libc::SYS_process_vm_readv),
+        ("process_vm_writev", libc::SYS_process_vm_writev),
+        ("open_by_handle_at", libc::SYS_open_by_handle_at),
+        ("acct", libc::SYS_acct),
         // `memfd_create` makes an anonymous executable inode that no
         // filesystem rule can name, so a `PathBeneath` rule on execute cannot
         // reach it. With it denied there is nothing for `execveat` to name
         // through `AT_EMPTY_PATH`, and everything the target runs comes off a
         // path the policy granted.
-        libc::SYS_memfd_create,
+        ("memfd_create", libc::SYS_memfd_create),
         // Landlock is checked when a file is opened, not when a descriptor is
         // duplicated, so a descriptor taken from bailey carries the access
         // bailey had. Without a PID namespace the target can name bailey and
         // ask for one, which reaches the trust store and the config that was
         // just verified.
-        libc::SYS_pidfd_getfd,
+        ("pidfd_getfd", libc::SYS_pidfd_getfd),
         // Landlock still mediates the filesystem operations a ring issues, but
         // a ring does not go through `sys_ioctl`, so the subvolume denials
         // below would be reachable through it. Nothing here needs io_uring.
-        libc::SYS_io_uring_setup,
-        libc::SYS_io_uring_enter,
-        libc::SYS_io_uring_register,
-        libc::SYS_chroot,
-        libc::SYS_quotactl,
+        ("io_uring_setup", libc::SYS_io_uring_setup),
+        ("io_uring_enter", libc::SYS_io_uring_enter),
+        ("io_uring_register", libc::SYS_io_uring_register),
+        ("chroot", libc::SYS_chroot),
+        ("quotactl", libc::SYS_quotactl),
         // Same-uid cross-process reach that neither Landlock nor the namespace
         // covers.
-        libc::SYS_kcmp,
-        libc::SYS_process_madvise,
-        libc::SYS_process_mrelease,
+        ("kcmp", libc::SYS_kcmp),
+        ("process_madvise", libc::SYS_process_madvise),
+        ("process_mrelease", libc::SYS_process_mrelease),
         // Bounded only by the ambient memlock limit, which is the host's.
-        libc::SYS_mlockall,
+        ("mlockall", libc::SYS_mlockall),
     ]
 }
 
@@ -1921,17 +1930,18 @@ fn denied_syscalls() -> &'static [i64] {
 ///
 /// Denied by default. A policy with `self_fuse` lets them through, because
 /// the kernel still gates every one on `CAP_SYS_ADMIN` in the run's user
-/// namespace, which is exactly the capability `self_fuse` keeps.
-const MOUNT_SYSCALLS: &[i64] = &[
-    libc::SYS_mount,
-    libc::SYS_umount2,
-    libc::SYS_fsopen,
-    libc::SYS_fsconfig,
-    libc::SYS_fsmount,
-    libc::SYS_move_mount,
-    libc::SYS_open_tree,
-    libc::SYS_fspick,
-    libc::SYS_mount_setattr,
+/// namespace, which is exactly the capability `self_fuse` keeps. Each entry
+/// carries the kernel name the documentation page uses.
+const MOUNT_SYSCALLS: &[(&str, i64)] = &[
+    ("mount", libc::SYS_mount),
+    ("umount2", libc::SYS_umount2),
+    ("fsopen", libc::SYS_fsopen),
+    ("fsconfig", libc::SYS_fsconfig),
+    ("fsmount", libc::SYS_fsmount),
+    ("move_mount", libc::SYS_move_mount),
+    ("open_tree", libc::SYS_open_tree),
+    ("fspick", libc::SYS_fspick),
+    ("mount_setattr", libc::SYS_mount_setattr),
 ];
 
 /// Type bytes of the ioctl families that create a subvolume or a snapshot,
@@ -1945,8 +1955,9 @@ const MOUNT_SYSCALLS: &[i64] = &[
 /// directory of arbitrary files outside the sandbox. Denying these families
 /// here, where Landlock cannot reach, closes that. `0x94` is btrfs (and
 /// `FICLONE`, so a reflink copy is refused with it and falls back to a full
-/// copy); `0xbc` is bcachefs.
-const SUBVOL_IOCTL_TYPES: [u64; 2] = [0x94, 0xbc];
+/// copy); `0xbc` is bcachefs. Each entry carries the filesystem name the
+/// documentation page uses.
+const SUBVOL_IOCTL_TYPES: [(&str, u64); 2] = [("btrfs", 0x94), ("bcachefs", 0xbc)];
 
 /// Terminal requests that put bytes into the input queue of a shared tty.
 ///
@@ -1954,8 +1965,21 @@ const SUBVOL_IOCTL_TYPES: [u64; 2] = [0x94, 0xbc];
 /// reach the caller's terminal can run a command in the caller's shell after
 /// the sandbox exits. `TIOCLINUX` reaches the console selection buffer the same
 /// way. Current kernels gate `TIOCSTI` behind a capability and a sysctl, and
-/// the older ones this still supports do not.
-const TERMINAL_INJECTION_IOCTLS: [u64; 2] = [0x5412, 0x541c];
+/// the older ones this still supports do not. Each entry carries the request
+/// name the documentation page uses.
+const TERMINAL_INJECTION_IOCTLS: [(&str, u64); 2] = [("TIOCSTI", 0x5412), ("TIOCLINUX", 0x541c)];
+
+/// The `CLONE_NEW*` flags a namespace can be built one `clone` at a time
+/// with, each carrying the flag name the documentation page uses.
+const NAMESPACE_CLONE_FLAGS: [(&str, u64); 7] = [
+    ("CLONE_NEWNS", libc::CLONE_NEWNS as u64),
+    ("CLONE_NEWCGROUP", libc::CLONE_NEWCGROUP as u64),
+    ("CLONE_NEWUTS", libc::CLONE_NEWUTS as u64),
+    ("CLONE_NEWIPC", libc::CLONE_NEWIPC as u64),
+    ("CLONE_NEWUSER", libc::CLONE_NEWUSER as u64),
+    ("CLONE_NEWPID", libc::CLONE_NEWPID as u64),
+    ("CLONE_NEWNET", libc::CLONE_NEWNET as u64),
+];
 
 fn build_seccomp_filter(self_fuse: bool) -> anyhow::Result<seccompiler::BpfProgram> {
     use seccompiler::{
@@ -1963,12 +1987,12 @@ fn build_seccomp_filter(self_fuse: bool) -> anyhow::Result<seccompiler::BpfProgr
     };
 
     let mut rules = BTreeMap::new();
-    for &nr in denied_syscalls() {
+    for &(_, nr) in denied_syscalls() {
         // An empty rule vector matches the syscall unconditionally.
         rules.insert(nr, Vec::new());
     }
     if !self_fuse {
-        for &nr in MOUNT_SYSCALLS {
+        for &(_, nr) in MOUNT_SYSCALLS {
             rules.insert(nr, Vec::new());
         }
     }
@@ -1979,7 +2003,7 @@ fn build_seccomp_filter(self_fuse: bool) -> anyhow::Result<seccompiler::BpfProgr
     // every other is left to the kernel.
     let mut ioctl_rules = SUBVOL_IOCTL_TYPES
         .iter()
-        .map(|&ty| {
+        .map(|&(_, ty)| {
             Ok(SeccompRule::new(vec![SeccompCondition::new(
                 1,
                 SeccompCmpArgLen::Dword,
@@ -1991,7 +2015,7 @@ fn build_seccomp_filter(self_fuse: bool) -> anyhow::Result<seccompiler::BpfProgr
     // The terminal is shared with the caller's shell, and these two write to
     // it as though the user had typed. Whole request numbers rather than a
     // family, so only these are refused.
-    for request in TERMINAL_INJECTION_IOCTLS {
+    for (_, request) in TERMINAL_INJECTION_IOCTLS {
         ioctl_rules.push(SeccompRule::new(vec![SeccompCondition::new(
             1,
             SeccompCmpArgLen::Dword,
@@ -2005,18 +2029,9 @@ fn build_seccomp_filter(self_fuse: bool) -> anyhow::Result<seccompiler::BpfProgr
     // flags are matched where they sit: in the low word of the first
     // argument. Ordinary thread and process creation sets none of them, and
     // is untouched.
-    const NAMESPACE_CLONE_FLAGS: [u64; 7] = [
-        libc::CLONE_NEWNS as u64,
-        libc::CLONE_NEWCGROUP as u64,
-        libc::CLONE_NEWUTS as u64,
-        libc::CLONE_NEWIPC as u64,
-        libc::CLONE_NEWUSER as u64,
-        libc::CLONE_NEWPID as u64,
-        libc::CLONE_NEWNET as u64,
-    ];
     let clone_rules = NAMESPACE_CLONE_FLAGS
         .iter()
-        .map(|&flag| {
+        .map(|&(_, flag)| {
             Ok(SeccompRule::new(vec![SeccompCondition::new(
                 0,
                 SeccompCmpArgLen::Dword,
@@ -2306,6 +2321,7 @@ fn try_create_cgroup(limits: &ResourceLimits) -> io::Result<PathBuf> {
 mod tests {
     use super::*;
     use crate::policy::{Access, DeviceRule, Egress, FsRule, PortForward};
+    use std::collections::BTreeSet;
 
     /// Builds a plan for a test and removes the staging directory it created,
     /// since only a run holds the guard that removes it.
@@ -2394,7 +2410,73 @@ mod tests {
     /// can name, so it is denied outright rather than left to the grants.
     #[test]
     fn memfd_create_is_denied() {
-        assert!(denied_syscalls().contains(&libc::SYS_memfd_create));
+        assert!(denied_syscalls().contains(&("memfd_create", libc::SYS_memfd_create)));
+    }
+
+    /// The enforcement page holds the same refusal list the named tables do.
+    /// The backticked names between the markers must equal the union of the
+    /// tables exactly, so the next refusal updates the page in the same
+    /// commit. Only the named tables are covered: a refusal written into the
+    /// prologue without a table is invisible here and must be documented by
+    /// hand, which the module documentation says.
+    #[test]
+    fn the_documented_refusals_match_the_named_tables() {
+        const PAGE: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../docs/guide/enforcement.md"
+        ));
+        const MARKER_START: &str = "<!-- seccomp-denied:start -->";
+        const MARKER_END: &str = "<!-- seccomp-denied:end -->";
+
+        assert_eq!(
+            PAGE.matches(MARKER_START).count(),
+            1,
+            "docs/guide/enforcement.md must contain exactly one {MARKER_START}"
+        );
+        assert_eq!(
+            PAGE.matches(MARKER_END).count(),
+            1,
+            "docs/guide/enforcement.md must contain exactly one {MARKER_END}"
+        );
+        let (before, rest) = PAGE
+            .split_once(MARKER_START)
+            .expect("the start marker is present, checked above");
+        let (marked, _) = rest
+            .split_once(MARKER_END)
+            .expect("the end marker is present, checked above");
+        assert!(
+            !before.contains(MARKER_END)
+                && !rest[rest.rfind(MARKER_END).unwrap() + MARKER_END.len()..]
+                    .contains(MARKER_START),
+            "the markers must wrap one block, not overlap"
+        );
+
+        // Backticked spans are the odd segments of a backtick split.
+        let documented: BTreeSet<&str> = marked
+            .split('`')
+            .enumerate()
+            .filter(|(i, _)| i % 2 == 1)
+            .map(|(_, name)| name)
+            .collect();
+        assert!(!documented.is_empty(), "the marked block names nothing");
+
+        let refused: BTreeSet<&str> = denied_syscalls()
+            .iter()
+            .map(|(name, _)| *name)
+            .chain(MOUNT_SYSCALLS.iter().map(|(name, _)| *name))
+            .chain(SUBVOL_IOCTL_TYPES.iter().map(|(name, _)| *name))
+            .chain(TERMINAL_INJECTION_IOCTLS.iter().map(|(name, _)| *name))
+            .chain(NAMESPACE_CLONE_FLAGS.iter().map(|(name, _)| *name))
+            .collect();
+
+        let missing: Vec<_> = refused.difference(&documented).collect();
+        let extra: Vec<_> = documented.difference(&refused).collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "docs/guide/enforcement.md and the filter disagree. \
+             denied by the filter but missing from the page: {missing:?}; \
+             named on the page but not denied: {extra:?}"
+        );
     }
 
     /// The namespace flags are matched on `clone`'s first argument, and the
@@ -3228,9 +3310,9 @@ mod tests {
 
         // btrfs SNAP_CREATE and SUBVOL_CREATE_V2, the pair the report used, and
         // bcachefs SUBVOLUME_CREATE, the same class on the other filesystem.
-        let btrfs_snap_create = ioctl_nr(SUBVOL_IOCTL_TYPES[0], 1, 4096);
-        let btrfs_subvol_create_v2 = ioctl_nr(SUBVOL_IOCTL_TYPES[0], 24, 4096);
-        let bcachefs_subvol_create = ioctl_nr(SUBVOL_IOCTL_TYPES[1], 16, 4096);
+        let btrfs_snap_create = ioctl_nr(SUBVOL_IOCTL_TYPES[0].1, 1, 4096);
+        let btrfs_subvol_create_v2 = ioctl_nr(SUBVOL_IOCTL_TYPES[0].1, 24, 4096);
+        let bcachefs_subvol_create = ioctl_nr(SUBVOL_IOCTL_TYPES[1].1, 16, 4096);
         // FIONREAD: type 'T' (0x54), an everyday ioctl that must still reach the
         // kernel, which answers it on /dev/null with anything but the EPERM
         // seccomp would have returned.
@@ -3338,8 +3420,15 @@ mod tests {
     fn terminal_injection_requests_are_named_whole() {
         // A family mask would take ordinary terminal requests with it, so
         // these two are matched as whole numbers.
-        assert_eq!(TERMINAL_INJECTION_IOCTLS, [0x5412, 0x541c]);
-        assert!(!TERMINAL_INJECTION_IOCTLS.contains(&0x5401));
+        assert_eq!(
+            TERMINAL_INJECTION_IOCTLS,
+            [("TIOCSTI", 0x5412), ("TIOCLINUX", 0x541c)]
+        );
+        assert!(
+            !TERMINAL_INJECTION_IOCTLS
+                .iter()
+                .any(|&(_, nr)| nr == 0x5401)
+        );
     }
 
     #[test]
@@ -3347,19 +3436,22 @@ mod tests {
         // A duplicated descriptor carries the access the opener had, and a
         // ring reaches ioctls without passing the ioctl rules below.
         let denied = denied_syscalls();
-        for nr in [
-            libc::SYS_pidfd_getfd,
-            libc::SYS_io_uring_setup,
-            libc::SYS_io_uring_enter,
-            libc::SYS_io_uring_register,
-            libc::SYS_chroot,
-            libc::SYS_quotactl,
-            libc::SYS_kcmp,
-            libc::SYS_process_madvise,
-            libc::SYS_process_mrelease,
-            libc::SYS_mlockall,
+        for (name, nr) in [
+            ("pidfd_getfd", libc::SYS_pidfd_getfd),
+            ("io_uring_setup", libc::SYS_io_uring_setup),
+            ("io_uring_enter", libc::SYS_io_uring_enter),
+            ("io_uring_register", libc::SYS_io_uring_register),
+            ("chroot", libc::SYS_chroot),
+            ("quotactl", libc::SYS_quotactl),
+            ("kcmp", libc::SYS_kcmp),
+            ("process_madvise", libc::SYS_process_madvise),
+            ("process_mrelease", libc::SYS_process_mrelease),
+            ("mlockall", libc::SYS_mlockall),
         ] {
-            assert!(denied.contains(&nr), "syscall {nr} should be denied");
+            assert!(
+                denied.contains(&(name, nr)),
+                "syscall {name} should be denied"
+            );
         }
     }
 
@@ -3370,16 +3462,20 @@ mod tests {
         // lives in `MOUNT_SYSCALLS` alone, which is the only thing `self_fuse`
         // lifts; the calls that would leave the namespace are denied outright
         // and never lifted.
-        for nr in MOUNT_SYSCALLS {
+        for &(_, nr) in MOUNT_SYSCALLS {
             assert!(
-                !denied_syscalls().contains(nr),
+                !denied_syscalls().iter().any(|&(_, n)| n == nr),
                 "syscall {nr} must sit in MOUNT_SYSCALLS alone, so self_fuse lifts it and nothing else"
             );
         }
-        for nr in [libc::SYS_pivot_root, libc::SYS_setns, libc::SYS_unshare] {
+        for (name, nr) in [
+            ("pivot_root", libc::SYS_pivot_root),
+            ("setns", libc::SYS_setns),
+            ("unshare", libc::SYS_unshare),
+        ] {
             assert!(
-                denied_syscalls().contains(&nr),
-                "syscall {nr} must stay denied even with self_fuse"
+                denied_syscalls().contains(&(name, nr)),
+                "syscall {name} must stay denied even with self_fuse"
             );
         }
     }

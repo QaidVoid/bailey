@@ -217,9 +217,13 @@ Being clear about the edges matters more than sounding complete.
 - **A denied access is not reported.** Landlock denies silently, and seeing a
   denial needs the kernel's audit subsystem enabled at boot plus permission to
   read its records. Use `bailey audit` to find out what a program wanted.
-- **The seccomp filter is a denylist,** covering module loading, `ptrace`, `bpf`,
-  namespace and mount operations, and similar. It is a hardening layer, not a
-  complete allowlist.
+- **The seccomp filter is a denylist,** covering kernel and module control,
+  cross-process reach, namespace and mount control, filesystem paths Landlock
+  cannot see, descriptor and ring bypasses, terminal injection, and memory
+  pinning. Every refusal, with its reason, is listed in the
+  [enforcement guide](docs/guide/enforcement.md), which a unit test holds
+  equal to the filter's own tables. It is a hardening layer, not a complete
+  allowlist.
 - **Host and CIDR egress rules are advisory.** Landlock matches on TCP port; the
   host field is not enforced and bailey warns when you use it.
 - **X11 is not sandboxable at the protocol level.** Prefer Wayland.

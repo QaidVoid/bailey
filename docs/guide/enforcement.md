@@ -40,24 +40,79 @@ program can tell it exists. If you want absence, add
 ## seccomp
 
 A seccomp filter is installed before the program execs, denying a fixed set of
-syscalls with `EPERM`:
+syscalls with `EPERM`. Everything it refuses is below, grouped by the reason
+the refusal exists. The lists between the markers are held equal to the
+filter's own named tables by a unit test, so the page cannot drift from the
+code without a failing test in the same commit.
 
-`ptrace`, `add_key`, `request_key`, `keyctl`, `kexec_load`, `kexec_file_load`,
-`init_module`, `finit_module`, `delete_module`, `bpf`, `perf_event_open`,
-`userfaultfd`, `swapon`, `swapoff`, `reboot`, `mount`, `umount2`, `pivot_root`,
-`setns`, `unshare`, `process_vm_readv`, `process_vm_writev`,
-`open_by_handle_at`, `acct`.
+<!-- seccomp-denied:start -->
 
-These are not needed by normal applications and are common building blocks for
-sandbox escape, privilege escalation, and tampering with other processes.
+**Kernel and module control.** Loading code into the kernel, instrumenting it,
+or flipping host-wide state the sandbox has no share of: modules, kernel
+images, tracing and profiling, kernel keyrings, swap devices, process
+accounting, reboot.
 
-The `ioctl` syscall is not denied whole, since ordinary programs use it
-constantly. Only the btrfs family is refused, matched on the request's type
-byte. Landlock mediates the path operations that create a file, but not the
-ioctls with which btrfs creates a subvolume or snapshot, so on a btrfs
-filesystem those would otherwise plant a directory of files in any host
-directory the target may read. `FICLONE` shares the same type byte, so a
-reflink copy is refused with it and falls back to a full copy.
+`bpf`, `perf_event_open`, `init_module`, `finit_module`, `delete_module`,
+`kexec_load`, `kexec_file_load`, `add_key`, `request_key`, `keyctl`, `reboot`,
+`acct`, `swapon`, `swapoff`
+
+**Cross-process reach.** The run shares a uid with the caller, so the namespace
+layer cannot separate the two. These calls read, write, or steer another
+process's memory and internals, which is escape or tampering given any name of
+a process outside the sandbox.
+
+`ptrace`, `process_vm_readv`, `process_vm_writev`, `kcmp`, `process_madvise`,
+`process_mrelease`
+
+**Namespace and mount control.** A new namespace or a moved mount root redraws
+what the sandbox can see. The clone flags are matched on the first argument of
+clone; the mount family is denied unless the policy asks for self_fuse, which
+keeps the mount capability for the target's own FUSE filesystem. The others
+stay denied even then.
+
+`unshare`, `setns`, `pivot_root`, `chroot`, `CLONE_NEWNS`, `CLONE_NEWCGROUP`,
+`CLONE_NEWUTS`, `CLONE_NEWIPC`, `CLONE_NEWUSER`, `CLONE_NEWPID`,
+`CLONE_NEWNET`, `mount`, `umount2`, `fsopen`, `fsconfig`, `fsmount`,
+`move_mount`, `open_tree`, `fspick`, `mount_setattr`
+
+**Filesystem paths Landlock cannot see.** Landlock judges a file when a path
+opens. These reach the filesystem without opening a path Landlock saw: an
+anonymous inode with no path at all, an open by inode handle, quota control on
+a mounted filesystem, and the subvolume ioctls of the two filesystems bailey
+knows, named after the filesystem rather than the request.
+
+`memfd_create`, `open_by_handle_at`, `quotactl`, `btrfs`, `bcachefs`
+
+**Descriptor and ring bypasses.** Landlock checks a descriptor when it is
+opened, not when it is duplicated, and a ring issues ioctls without ever
+passing the ioctl rules below.
+
+`pidfd_getfd`, `io_uring_setup`, `io_uring_enter`, `io_uring_register`
+
+**Terminal injection.** The terminal is shared with the caller's shell, and
+these two requests put bytes into its input queue as though the user had typed
+them.
+
+`TIOCSTI`, `TIOCLINUX`
+
+**Memory pinning.** Pinning every page or building fault handlers shapes
+memory in ways the kernel bounds only by host-wide limits, and both are
+standard building blocks of kernel exploits.
+
+`userfaultfd`, `mlockall`
+
+<!-- seccomp-denied:end -->
+
+Ordinary applications need none of these, and each group above is what a
+sandbox escape or an attack on the caller is built from.
+
+The ioctl syscall is not denied whole, since ordinary programs use it
+constantly. Only the two subvolume families are refused, matched on the
+request's type byte. Landlock mediates the path operations that create a file,
+but not the ioctls with which btrfs or bcachefs creates a subvolume or
+snapshot, so on such a filesystem those would otherwise plant a directory of
+files in any host directory the target may read. FICLONE shares the btrfs type
+byte, so a reflink copy is refused with it and falls back to a full copy.
 
 A syscall number only means something for the architecture it was made on, and
 the filter is written for the native one. A denied syscall reached through a
