@@ -506,6 +506,18 @@ fn cmd_doctor() -> anyhow::Result<i32> {
         println!("    denied egress will cover TCP only, not UDP or DNS");
         println!("    a nested `deny` cannot be enforced");
     }
+    // The same fact the run summary carries: which layer refuses a namespace
+    // a target tries to create. The kernel limit rides on the user namespace
+    // a run builds, so a host without one leaves only the filter.
+    if caps.unprivileged_userns {
+        println!("  nested namespaces: refused (kernel limit, seccomp)");
+    } else {
+        println!("  nested namespaces: refused (seccomp only)");
+        println!(
+            "    runs carry no user namespace to hold the kernel limit, so the \
+             filter alone refuses namespace creation"
+        );
+    }
 
     let delegated = &caps.cgroup_delegated;
     let missing: Vec<&str> = ["memory", "pids", "cpu"]
@@ -684,6 +696,16 @@ fn proxy_loopback_ruleset(forwards: &[PortForward], publishes: &[u16], egress: &
 }
 
 /// Select forwards carried by pasta rather than the denied-egress backend.
+/// The user namespace limit the proxy namespace holds, decided from the
+/// layout table in the change design.
+///
+/// With the isolation layer running, the run's own namespace nests inside the
+/// proxy namespace and spends its single slot. With the target running in the
+/// proxy namespace directly, nothing may be created beneath it at all.
+fn proxy_guard_limit(no_isolate: bool) -> u32 {
+    if no_isolate { 0 } else { 1 }
+}
+
 fn proxy_forwards(
     policy: &Policy,
     args: &NetworkArgs,
@@ -883,6 +905,7 @@ fn wrap_in_private_namespace(
     forwards: &[PortForward],
     publishes: &[u16],
     announce: bool,
+    guard_limit: u32,
 ) -> anyhow::Result<Wrapped> {
     use crate::policy::Egress;
 
@@ -977,8 +1000,10 @@ fn wrap_in_private_namespace(
             let release = release.into_reader();
             // A user and network namespace of this process's own, mapped to
             // root inside so that `nft` keeps its capabilities across the exec
-            // that installs the rule.
-            if let Err(error) = network::enter_proxy_namespace() {
+            // that installs the rule. The namespace is also the run's guard,
+            // so the limit says whether the isolation layer may nest the run's
+            // own namespace inside it.
+            if let Err(error) = network::enter_proxy_namespace(guard_limit) {
                 eprintln!("bailey: could not create the private namespace: {error}");
                 std::process::exit(1);
             }
@@ -1173,24 +1198,37 @@ fn host_uid_of_root(map: &str) -> Option<u32> {
 }
 
 /// Establish shared network confinement before hooks or target execution.
+///
+/// Returns what the caller should do, and whether the caller now runs beneath
+/// the guard user namespace of a private namespace this process created.
 fn prepare_network(
     policy: &mut Policy,
     args: &NetworkArgs,
     no_isolate: bool,
     announce: bool,
-) -> anyhow::Result<Wrapped> {
+) -> anyhow::Result<(Wrapped, bool)> {
+    // The proxy namespace doubles as the run's guard user namespace. With the
+    // isolation layer nesting the run's own namespace inside it, one slot
+    // stays free for that. With the target running in the proxy namespace
+    // directly, none is left at all.
+    let guard_limit = proxy_guard_limit(no_isolate);
     // Validate publications first: a run that asks for both should be told
     // about the publication it got wrong, not about a forward it configured
     // correctly.
     let proxy_publishes = proxy_publish_ports(policy, args, no_isolate)?;
     let proxy_forwards = proxy_forwards(policy, args, no_isolate)?;
-    let made_the_namespace =
-        match wrap_in_private_namespace(policy, args, &proxy_forwards, &proxy_publishes, announce)?
-        {
-            Wrapped::Parent(code) => return Ok(Wrapped::Parent(code)),
-            Wrapped::Creator => true,
-            Wrapped::Unwrapped => false,
-        };
+    let made_the_namespace = match wrap_in_private_namespace(
+        policy,
+        args,
+        &proxy_forwards,
+        &proxy_publishes,
+        announce,
+        guard_limit,
+    )? {
+        Wrapped::Parent(code) => return Ok((Wrapped::Parent(code), false)),
+        Wrapped::Creator => true,
+        Wrapped::Unwrapped => false,
+    };
 
     // Inside the namespace now, whether by the wrap above or a re-exec into it.
     // The lockdown goes on before the target is confined and run, so there is
@@ -1257,11 +1295,14 @@ fn prepare_network(
         }
     }
 
-    Ok(if made_the_namespace {
-        Wrapped::Creator
-    } else {
-        Wrapped::Unwrapped
-    })
+    Ok((
+        if made_the_namespace {
+            Wrapped::Creator
+        } else {
+            Wrapped::Unwrapped
+        },
+        made_the_namespace,
+    ))
 }
 
 fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
@@ -1277,12 +1318,13 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
     report_untrusted(&program, args.config.as_deref());
     warn_if_target_denied(&resolved.policy, &program);
 
-    if let Wrapped::Parent(code) = prepare_network(
+    let (wrapped, guard_in_place) = prepare_network(
         &mut resolved.policy,
         &args.network,
         args.no_isolate,
         !args.quiet && !args.json,
-    )? {
+    )?;
+    if let Wrapped::Parent(code) = wrapped {
         return Ok(code);
     }
 
@@ -1308,6 +1350,7 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
         always_cgroup: false,
         implicit_write: Vec::new(),
         egress_broker: args.network.egress_proxy.is_some(),
+        guard_in_place,
     };
     let code = backend.run(&resolved.policy, &target)?;
     if let Err(err) = resolved.hooks.run_post_exit(code) {
@@ -1355,9 +1398,9 @@ fn cmd_shell(args: ShellArgs) -> anyhow::Result<i32> {
         .set
         .insert("BAILEY_SANDBOX_DIR".into(), dir.display().to_string());
 
-    if let Wrapped::Parent(code) =
-        prepare_network(&mut resolved.policy, &args.network, args.no_isolate, true)?
-    {
+    let (wrapped, guard_in_place) =
+        prepare_network(&mut resolved.policy, &args.network, args.no_isolate, true)?;
+    if let Wrapped::Parent(code) = wrapped {
         return Ok(code);
     }
 
@@ -1378,6 +1421,7 @@ fn cmd_shell(args: ShellArgs) -> anyhow::Result<i32> {
         // a narrower grant their config makes beneath it is kept narrow.
         implicit_write: vec![dir.clone()],
         egress_broker: args.network.egress_proxy.is_some(),
+        guard_in_place,
     };
     let code = backend.run(&resolved.policy, &target)?;
     if let Err(err) = resolved.hooks.run_post_exit(code) {
@@ -2606,6 +2650,12 @@ mod tests {
     fn publication_only_rules_keep_established_replies() {
         let rules = proxy_loopback_ruleset(&[], &[3800], &Egress::AllowAll);
         assert!(rules.contains("ct state established accept"));
+    }
+
+    #[test]
+    fn the_proxy_holds_one_slot_for_the_isolation_layer() {
+        assert_eq!(proxy_guard_limit(false), 1);
+        assert_eq!(proxy_guard_limit(true), 0);
     }
 
     #[test]

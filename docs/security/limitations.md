@@ -224,6 +224,16 @@ namespaces. Where a host disables them, the run falls back to Landlock and
 seccomp and reports the downgrade, which for the network means TCP-only
 restriction.
 
+### Programs that sandbox themselves with a user namespace
+
+A program that builds a user namespace of its own, Chromium and Electron among
+them, fails under bailey either way. `unshare` and `clone` with namespace flags
+were refused before this, `clone3` now answers with the error libcs fall back
+from, and every run that carries a user namespace also carries a kernel limit
+that its own namespace already spent, so no route reaches the kernel. There is
+no flag that reopens it: a user namespace of the target's own is exactly what
+hands back the capabilities everything else in the sandbox takes away.
+
 ### `self_fuse` trades Landlock for mount power
 
 `self_fuse = true` keeps the mount syscalls and `CAP_SYS_ADMIN` inside the

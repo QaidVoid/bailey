@@ -7,6 +7,8 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+mod common;
+
 fn bailey() -> &'static str {
     env!("CARGO_BIN_EXE_bailey")
 }
@@ -36,6 +38,52 @@ fn write_config(dir: &Path, extra_read: &str) -> std::path::PathBuf {
     )
     .unwrap();
     config
+}
+
+/// Without the isolation layer, bailey creates no user namespace and the
+/// kernel limit has nothing to bound, so the seccomp filter is the only layer
+/// between the target and a fresh namespace. Every process-creation syscall
+/// that can carry namespace flags must refuse them: `clone3` answers ENOSYS,
+/// which libcs treat as unimplemented and fall back from to `clone`, whose
+/// flags the filter reads.
+#[test]
+fn no_isolate_refuses_namespace_flags_on_every_route() {
+    if !Path::new("/usr/bin/python3").exists() {
+        eprintln!("skipping: /usr/bin/python3 unavailable");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    fs::create_dir(&work).unwrap();
+    let config = dir.path().join("bailey.toml");
+    fs::write(
+        &config,
+        format!(
+            "[filesystem]\n\
+             read = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\", \"/etc\", \"{work}\"]\n\
+             execute = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\"]\n\
+             [network]\n\
+             egress = \"allow\"\n",
+            work = work.display()
+        ),
+    )
+    .unwrap();
+    let probe = common::write_namespace_probe(&work);
+
+    let output = Command::new(bailey())
+        .args(["run", "--no-isolate", "-c"])
+        .arg(&config)
+        .args(["/usr/bin/python3"])
+        .arg(&probe)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    common::assert_every_namespace_route_refused("--no-isolate", &stdout);
+    assert!(
+        output.status.success(),
+        "the run must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

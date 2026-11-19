@@ -179,6 +179,18 @@ impl RunReport {
     }
 }
 
+/// Whether a run that enters namespaces of its own creates a fresh guard user
+/// namespace first.
+///
+/// The layout table in the change design decides: every run that builds its
+/// namespaces from the host does, whatever layer follows. A proxied run is
+/// already beneath the proxy namespace, which is the guard, and a second one
+/// would spend the proxy namespace's only slot before the run's own namespace
+/// asked for it.
+fn creates_guard(guard_in_place: bool) -> bool {
+    !guard_in_place
+}
+
 /// Deny-by-default enforcement backend.
 #[derive(Debug, Default)]
 pub struct EnforceBackend {
@@ -204,6 +216,13 @@ pub struct EnforceBackend {
     /// The run is already in a namespace whose egress is held to one broker,
     /// so it neither makes a namespace of its own nor reports UDP as open.
     pub egress_broker: bool,
+    /// A guard user namespace bailey created already bounds this process, so
+    /// the namespace layers run beneath it instead of creating their own.
+    ///
+    /// Only an egress proxy run is in this position: its private namespace is
+    /// the guard, and creating a second one would spend its only slot before
+    /// the run's own namespace asked for it.
+    pub guard_in_place: bool,
 }
 
 /// How a run reports what it enforced.
@@ -255,8 +274,16 @@ impl EnforceBackend {
         let keep_mount = policy.self_fuse;
 
         // User namespaces gate both the isolation layer and the network
-        // namespace, so the host is probed once for both.
-        let userns = isolation::available();
+        // namespace, so the host is probed once for both. A proxied run skips
+        // the probe: this process just created the proxy namespace, which is
+        // proof enough, and the probe would spend the guard's single slot for
+        // the moment between the probe child's exit and the run's own
+        // namespace, where the kernel's count can still read one.
+        let userns = if self.guard_in_place {
+            true
+        } else {
+            isolation::available()
+        };
         // Inside a sandbox the probe fails because our own seccomp filter denies
         // `unshare`, not because the host lacks anything. The namespaces of the
         // outer sandbox are still in force: they are properties of the process,
@@ -523,6 +550,16 @@ impl EnforceBackend {
         // own, so a plain `bailey run` still gets real egress denial.
         let network_only = isolation.is_none() && mode == NetworkMode::Isolated;
 
+        // Which layer answers a namespace-creating syscall, decided by the
+        // layout: a run whose namespaces bailey builds, or whose target sits
+        // in the proxy namespace, carries the guard user namespace, and the
+        // rest rely on the filter alone.
+        if isolation.is_some() || network_only || self.guard_in_place {
+            report.applied("nested namespaces: refused (kernel limit, seccomp)");
+        } else {
+            report.applied("nested namespaces: refused (seccomp only)");
+        }
+
         // The cgroup is created before the fork so the target can join it from
         // `pre_exec`. Joining before exec is what makes the limits cover every
         // process the target goes on to create.
@@ -584,6 +621,7 @@ impl EnforceBackend {
             dir: isolation.as_ref().map(|plan| plan.staging.clone()),
         };
         let stop_before_exec = self.stop_before_exec;
+        let create_guard = creates_guard(self.guard_in_place);
         let file_bytes = policy.resources.file_bytes;
         // The child end's descriptor number, valid in the forked child where
         // fd numbers are preserved. Sending goes from the child end; the
@@ -642,9 +680,9 @@ impl EnforceBackend {
                     std::fs::write(procs, "0")?;
                 }
                 if let Some(isolation) = &isolation {
-                    isolation::enter(isolation)?;
+                    isolation::enter(isolation, create_guard)?;
                 } else if network_only {
-                    network::enter_isolated()?;
+                    network::enter_isolated(create_guard)?;
                 }
                 // After the namespaces, where the count starts at this process:
                 // set before them it would charge the fork isolation makes to
@@ -1988,13 +2026,13 @@ fn build_seccomp_filter(self_fuse: bool) -> anyhow::Result<seccompiler::BpfProgr
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     rules.insert(libc::SYS_clone, clone_rules);
-    // `clone3` carries the same flags behind a pointer, which a seccomp
-    // filter cannot dereference, and denying it whole would break thread
-    // creation: a thread pool falls back only on `ENOSYS`, not on the `EPERM`
-    // this filter answers with. The `clone` rules above cover the caller it
-    // shares the ABI with, and the capability drop after everything else here
-    // is what leaves a namespace a target does build holding nothing it could
-    // not already reach.
+    // `clone3` carries the same flags behind a pointer, which no seccomp
+    // filter can dereference. The prologue answers it `ENOSYS`, so every libc
+    // and runtime that tries `clone3` first falls back to `clone`, where the
+    // flags above decide, and the kernel limit in the run's guard namespace
+    // holds whatever still slips through. The capability drop after everything
+    // here is what leaves a namespace a target does build holding nothing it
+    // could not already reach.
 
     let filter = SeccompFilter::new(
         rules,
@@ -2051,6 +2089,7 @@ fn seccomp_guards() -> Vec<seccompiler::sock_filter> {
     const RET_ERRNO_EAFNOSUPPORT: u32 = 0x0005_0000 | (libc::EAFNOSUPPORT as u32);
     const RET_ERRNO_EPROTONOSUPPORT: u32 = 0x0005_0000 | (libc::EPROTONOSUPPORT as u32);
     const RET_ERRNO_ENOPROTOOPT: u32 = 0x0005_0000 | (libc::ENOPROTOOPT as u32);
+    const RET_ERRNO_ENOSYS: u32 = 0x0005_0000 | (libc::ENOSYS as u32);
 
     const AF_SMC: i32 = 43;
     const IPPROTO_SMC: i32 = 256;
@@ -2125,6 +2164,21 @@ fn seccomp_guards() -> Vec<seccompiler::sock_filter> {
     // instruction after the block.
     socket_guards[1].jf = (socket_guards.len() - 2) as u8;
     prologue.extend_from_slice(&socket_guards);
+
+    // `clone3` carries the namespace flags in a struct a filter cannot read,
+    // so it is refused whole, with the errno that makes libcs treat it as
+    // unimplemented and fall back to `clone`, whose flags the rules in the
+    // filter below do read. `EPERM` would end thread pools rather than route
+    // them to the fallback. What no filter sees, the guard user namespace of
+    // the run bounds instead.
+    let clone3_guards = vec![
+        // A = seccomp_data.nr
+        stmt(BPF_LD_W_ABS, NR_OFFSET),
+        // not clone3: skip the refusal and fall into the filter
+        jump(BPF_JMP_JEQ_K, libc::SYS_clone3 as u32, 0, 1),
+        stmt(BPF_RET_K, RET_ERRNO_ENOSYS),
+    ];
+    prologue.extend_from_slice(&clone3_guards);
 
     prologue
 }
@@ -2503,6 +2557,103 @@ mod tests {
         );
     }
 
+    /// Installs the built filter in a forked child and probes `clone3` and
+    /// thread creation through it, so the refusal is the errno libcs fall
+    /// back on and the fallback itself really runs.
+    #[test]
+    fn clone3_is_refused_while_threads_still_start() {
+        let program = build_seccomp_filter(false).expect("the filter builds");
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            unsafe {
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                    libc::_exit(PROBE_PRCTL_FAILED);
+                }
+                let fprog = libc::sock_fprog {
+                    len: program.len() as u16,
+                    filter: program.as_ptr().cast::<libc::sock_filter>().cast_mut(),
+                };
+                if libc::syscall(libc::SYS_seccomp, libc::SECCOMP_SET_MODE_FILTER, 0, &fprog) != 0 {
+                    libc::_exit(PROBE_SECCOMP_FAILED);
+                }
+                // A clone3 asking for a fresh user namespace. The struct is
+                // `clone_args`: flags first, exit signal fifth, 64 bytes.
+                const CLONE_NEWUSER: u64 = 0x1000_0000;
+                const CLONE_NEWNET: u64 = 0x4000_0000;
+                let request: [u64; 8] = [
+                    CLONE_NEWUSER | CLONE_NEWNET,
+                    0,
+                    0,
+                    0,
+                    libc::SIGCHLD as u64,
+                    0,
+                    0,
+                    0,
+                ];
+                let created = libc::syscall(libc::SYS_clone3, request.as_ptr(), 64usize);
+                if created == 0 {
+                    // The filter let clone3 through and this is the new
+                    // process it made, inside a user namespace of its own.
+                    libc::_exit(1);
+                }
+                if created > 0 {
+                    let mut status: libc::c_int = 0;
+                    libc::waitpid(created as libc::pid_t, &mut status, 0);
+                    libc::_exit(2);
+                }
+                if *libc::__errno_location() != libc::ENOSYS {
+                    libc::_exit(3);
+                }
+                // Thread creation tries clone3 first on glibc and must reach
+                // its clone fallback, which the filter leaves alone.
+                extern "C" fn thread_body(_arg: *mut libc::c_void) -> *mut libc::c_void {
+                    std::ptr::null_mut()
+                }
+                let mut tid: libc::pthread_t = 0;
+                if libc::pthread_create(
+                    &mut tid,
+                    std::ptr::null(),
+                    thread_body,
+                    std::ptr::null_mut(),
+                ) != 0
+                {
+                    libc::_exit(4);
+                }
+                if libc::pthread_join(tid, std::ptr::null_mut()) != 0 {
+                    libc::_exit(5);
+                }
+                libc::_exit(0);
+            }
+        }
+
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(
+            waited,
+            pid,
+            "waitpid failed: {}",
+            std::io::Error::last_os_error()
+        );
+        assert!(libc::WIFEXITED(status), "the probe child did not exit");
+        match libc::WEXITSTATUS(status) {
+            0 => {}
+            code if code == PROBE_SECCOMP_FAILED => {
+                eprintln!("skipping: this host will not install an unprivileged seccomp filter")
+            }
+            code if code == PROBE_PRCTL_FAILED => {
+                eprintln!("skipping: this host will not set no_new_privs")
+            }
+            1 => panic!("clone3 was not refused: a process was created in a new user namespace"),
+            2 => panic!("clone3 was not refused: a child was created"),
+            3 => panic!("clone3 must be refused with ENOSYS, which libcs fall back on"),
+            4 => panic!("pthread_create failed under the filter"),
+            5 => panic!("pthread_join failed under the filter"),
+            other => panic!("the probe child exited with unexpected code {other}"),
+        }
+    }
+
     /// Exit codes the probe child reports back. 1 to 5 name the assertion that
     /// failed, 70 and 72 name the setup steps, so a host without unprivileged
     /// seccomp reads as a skip rather than as a broken filter.
@@ -2586,6 +2737,26 @@ mod tests {
             5 => panic!("socket(AF_INET, SOCK_DGRAM, 0) was refused by the filter"),
             other => panic!("the probe child exited with unexpected code {other}"),
         }
+    }
+
+    /// The layout table in the change design, asserted for all four rows: a
+    /// run that builds namespaces from the host creates a fresh guard, and a
+    /// proxied run runs beneath the guard the proxy namespace already is.
+    #[test]
+    fn the_layout_table_decides_who_creates_the_guard() {
+        assert!(creates_guard(false), "an isolated run creates a guard");
+        assert!(
+            creates_guard(false),
+            "a network-only run without a proxy creates a guard too"
+        );
+        assert!(
+            !creates_guard(true),
+            "a proxied isolated run runs beneath the proxy namespace's guard"
+        );
+        assert!(
+            !creates_guard(true),
+            "a proxied run without isolation runs in the guard directly"
+        );
     }
 
     /// A forward is a dial the target means to make, on a loopback that has

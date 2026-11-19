@@ -21,6 +21,7 @@ use std::io;
 
 use nix::sched::{CloneFlags, unshare};
 
+use crate::backend::isolation::{create_guard_namespace, set_user_namespace_limit};
 use crate::policy::{Egress, Policy};
 
 /// How a run's network access is confined.
@@ -196,7 +197,7 @@ pub fn report(mode: NetworkMode, policy: &Policy, inherited: Inherited) {
 /// The target is unaffected: the isolation layer builds its own user namespace
 /// nested in this one and maps the caller's uid there, which is what a program
 /// that refuses to run as root, or authenticates over D-Bus, needs to see.
-pub fn enter_proxy_namespace() -> io::Result<()> {
+pub fn enter_proxy_namespace(limit: u32) -> io::Result<()> {
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
 
@@ -206,12 +207,22 @@ pub fn enter_proxy_namespace() -> io::Result<()> {
     fs::write("/proc/self/gid_map", format!("0 {gid} 1"))?;
     fs::write("/proc/self/uid_map", format!("0 {uid} 1"))?;
 
+    // The proxy namespace is the run's guard: the isolation layer nests the
+    // run's own user namespace inside it, and the limit says whether anything
+    // may be created beneath it at all. pasta, which joins the namespace, does
+    // not create one.
+    set_user_namespace_limit(limit)?;
+
     bring_loopback_up()
 }
 
-pub fn enter_isolated() -> io::Result<()> {
+pub fn enter_isolated(create_guard: bool) -> io::Result<()> {
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
+
+    if create_guard {
+        create_guard_namespace(1)?;
+    }
 
     // The IPC namespace comes along here too: SysV and POSIX IPC objects are
     // not files, so nothing in the filesystem policy can withhold them.

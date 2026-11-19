@@ -62,6 +62,7 @@ impl AuditBackend {
             always_cgroup: true,
             implicit_write: Vec::new(),
             egress_broker: false,
+            guard_in_place: false,
         };
         let confined = backend.spawn(&envelope, target)?;
         let code = audit_helper::record(&mut recorder, confined)?;

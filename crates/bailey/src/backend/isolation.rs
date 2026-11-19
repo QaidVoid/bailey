@@ -152,13 +152,45 @@ pub fn available() -> bool {
     }
 }
 
+/// Write the limit on user namespaces that may be created beneath the current
+/// one.
+///
+/// Every user namespace registers its own copy of this sysctl, so a write from
+/// inside one applies to it alone. The kernel charges each creation to every
+/// ancestor namespace and refuses it with `ENOSPC` once an ancestor's limit is
+/// reached, so a small limit here bounds the whole subtree beneath this
+/// namespace, whatever an inner namespace raises its own limit to.
+pub(crate) fn set_user_namespace_limit(limit: u32) -> io::Result<()> {
+    fs::write("/proc/sys/user/max_user_namespaces", format!("{limit}"))
+}
+
+/// Map the caller's uid and gid into a freshly created user namespace.
+fn write_identity_map(uid: u32, gid: u32) -> io::Result<()> {
+    fs::write("/proc/self/setgroups", "deny")?;
+    fs::write("/proc/self/gid_map", format!("{gid} {gid} 1"))?;
+    fs::write("/proc/self/uid_map", format!("{uid} {uid} 1"))
+}
+
+/// Create a guard user namespace beneath the current one: an identity map and
+/// a limit on what may be created beneath it.
+///
+/// A run that builds its namespaces from the host starts here, so its own
+/// namespace spends the guard's slot and none is left for the target. Any
+/// failure is returned rather than skipped: continuing would drop a boundary
+/// the summary claims, and bailey does not run that way.
+pub(crate) fn create_guard_namespace(limit: u32) -> io::Result<()> {
+    let uid = unsafe { libc::getuid() };
+    let gid = unsafe { libc::getgid() };
+    unshare(CloneFlags::CLONE_NEWUSER).map_err(errno)?;
+    write_identity_map(uid, gid)?;
+    set_user_namespace_limit(limit)
+}
+
 fn probe() -> io::Result<()> {
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
     unshare(CloneFlags::CLONE_NEWUSER).map_err(errno)?;
-    fs::write("/proc/self/setgroups", "deny")?;
-    fs::write("/proc/self/gid_map", format!("{gid} {gid} 1"))?;
-    fs::write("/proc/self/uid_map", format!("{uid} {uid} 1"))?;
+    write_identity_map(uid, gid)?;
     unshare(CloneFlags::CLONE_NEWNS).map_err(errno)?;
     mount(
         None::<&str>,
@@ -190,9 +222,17 @@ fn probe() -> io::Result<()> {
 /// namespace. The caller then hands the target to [`run_as_init`], which keeps
 /// PID 1 free to reap the namespace's orphans. The intermediate parent waits
 /// for that child and exits with its status, so it never returns.
-pub fn enter(plan: &IsolationPlan) -> io::Result<()> {
+pub fn enter(plan: &IsolationPlan, create_guard: bool) -> io::Result<()> {
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
+
+    // The guard namespace when this run builds its own from the host: the
+    // identity map, then a limit of one namespace, which the run's own spends.
+    // Without it the target could create a user namespace beneath the run's
+    // and regain capabilities over namespaces of its own.
+    if create_guard {
+        create_guard_namespace(1)?;
+    }
 
     // An identity map, not `0 {uid} 1`. What permits the mounts below is
     // CAP_SYS_ADMIN in the new user namespace, which its creator holds whatever
@@ -203,9 +243,7 @@ pub fn enter(plan: &IsolationPlan) -> io::Result<()> {
     // Keeping the caller's uid leaves the keyring, and everything behind the
     // session bus, reachable.
     unshare(CloneFlags::CLONE_NEWUSER).map_err(errno)?;
-    fs::write("/proc/self/setgroups", "deny")?;
-    fs::write("/proc/self/gid_map", format!("{gid} {gid} 1"))?;
-    fs::write("/proc/self/uid_map", format!("{uid} {uid} 1"))?;
+    write_identity_map(uid, gid)?;
 
     // UTS as well, so the target is not told the machine's name. Denying
     // /etc/hostname is not enough: `uname` is a syscall, and a program that
@@ -882,6 +920,101 @@ fn errno(err: nix::errno::Errno) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nix::errno::Errno;
+
+    /// Run `body` in a forked child and return its exit code, so a test can
+    /// drive namespace setup that mutates the process: every probe here ends
+    /// in namespace state the parent must not inherit.
+    fn child_exit_code(body: impl FnOnce() -> i32) -> i32 {
+        match unsafe { libc::fork() } {
+            -1 => panic!("fork failed: {}", io::Error::last_os_error()),
+            0 => unsafe { libc::_exit(body()) },
+            pid => {
+                let mut status: libc::c_int = 0;
+                unsafe { libc::waitpid(pid, &mut status, 0) };
+                if libc::WIFEXITED(status) {
+                    libc::WEXITSTATUS(status)
+                } else {
+                    -1
+                }
+            }
+        }
+    }
+
+    /// Map the caller's uid and gid into the namespace just created, the way
+    /// the namespace layers do, so a further unshare is charged like a real
+    /// one. The values are the ones captured before any unshare, since inside
+    /// an unmapped namespace they read as the overflow uid.
+    fn map_caller(uid: u32, gid: u32) -> io::Result<()> {
+        write_identity_map(uid, gid)
+    }
+
+    #[test]
+    fn a_guard_of_one_leaves_room_for_exactly_one_child_namespace() {
+        assert_eq!(
+            child_exit_code(|| {
+                let uid = unsafe { libc::getuid() };
+                let gid = unsafe { libc::getgid() };
+                if create_guard_namespace(1).is_err() {
+                    return 1;
+                }
+                if unshare(CloneFlags::CLONE_NEWUSER).is_err() {
+                    return 2;
+                }
+                if map_caller(uid, gid).is_err() {
+                    return 3;
+                }
+                match unshare(CloneFlags::CLONE_NEWUSER) {
+                    Err(Errno::ENOSPC) => 0,
+                    _ => 4,
+                }
+            }),
+            0
+        );
+    }
+
+    #[test]
+    fn a_guard_of_zero_refuses_the_first_child_namespace() {
+        assert_eq!(
+            child_exit_code(|| {
+                if create_guard_namespace(0).is_err() {
+                    return 1;
+                }
+                match unshare(CloneFlags::CLONE_NEWUSER) {
+                    Err(Errno::ENOSPC) => 0,
+                    _ => 2,
+                }
+            }),
+            0
+        );
+    }
+
+    #[test]
+    fn raising_the_limit_in_an_inner_namespace_does_not_lift_the_guard() {
+        assert_eq!(
+            child_exit_code(|| {
+                let uid = unsafe { libc::getuid() };
+                let gid = unsafe { libc::getgid() };
+                if create_guard_namespace(1).is_err() {
+                    return 1;
+                }
+                if unshare(CloneFlags::CLONE_NEWUSER).is_err() {
+                    return 2;
+                }
+                if map_caller(uid, gid).is_err() {
+                    return 3;
+                }
+                if set_user_namespace_limit(500).is_err() {
+                    return 4;
+                }
+                match unshare(CloneFlags::CLONE_NEWUSER) {
+                    Err(Errno::ENOSPC) => 0,
+                    _ => 5,
+                }
+            }),
+            0
+        );
+    }
 
     #[test]
     fn a_nosuid_nodev_relatime_mount_keeps_all_three() {

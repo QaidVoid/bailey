@@ -82,6 +82,18 @@ Landlock rules hold. The refusals apply in every network mode, including
 denied egress where the namespace already makes them moot, so the filter has
 one shape regardless of policy.
 
+`clone3` is refused in the same prologue, with `ENOSYS` instead of `EPERM`. The
+flags that turn a `clone` into a namespace creator sit in a structure the filter
+cannot read, so `clone3` is refused whole, and `ENOSYS` is the error that makes
+glibc treat it as unimplemented here and retry with `clone`, whose flags the
+filter does read. Answering `EPERM` would end the attempt instead of redirecting
+it, and a thread pool that gets `EPERM` treats it as fatal. musl never calls
+`clone3`, and Go and Rust's standard library use `clone` already, so ordinary
+thread and process creation is unaffected everywhere. What the filter cannot
+see past, the kernel does: every run that builds a user namespace creates a
+guard namespace first, whose limit on namespaces created beneath it is spent by
+the run's own namespace, leaving none for the program.
+
 ::: warning A denylist, not an allowlist
 This is a hardening layer. A complete allowlist would be stronger, and it is also
 the kind of thing that breaks a program six months later when a libc update starts

@@ -14,6 +14,11 @@ fn bailey() -> &'static str {
     env!("CARGO_BIN_EXE_bailey")
 }
 
+mod common;
+
+use common::assert_every_namespace_route_refused;
+use common::write_namespace_probe;
+
 /// True only when an isolated run genuinely enters a new PID namespace. When
 /// the host forces the Landlock-only fallback, the target keeps its host PID,
 /// so this returns false and the tests skip. Inside a real sandbox PID 1 is
@@ -771,6 +776,88 @@ fn self_fuse_lets_the_target_mount_and_unmount() {
         stdout,
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// Every route to a fresh user namespace must be closed for the target, in
+/// every layout bailey can build. The clone3 route is the one that matters:
+/// the seccomp filter inspects `clone` flags but has nothing readable to
+/// match on for clone3, so a target could create a user namespace under
+/// bailey's own and regain every capability inside it. The kernel's guard
+/// limit closes what the filter cannot see, so the two layers together leave
+/// no route.
+#[test]
+fn target_cannot_create_a_user_namespace() {
+    if !isolation_active() {
+        eprintln!("skipping: isolation unavailable on this host");
+        return;
+    }
+    if !Path::new("/usr/bin/python3").exists() {
+        eprintln!("skipping: /usr/bin/python3 unavailable");
+        return;
+    }
+    let pasta = Command::new("sh")
+        .args(["-c", "command -v pasta >/dev/null 2>&1"])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    fs::create_dir(&work).unwrap();
+    let grants = format!(
+        "[filesystem]\n\
+         read = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\", \"/etc\", \"{work}\"]\n\
+         execute = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\"]\n",
+        work = work.display()
+    );
+    let layouts: [(&str, String, &[&str]); 5] = [
+        ("isolated", grants.clone(), &["--isolate"]),
+        ("network-only", grants.clone(), &["--no-isolate"]),
+        (
+            "proxied, isolated",
+            format!("{grants}[network]\negress = \"allow\"\n"),
+            &["--proxy-net"],
+        ),
+        // This layout has no reconstructed root to stage the private
+        // network's `resolv.conf` into, so an allowed DNS refuses the run;
+        // denying DNS is the shape a no-isolate proxied run takes, and the
+        // namespace routes it exists to check stay the same.
+        (
+            "proxied, --no-isolate",
+            format!("{grants}[network]\negress = \"allow\"\ndns = \"deny\"\n"),
+            &["--proxy-net", "--no-isolate"],
+        ),
+        (
+            "self_fuse",
+            format!("self_fuse = true\n{grants}"),
+            &["--isolate"],
+        ),
+    ];
+    for (name, config_body, extra_args) in layouts {
+        if extra_args.contains(&"--proxy-net") && !pasta {
+            eprintln!("skipping: pasta unavailable for the {name} layout");
+            continue;
+        }
+        let config = dir.path().join("bailey.toml");
+        fs::write(&config, config_body).unwrap();
+        let probe = write_namespace_probe(&work);
+
+        let output = Command::new(bailey())
+            .args(["run"])
+            .args(extra_args)
+            .arg("-c")
+            .arg(&config)
+            .args(["/usr/bin/python3"])
+            .arg(&probe)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_every_namespace_route_refused(name, &stdout);
+        assert!(
+            output.status.success(),
+            "{name}: the run must succeed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 #[test]

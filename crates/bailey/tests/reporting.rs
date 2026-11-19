@@ -346,6 +346,69 @@ fn a_bundled_name_cannot_be_shadowed() {
     );
 }
 
+/// An isolated run builds a user namespace for itself, so the kernel limit is
+/// one of the layers that refuses a nested namespace, and the summary says so.
+#[test]
+fn an_isolated_run_reports_the_kernel_limit_and_the_filter() {
+    if !bailey::backend::isolation::available() {
+        eprintln!("skipping: isolation unavailable on this host");
+        return;
+    }
+    let output = run(&["run", "--isolate", "/bin/true"]);
+    assert!(output.status.success());
+    let summary = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        summary.contains("nested namespaces: refused (kernel limit, seccomp)"),
+        "an isolated run must report the guard limit with the filter: {summary}"
+    );
+}
+
+/// A `--no-isolate` run with allowed egress creates no user namespace, so
+/// there is no limit for the kernel to hold, and the summary must say the
+/// filter is the only layer rather than claiming more.
+#[test]
+fn a_no_isolate_run_reports_the_filter_as_the_only_layer() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("bailey.toml");
+    fs::write(
+        &config,
+        "[filesystem]\nread = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\"]\n\
+         execute = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\"]\n\
+         [network]\negress = \"allow\"\n",
+    )
+    .unwrap();
+    let output = Command::new(bailey())
+        .args(["run", "--no-isolate", "-c"])
+        .arg(&config)
+        .arg("/bin/true")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let summary = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        summary.contains("nested namespaces: refused (seccomp only)"),
+        "a run without a user namespace must report the filter alone: {summary}"
+    );
+}
+
+/// The doctor names the same fact, with the state this host can reach.
+#[test]
+fn doctor_reports_what_refuses_nested_namespaces() {
+    let output = run(&["doctor"]);
+    let report = String::from_utf8_lossy(&output.stdout);
+    if bailey::backend::isolation::available() {
+        assert!(
+            report.contains("nested namespaces: refused (kernel limit, seccomp)"),
+            "doctor must report the guard limit with the filter: {report}"
+        );
+    } else {
+        assert!(
+            report.contains("nested namespaces: refused (seccomp only)"),
+            "doctor must report the filter alone: {report}"
+        );
+    }
+}
+
 /// A profile needs no trust record because you wrote it. That reasoning fails
 /// when someone else can write it, and a profile claims targets on its own.
 #[test]

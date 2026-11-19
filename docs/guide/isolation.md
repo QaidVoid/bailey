@@ -40,7 +40,18 @@ the uid the client offers is not the one the daemon reads from `SO_PEERCRED`.
 Inside the pre-exec child:
 
 1. `unshare(CLONE_NEWUSER)`, then write `uid_map` and `gid_map` with `setgroups`
-   denied.
+   denied. Where the run builds its namespaces from the host, this first
+   namespace is a guard: after the same mapping, bailey writes
+   `/proc/sys/user/max_user_namespaces` in it to 1, and the namespace created in
+   the next step spends that one. The kernel charges every namespace creation to
+   each namespace above it and refuses with `ENOSPC` once an ancestor's limit is
+   reached, so nothing the program does can create a user namespace of its own,
+   and raising the limit from inside its own namespace does not lift the one
+   above. Without a guard, the program could create a user namespace beneath the
+   run's and hold every capability inside it. A proxied run has no separate
+   guard, because the private namespace pasta joins already is one, and its
+   limit leaves room for the run's namespace, or nothing at all when the program
+   runs in it directly.
 2. `unshare(CLONE_NEWNS | CLONE_NEWPID)`.
 3. Fork. A PID namespace only takes effect for a child of the process that
    unshared it, so that child is PID 1 of the new namespace. The intermediate
