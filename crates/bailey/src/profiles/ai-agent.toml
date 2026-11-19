@@ -16,15 +16,15 @@
 # inside the project enforceable and puts your other projects out of the
 # agent's reach.
 #
-# What this egress rule enforces depends on the network mode. In the host's
-# network namespace, the default when a policy allows egress, only TCP ports
-# are enforced: the agent reaches any host on 443, and UDP, DNS and the host's
-# loopback are unrestricted there. That gap belongs to the host mode alone.
-# `--proxy-net` moves the run into a private namespace that hides the host's
-# address and the host's loopback services, and `--egress-proxy ADDR:PORT`
-# confines egress further, to a broker on the host that admits only the
-# destinations it allows. The modes and their reasons are in the network
-# guide, docs/guide/network.md.
+# What this egress rule enforces depends on the network mode. Automatic mode
+# (the default) places an egress-allowing run in the private network namespace,
+# which hides the host's address and the host's loopback services, and needs
+# pasta and user namespaces. `mode = "host"` in a config shares the host's
+# namespace instead, where only TCP ports are enforced: the agent reaches any
+# host on 443, and UDP, DNS and the host's loopback are unrestricted there.
+# `broker = "ADDR:PORT"` or `--egress-proxy ADDR:PORT` confines egress further,
+# to a broker on the host that admits only the destinations it allows. The
+# modes and their reasons are in the network guide, docs/guide/network.md.
 #
 # For an agent that must not reach the network, use the `untrusted` floor,
 # which denies it outright.

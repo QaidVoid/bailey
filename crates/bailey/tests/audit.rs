@@ -174,6 +174,64 @@ fn an_ungranted_egress_attempt_is_refused_during_an_audit() {
     );
 }
 
+/// Audit runs in the host namespace by design, so a policy whose mode asks
+/// for more than Landlock's TCP rules names the gap instead of quietly
+/// skipping it.
+#[test]
+fn an_audit_of_a_network_mode_it_cannot_honour_names_the_gap() {
+    let Some(helper) = helper() else {
+        eprintln!("skipping: no audit helper configured");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+
+    let private = dir.path().join("private.toml");
+    fs::write(&private, "[network]\nmode = \"private\"\n").unwrap();
+    let output = audit(
+        &helper,
+        &[
+            "audit",
+            "-c",
+            private.to_str().unwrap(),
+            "/bin/sh",
+            "-c",
+            "true",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("audit runs in the host namespace"),
+        "a private-mode policy audited in the host namespace must say so: {stderr}"
+    );
+    assert!(
+        stderr.contains(&private.display().to_string()),
+        "the note must name where the private mode came from: {stderr}"
+    );
+
+    let brokered = dir.path().join("brokered.toml");
+    fs::write(&brokered, "[network]\nbroker = \"10.0.0.1:9999\"\n").unwrap();
+    let output = audit(
+        &helper,
+        &[
+            "audit",
+            "-c",
+            brokered.to_str().unwrap(),
+            "/bin/sh",
+            "-c",
+            "true",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("the broker at 10.0.0.1:9999"),
+        "a brokered policy audited in the host namespace must say so: {stderr}"
+    );
+    assert!(
+        stderr.contains(&brokered.display().to_string()),
+        "the note must name where the broker came from: {stderr}"
+    );
+}
+
 #[test]
 fn unconfined_is_an_explicit_opt_in() {
     let Some(helper) = helper() else {

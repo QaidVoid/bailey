@@ -12,7 +12,6 @@ use std::ffi::{CStr, OsStr};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use crate::backend::network::{Inherited, NetworkMode};
 use crate::policy::Policy;
 
 /// The `PATH` handed to a target, rather than the caller's, which commonly
@@ -230,7 +229,13 @@ pub fn inside_sandbox() -> bool {
 ///
 /// The result is the whole environment: it is applied to a cleared environment,
 /// so anything absent here does not reach the target.
-pub fn environment(policy: &Policy, world: &World, network: NetworkMode) -> Vec<(String, String)> {
+///
+/// `network` is the value published for nested runs to read, `None` when there
+/// is nothing to say. A run that established a namespace publishes what it
+/// built; a nested run publishes what it inherited, since its target sits in
+/// the same network and the outer run's restrictions are not this one's to
+/// restate.
+pub fn environment(policy: &Policy, world: &World, network: Option<&str>) -> Vec<(String, String)> {
     let mut env: BTreeMap<String, String> = BTreeMap::new();
 
     env.insert("PATH".into(), SANDBOX_PATH.into());
@@ -243,10 +248,9 @@ pub fn environment(policy: &Policy, world: &World, network: NetworkMode) -> Vec<
     // Which network the inner run will inherit. A nested run cannot build its
     // own, so this is the difference between correctly saying nothing and
     // wrongly warning that UDP is unrestricted.
-    env.insert(
-        "BAILEY_SANDBOX_NET".into(),
-        Inherited::publish(network).into(),
-    );
+    if let Some(network) = network {
+        env.insert("BAILEY_SANDBOX_NET".into(), network.to_owned());
+    }
     if world.private_tmp {
         env.insert("TMPDIR".into(), "/tmp".into());
     }
@@ -479,6 +483,7 @@ fn data_home() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::network::{Inherited, NetworkMode};
     use crate::policy::{Access, FsRule};
 
     fn policy_granting(paths: &[&str]) -> Policy {
@@ -589,7 +594,11 @@ mod tests {
         unsafe { std::env::set_var("BAILEY_TEST_SECRET", "hunter2") };
         let policy = policy_granting(&["/usr"]);
         let world = World::derive(Path::new("/opt/game/game"), &policy, false);
-        let env = environment(&policy, &world, NetworkMode::Isolated);
+        let env = environment(
+            &policy,
+            &world,
+            Some(Inherited::publish(NetworkMode::Isolated)),
+        );
         assert!(!env.iter().any(|(name, _)| name == "BAILEY_TEST_SECRET"));
         assert!(env.iter().any(|(name, _)| name == "PATH"));
         assert!(env.iter().any(|(name, _)| name == "HOME"));
@@ -605,9 +614,13 @@ mod tests {
         policy.env.deny = vec!["TERM".into()];
 
         let world = World::derive(Path::new("/opt/game/game"), &policy, false);
-        let env: BTreeMap<_, _> = environment(&policy, &world, NetworkMode::Isolated)
-            .into_iter()
-            .collect();
+        let env: BTreeMap<_, _> = environment(
+            &policy,
+            &world,
+            Some(Inherited::publish(NetworkMode::Isolated)),
+        )
+        .into_iter()
+        .collect();
 
         assert_eq!(
             env.get("BAILEY_TEST_PASSED").map(String::as_str),
@@ -626,9 +639,13 @@ mod tests {
         let policy = policy_granting(&["/usr"]);
         let world = World::derive(Path::new("/opt/game/game"), &policy, false);
 
-        let env: BTreeMap<_, _> = environment(&policy, &world, NetworkMode::Isolated)
-            .into_iter()
-            .collect();
+        let env: BTreeMap<_, _> = environment(
+            &policy,
+            &world,
+            Some(Inherited::publish(NetworkMode::Isolated)),
+        )
+        .into_iter()
+        .collect();
         assert_eq!(env.get(SANDBOX_MARKER).map(String::as_str), Some("1"));
         assert_eq!(
             env.get("BAILEY_SANDBOX_NET").map(String::as_str),
@@ -636,9 +653,13 @@ mod tests {
             "a nested run reads this rather than guessing what it inherited"
         );
 
-        let host: BTreeMap<_, _> = environment(&policy, &world, NetworkMode::LandlockOnly)
-            .into_iter()
-            .collect();
+        let host: BTreeMap<_, _> = environment(
+            &policy,
+            &world,
+            Some(Inherited::publish(NetworkMode::LandlockOnly)),
+        )
+        .into_iter()
+        .collect();
         assert_eq!(
             host.get("BAILEY_SANDBOX_NET").map(String::as_str),
             Some("host")
@@ -646,9 +667,13 @@ mod tests {
 
         let mut denied = policy.clone();
         denied.env.deny = vec![SANDBOX_MARKER.into()];
-        let env: BTreeMap<_, _> = environment(&denied, &world, NetworkMode::Isolated)
-            .into_iter()
-            .collect();
+        let env: BTreeMap<_, _> = environment(
+            &denied,
+            &world,
+            Some(Inherited::publish(NetworkMode::Isolated)),
+        )
+        .into_iter()
+        .collect();
         assert!(
             !env.contains_key(SANDBOX_MARKER),
             "it is an ordinary variable, removable like any other"
@@ -662,16 +687,24 @@ mod tests {
 
         let without = policy_granting(&["/usr"]);
         let world = World::derive(Path::new("/opt/game/game"), &without, false);
-        let env: BTreeMap<_, _> = environment(&without, &world, NetworkMode::Isolated)
-            .into_iter()
-            .collect();
+        let env: BTreeMap<_, _> = environment(
+            &without,
+            &world,
+            Some(Inherited::publish(NetworkMode::Isolated)),
+        )
+        .into_iter()
+        .collect();
         assert!(!env.contains_key("WAYLAND_DISPLAY"));
 
         let with = policy_granting(&["/usr", "/run/user/4242"]);
         let world = World::derive(Path::new("/opt/game/game"), &with, false);
-        let env: BTreeMap<_, _> = environment(&with, &world, NetworkMode::Isolated)
-            .into_iter()
-            .collect();
+        let env: BTreeMap<_, _> = environment(
+            &with,
+            &world,
+            Some(Inherited::publish(NetworkMode::Isolated)),
+        )
+        .into_iter()
+        .collect();
         assert_eq!(
             env.get("WAYLAND_DISPLAY").map(String::as_str),
             Some("wayland-0")

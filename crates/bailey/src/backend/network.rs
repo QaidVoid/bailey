@@ -8,9 +8,12 @@
 //! host's abstract UNIX socket namespace from reach, since it is per network
 //! namespace.
 //!
-//! Where the policy allows some egress, the namespace cannot be used without
-//! also providing connectivity into it, so enforcement falls back to Landlock's
-//! port rules and the run reports what that does not cover.
+//! A policy that allows egress can have the same namespace behind pasta, which
+//! copies no host address into it: the resolved policy's network mode decides
+//! through [`decide`], with automatic mode preferring the namespace wherever
+//! the host provides it. Without the namespace, or where the mode asks for the
+//! host's, Landlock's port rules are the only restriction and the run reports
+//! what that does not cover.
 //!
 //! A run given an egress broker is the exception: it is already in a namespace
 //! of its own whose netfilter rule admits only the broker, so every other
@@ -22,7 +25,7 @@ use std::io;
 use nix::sched::{CloneFlags, unshare};
 
 use crate::backend::isolation::{create_guard_namespace, set_user_namespace_limit};
-use crate::policy::{Egress, Policy};
+use crate::policy::{Egress, Policy, PortForward};
 
 /// How a run's network access is confined.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +33,9 @@ pub enum NetworkMode {
     /// Own network namespace with only loopback. Nothing leaves the host, at any
     /// protocol.
     Isolated,
+    /// Own namespace behind pasta, with connectivity for allowed egress. The
+    /// host's address, MAC, and loopback services stay out of reach.
+    Private,
     /// Host network namespace, with Landlock rules over TCP ports. Other
     /// protocols are unrestricted.
     LandlockOnly,
@@ -46,21 +52,155 @@ impl NetworkMode {
             NetworkMode::Isolated => {
                 "isolated (own namespace, loopback only, no route off the host)"
             }
+            NetworkMode::Private => {
+                "private (own namespace behind pasta; the host's address, MAC, and \
+                 loopback services are not visible)"
+            }
             NetworkMode::LandlockOnly => "landlock only (TCP ports; other protocols unrestricted)",
             NetworkMode::Brokered => {
                 "brokered (own namespace, TCP to the broker only; UDP, DNS, ICMP dropped)"
             }
         }
     }
+
+    /// The name a run's summary and `bailey show` report the mode by.
+    pub fn name(self) -> &'static str {
+        match self {
+            NetworkMode::Isolated => "isolated",
+            NetworkMode::Private => "private",
+            NetworkMode::LandlockOnly => "host",
+            NetworkMode::Brokered => "brokered",
+        }
+    }
 }
 
-/// Choose the confinement mode for `policy` on a host where user namespaces are
-/// or are not available.
+/// What the host can provide for a network decision.
+#[derive(Debug, Clone, Copy)]
+pub struct HostCapabilities {
+    /// Whether unprivileged user namespaces work, which both the denied-egress
+    /// and the private namespace are built through.
+    pub user_namespaces: bool,
+    /// Whether pasta is available in a trusted location.
+    pub pasta: bool,
+    /// Whether `nft` is available in a trusted location, which the broker's
+    /// lockdown rule needs.
+    pub nft: bool,
+}
+
+/// The mode a run will get, with what chose it and why.
+#[derive(Debug, Clone)]
+pub struct NetworkDecision {
+    /// The mode in force.
+    pub mode: NetworkMode,
+    /// The config layer or flag that chose the setting, or what automatic
+    /// selection fell back to.
+    pub source: String,
+    /// Why this mode for this run: the automatic choice, or the fallback that
+    /// downgraded it.
+    pub reason: String,
+}
+
+/// Whether the policy cannot be honoured without the private namespace.
 ///
-/// The namespace is only usable where the policy needs no connectivity at all:
-/// a namespace with no route cannot serve a policy that allows egress or binds a
-/// port, so those fall back to Landlock's port rules.
-pub fn select(policy: &Policy, userns_available: bool) -> NetworkMode {
+/// A forward under allowed egress needs pasta to carry it, a published port
+/// needs a namespace the host can dial into, and a broker needs a namespace
+/// its netfilter rule can hold. Under automatic mode their presence turns a
+/// fallback into a refusal; a feature forming a boundary is never silently
+/// dropped.
+pub fn needs_private_namespace(
+    policy: &Policy,
+    forwards: &[PortForward],
+    publishes: &[u16],
+) -> bool {
+    let egress_allowed = !matches!(policy.network.egress, Egress::DenyAll);
+    (egress_allowed && !forwards.is_empty())
+        || !publishes.is_empty()
+        || policy.network.broker.is_some()
+}
+
+/// Choose the confinement mode for `policy` on a host with `caps`, naming what
+/// chose it and why.
+///
+/// A policy that denies egress keeps the loopback-only namespace in every mode:
+/// the namespace is the only way to deny every protocol at once, and no mode
+/// setting asks to give that up. A broker is honoured in every mode too, since
+/// a boundary the policy names is not quietly dropped. For allowed egress
+/// without a broker, the resolved mode decides, with automatic mode preferring
+/// the private namespace wherever the host provides it.
+pub fn decide(
+    policy: &Policy,
+    caps: &HostCapabilities,
+    nested: bool,
+    forwards: &[PortForward],
+    publishes: &[u16],
+) -> anyhow::Result<NetworkDecision> {
+    // Inside a sandbox, `unshare` is refused by the outer filter, so the inner
+    // run can build neither a namespace nor a netfilter rule. It enforces what
+    // it can apply itself, Landlock's TCP port rules, and refuses a policy
+    // that needs more: whatever the outer run provides is the outer policy's,
+    // not this one's.
+    if nested {
+        if policy.network.broker.is_some() {
+            anyhow::bail!(
+                "a nested run cannot establish a broker, so the policy's \
+                 broker ({}) cannot be honoured; run it outside the sandbox",
+                policy.network.broker_source.as_deref().unwrap_or("unknown")
+            );
+        }
+        if !publishes.is_empty() {
+            anyhow::bail!(
+                "a nested run cannot publish ports, which need a network \
+                 namespace of the run's own"
+            );
+        }
+        if policy.network.mode == crate::policy::NetworkMode::Private {
+            anyhow::bail!(
+                "a nested run cannot create a network namespace, so the \
+                 policy's private mode ({}) cannot be honoured",
+                policy.network.mode_source
+            );
+        }
+        if !forwards.is_empty() {
+            anyhow::bail!(
+                "a nested run cannot create a network namespace of its own, so \
+                 the policy's forwards cannot be carried"
+            );
+        }
+        return Ok(NetworkDecision {
+            mode: NetworkMode::LandlockOnly,
+            source: "nested run".to_owned(),
+            reason: "inherits the network of the sandbox it runs in, and only \
+                     the Landlock port rules are its own"
+                .to_owned(),
+        });
+    }
+
+    if let Some((addr, port)) = policy.network.broker {
+        let source = policy.network.broker_source.as_deref().unwrap_or("unknown");
+        if !caps.user_namespaces || !caps.pasta {
+            anyhow::bail!(
+                "the broker at {addr}:{port} ({source}) needs the private \
+                 namespace, which needs {} ; the run is refused",
+                if caps.user_namespaces {
+                    "pasta, which is not in a trusted location"
+                } else {
+                    "user namespaces, which are unavailable"
+                }
+            );
+        }
+        if !caps.nft {
+            anyhow::bail!(
+                "the broker at {addr}:{port} ({source}) needs nft, which is \
+                 not in a trusted location; the run is refused"
+            );
+        }
+        return Ok(NetworkDecision {
+            mode: NetworkMode::Brokered,
+            source: source.to_owned(),
+            reason: format!("egress is held to the broker at {addr}:{port}"),
+        });
+    }
+
     // A policy that denies egress keeps the private namespace whether or not it
     // binds a port. The namespace has loopback up, so a bound port is reachable
     // from inside the sandbox, which is what a policy that refuses every
@@ -68,12 +208,97 @@ pub fn select(policy: &Policy, userns_available: bool) -> NetworkMode {
     // namespace to publish the port would hand the run UDP, QUIC, DNS and ICMP
     // as well, none of which Landlock gates: the port would be served at the
     // cost of everything else being unrestricted.
-    let needs_no_network = matches!(policy.network.egress, Egress::DenyAll);
-    if needs_no_network && userns_available {
-        NetworkMode::Isolated
-    } else {
-        NetworkMode::LandlockOnly
+    if matches!(policy.network.egress, Egress::DenyAll) {
+        if caps.user_namespaces {
+            return Ok(NetworkDecision {
+                mode: NetworkMode::Isolated,
+                source: "the policy denies egress".to_owned(),
+                reason: "an own namespace is the only way to deny every \
+                         protocol at once"
+                    .to_owned(),
+            });
+        }
+        return Ok(NetworkDecision {
+            mode: NetworkMode::LandlockOnly,
+            source: "the policy denies egress".to_owned(),
+            reason: "unprivileged user namespaces are unavailable, so only \
+                     Landlock's TCP rules could be applied"
+                .to_owned(),
+        });
     }
+
+    let setting = policy.network.mode;
+    let source = policy.network.mode_source.clone();
+    if setting == crate::policy::NetworkMode::Host {
+        return Ok(NetworkDecision {
+            mode: NetworkMode::LandlockOnly,
+            source,
+            reason: "the host's namespace, where Landlock's TCP port rules \
+                     are the only restriction"
+                .to_owned(),
+        });
+    }
+    if setting == crate::policy::NetworkMode::Private {
+        if !caps.user_namespaces || !caps.pasta {
+            anyhow::bail!(
+                "the policy's private mode ({source}) needs {}, which this \
+                 host cannot provide; the run is refused",
+                if caps.user_namespaces {
+                    "pasta, which is not in a trusted location"
+                } else {
+                    "unprivileged user namespaces, which are unavailable"
+                }
+            );
+        }
+        return Ok(NetworkDecision {
+            mode: NetworkMode::Private,
+            source,
+            reason: "the policy asks for the private namespace".to_owned(),
+        });
+    }
+
+    // Automatic mode: the private namespace wherever the host provides it.
+    if caps.user_namespaces && caps.pasta {
+        return Ok(NetworkDecision {
+            mode: NetworkMode::Private,
+            source,
+            reason: "the host provides the private namespace, which automatic \
+                     mode prefers"
+                .to_owned(),
+        });
+    }
+    if needs_private_namespace(policy, forwards, publishes) {
+        let missing = if caps.user_namespaces {
+            "pasta, which is not in a trusted location"
+        } else {
+            "unprivileged user namespaces, which are unavailable"
+        };
+        let needed = if !publishes.is_empty() {
+            "the published ports"
+        } else if !forwards.is_empty() {
+            "the port forwards"
+        } else {
+            "the policy"
+        };
+        anyhow::bail!(
+            "{needed} need the private namespace, which needs {missing}; \
+             the run is refused"
+        );
+    }
+    let missing = if caps.user_namespaces {
+        "pasta is not in a trusted location"
+    } else {
+        "unprivileged user namespaces are unavailable"
+    };
+    Ok(NetworkDecision {
+        mode: NetworkMode::LandlockOnly,
+        source,
+        reason: format!(
+            "automatic mode fell back to the host's namespace because \
+             {missing}, so the host's address and loopback are visible and \
+             only TCP ports are restricted"
+        ),
+    })
 }
 
 /// Whether a bound port will only be reachable from inside the sandbox.
@@ -84,6 +309,22 @@ pub fn bind_is_loopback_only(policy: &Policy, mode: NetworkMode) -> bool {
     mode == NetworkMode::Isolated
         && !policy.network.bind_ports.is_empty()
         && policy.network.publish_ports.is_empty()
+}
+
+/// The mode a run confined by [`crate::backend::audit`] reports, which is the
+/// shape of answer the pre-mode summary gave.
+///
+/// Audit runs in the host namespace by design, so it never selects the private
+/// namespace for allowed egress: a policy that denies egress and can build a
+/// namespace still gets the loopback-only one, because Landlock alone would
+/// leave UDP open. The decision [`decide`] makes for a run carries more, and
+/// audit reports what the policy's mode would have done instead of applying it.
+pub fn select(policy: &Policy, userns: bool) -> NetworkMode {
+    if userns && matches!(policy.network.egress, Egress::DenyAll) {
+        NetworkMode::Isolated
+    } else {
+        NetworkMode::LandlockOnly
+    }
 }
 
 /// Report the confinement that is actually in force, when it is weaker than the
@@ -102,6 +343,8 @@ pub enum Inherited {
     None,
     /// Inside one with a namespace of its own and no route off the host.
     IsolatedNamespace,
+    /// Inside one behind pasta, with connectivity for allowed egress.
+    PrivateNamespace,
     /// Inside one that shares the host's network namespace.
     HostNamespace,
     /// Inside one whose egress is held to a single broker.
@@ -117,6 +360,7 @@ impl Inherited {
     fn read(published: Option<&str>) -> Self {
         match published {
             Some("isolated") => Inherited::IsolatedNamespace,
+            Some("private") => Inherited::PrivateNamespace,
             Some("broker") => Inherited::Brokered,
             Some(_) => Inherited::HostNamespace,
             None => Inherited::None,
@@ -127,6 +371,7 @@ impl Inherited {
     pub fn publish(mode: NetworkMode) -> &'static str {
         match mode {
             NetworkMode::Isolated => "isolated",
+            NetworkMode::Private => "private",
             NetworkMode::LandlockOnly => "host",
             NetworkMode::Brokered => "broker",
         }
@@ -139,7 +384,10 @@ impl Inherited {
 /// A run that fully denies the network says nothing, in keeping with the rest of
 /// the tool: output means something needs attention.
 pub fn report(mode: NetworkMode, policy: &Policy, inherited: Inherited) {
-    if matches!(mode, NetworkMode::Isolated | NetworkMode::Brokered) {
+    if matches!(
+        mode,
+        NetworkMode::Isolated | NetworkMode::Brokered | NetworkMode::Private
+    ) {
         return;
     }
     if inherited == Inherited::Brokered {
@@ -162,6 +410,25 @@ pub fn report(mode: NetworkMode, policy: &Policy, inherited: Inherited) {
                  sandbox this run is inside has no route off the host, so \
                  nothing will connect"
             );
+        }
+        return;
+    }
+    if inherited == Inherited::PrivateNamespace {
+        // The inherited namespace is behind pasta, so the host's address and
+        // loopback are out of reach, and what leaves travels the same path the
+        // outer run's traffic does. This run's own rules still only cover TCP.
+        match &policy.network.egress {
+            Egress::DenyAll => eprintln!(
+                "bailey: warning: egress is denied, but only TCP is blocked by \
+                 this run's rules, so UDP, QUIC, and DNS still leave through \
+                 the sandbox it is inside"
+            ),
+            Egress::Allow(_) | Egress::AllowAll => eprintln!(
+                "bailey: note: this run inherits the private network of the \
+                 sandbox it is inside, so the host's address and loopback \
+                 services are not visible, and its own rules restrict TCP \
+                 ports only"
+            ),
         }
         return;
     }
@@ -298,6 +565,14 @@ mod tests {
         }
     }
 
+    fn caps(pasta: bool, user_namespaces: bool, nft: bool) -> HostCapabilities {
+        HostCapabilities {
+            user_namespaces,
+            pasta,
+            nft,
+        }
+    }
+
     #[test]
     fn denied_egress_selects_the_namespace() {
         let policy = policy_with(NetworkPolicy::default());
@@ -317,8 +592,7 @@ mod tests {
                 host: "*".into(),
                 port: Some(443),
             }]),
-            bind_ports: Vec::new(),
-            publish_ports: Vec::new(),
+            ..NetworkPolicy::default()
         });
         assert_eq!(select(&policy, true), NetworkMode::LandlockOnly);
     }
@@ -332,6 +606,7 @@ mod tests {
             egress: Egress::DenyAll,
             bind_ports: vec![27015],
             publish_ports: Vec::new(),
+            ..NetworkPolicy::default()
         });
         assert_eq!(select(&policy, true), NetworkMode::Isolated);
         assert!(bind_is_loopback_only(&policy, NetworkMode::Isolated));
@@ -356,6 +631,7 @@ mod tests {
             }]),
             bind_ports: Vec::new(),
             publish_ports: Vec::new(),
+            ..NetworkPolicy::default()
         });
         assert_eq!(select(&policy, true), NetworkMode::LandlockOnly);
     }
@@ -367,6 +643,10 @@ mod tests {
         assert_eq!(
             Inherited::read(Some(Inherited::publish(NetworkMode::Isolated))),
             Inherited::IsolatedNamespace
+        );
+        assert_eq!(
+            Inherited::read(Some(Inherited::publish(NetworkMode::Private))),
+            Inherited::PrivateNamespace
         );
         assert_eq!(
             Inherited::read(Some(Inherited::publish(NetworkMode::LandlockOnly))),
@@ -386,7 +666,140 @@ mod tests {
             egress: Egress::Allow(vec![]),
             bind_ports: vec![27015],
             publish_ports: Vec::new(),
+            ..NetworkPolicy::default()
         });
         assert_eq!(select(&policy, true), NetworkMode::LandlockOnly);
+    }
+
+    /// Every row of the sandbox-network delta, decided exactly as written.
+    /// The mode setting and the broker ride in the policy, the host's
+    /// capabilities in `caps`, and forwards and published ports travel beside
+    /// the policy the way the caller collects them.
+    #[test]
+    fn the_mode_delta_rows_decide_as_specified() {
+        let full = caps(true, true, true);
+        let no_pasta = caps(false, true, true);
+        let no_userns = caps(true, false, true);
+
+        // A project config selects the private namespace.
+        let private = policy_with(NetworkPolicy {
+            egress: Egress::Allow(vec![EgressRule {
+                host: "*".into(),
+                port: Some(443),
+            }]),
+            mode: crate::policy::NetworkMode::Private,
+            mode_source: "/project/bailey.toml".to_owned(),
+            ..NetworkPolicy::default()
+        });
+        let decision = decide(&private, &full, false, &[], &[]).unwrap();
+        assert_eq!(decision.mode, NetworkMode::Private);
+        assert_eq!(decision.source, "/project/bailey.toml");
+
+        // Denied egress is unaffected by mode.
+        let denied_host = policy_with(NetworkPolicy {
+            mode: crate::policy::NetworkMode::Host,
+            ..NetworkPolicy::default()
+        });
+        assert_eq!(
+            decide(&denied_host, &full, false, &[], &[]).unwrap().mode,
+            NetworkMode::Isolated
+        );
+
+        // A broker in policy is brokered in every mode, refused where nft or
+        // the namespace is missing.
+        let mut brokered = private.clone();
+        brokered.network.broker = Some(("169.254.169.1".parse().unwrap(), 8443));
+        brokered.network.broker_source = Some("/project/bailey.toml".to_owned());
+        assert_eq!(
+            decide(&brokered, &full, false, &[], &[]).unwrap().mode,
+            NetworkMode::Brokered
+        );
+        let refused = decide(&brokered, &no_pasta, false, &[], &[])
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("pasta"), "{refused}");
+        assert!(refused.contains("/project/bailey.toml"), "{refused}");
+        let refused = decide(&brokered, &caps(true, true, false), false, &[], &[])
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("nft"), "{refused}");
+
+        // Automatic mode prefers the private namespace where the host
+        // provides it, and continues on the host's network where it does not,
+        // unless the policy needs the namespace.
+        let auto = policy_with(NetworkPolicy {
+            egress: Egress::AllowAll,
+            ..NetworkPolicy::default()
+        });
+        let decision = decide(&auto, &full, false, &[], &[]).unwrap();
+        assert_eq!(decision.mode, NetworkMode::Private);
+        let decision = decide(&auto, &no_pasta, false, &[], &[]).unwrap();
+        assert_eq!(decision.mode, NetworkMode::LandlockOnly);
+        assert!(decision.reason.contains("pasta"), "{}", decision.reason);
+
+        let forward = PortForward {
+            port: 8080,
+            host_port: 8080,
+        };
+        let forwards = [forward];
+        let refused = decide(&auto, &no_pasta, false, &forwards, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("pasta"), "{refused}");
+        assert!(refused.contains("forward"), "{refused}");
+
+        // Explicit private mode refuses rather than degrades, whatever asked
+        // for it, a config layer or a flag.
+        for source in ["/project/bailey.toml", "flag --proxy-net"] {
+            let mut explicit = auto.clone();
+            explicit.network.mode = crate::policy::NetworkMode::Private;
+            explicit.network.mode_source = source.to_owned();
+            let refused = decide(&explicit, &no_pasta, false, &[], &[])
+                .unwrap_err()
+                .to_string();
+            assert!(refused.contains("pasta"), "{refused}");
+            assert!(refused.contains(source), "{refused}");
+            let refused = decide(&explicit, &no_userns, false, &[], &[])
+                .unwrap_err()
+                .to_string();
+            assert!(refused.contains("user namespaces"), "{refused}");
+        }
+
+        // Host mode keeps the host namespace, and a nested run refuses what
+        // it cannot enforce while inheriting the outer run's network.
+        let host = policy_with(NetworkPolicy {
+            egress: Egress::AllowAll,
+            mode: crate::policy::NetworkMode::Host,
+            mode_source: "/project/bailey.toml".to_owned(),
+            ..NetworkPolicy::default()
+        });
+        assert_eq!(
+            decide(&host, &full, false, &[], &[]).unwrap().mode,
+            NetworkMode::LandlockOnly
+        );
+        let nested = decide(&host, &full, true, &[], &[]).unwrap();
+        assert_eq!(nested.mode, NetworkMode::LandlockOnly);
+        assert_eq!(nested.source, "nested run");
+        let refused = decide(&brokered, &full, true, &[], &[])
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("nested"), "{refused}");
+        let refused = decide(&private, &full, true, &[], &[])
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("nested"), "{refused}");
+        let refused = decide(&host, &full, true, &forwards, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("nested"), "{refused}");
+    }
+
+    /// The names the summary reports the modes by.
+    #[test]
+    fn modes_report_their_names() {
+        assert_eq!(NetworkMode::Isolated.name(), "isolated");
+        assert_eq!(NetworkMode::Private.name(), "private");
+        assert_eq!(NetworkMode::LandlockOnly.name(), "host");
+        assert_eq!(NetworkMode::Brokered.name(), "brokered");
     }
 }

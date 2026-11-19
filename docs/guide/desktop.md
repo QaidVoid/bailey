@@ -138,10 +138,11 @@ egress = "allow"
 port = 8080
 ```
 
-Launch with an explicit `--proxy-net`:
+Launch with no flag: automatic mode provides the private namespace the forward
+is carried by wherever the host can.
 
 ```sh
-bailey shell --proxy-net
+bailey shell
 ```
 
 Inside the sandbox, `127.0.0.1:8080` reaches zai-proxy on the host. General
@@ -149,11 +150,11 @@ internet egress remains allowed, but unrelated host loopback services stay
 blocked. With `egress_allow` instead, internet access remains limited to its
 permitted TCP ports. A forward does not add its port to the internet allowance.
 
-Online forwards require isolation, pasta, working unprivileged user namespaces,
-and `nft`. The run is refused if any requirement is missing, if `--proxy-net`
-is omitted, or if `--egress-proxy` is used. The broker remains the sole egress
-path in brokered runs. The same options apply to `bailey run` and
-`bailey shell`.
+Online forwards need isolation, pasta, and working unprivileged user
+namespaces, which automatic mode arranges where the host can. The run is
+refused if a prerequisite is missing, or if a broker is set, since the broker
+remains the sole egress path in brokered runs. The same options apply to
+`bailey run` and `bailey shell`.
 
 Only the configured TCP ports are forwarded. No automatic, inbound, or UDP
 forwarding is enabled, and the forwards remain private to the sandbox.
@@ -175,8 +176,8 @@ support concurrent connections. Prefer the service's own socket relay
   exists to keep a directory ungranted, and both at once is a contradiction.
 - A FUSE entry and `--no-isolate` are refused the same way, because a mount
   placed for the target needs a root to place it in.
-- A forward needs a private network namespace. Denied-egress forwards use a
-  listener inside it; online forwards require `--proxy-net`. Neither exposes
-  a listener to outside clients.
+- A forward needs a private network namespace, which automatic mode provides
+  where the host can and which the run is refused without when a policy needs
+  it. Neither exposes a listener to outside clients.
 - On a machine without working relays, mounts, or forwards, the refusal names
   what was missing. Nothing is silently dropped from a policy.

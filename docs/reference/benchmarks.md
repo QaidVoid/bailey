@@ -80,6 +80,28 @@ not the average. A program that opens some files and then computes, or waits, or
 draws, pays proportionally less, because the fraction of its time spent in `open`
 is what is being taxed.
 
+## Egress through the private network namespace
+
+A policy that allows egress is placed in a private network namespace by default
+(`mode = "auto"`), which starts pasta before the target. Measured with an
+egress-allowing policy, the host namespace against the private namespace,
+300 interleaved rounds for startup and three interleaved rounds for a 100 MB
+HTTPS download:
+
+| Case | Median |
+| --- | --- |
+| Startup, host namespace | 7.4 ms |
+| Startup, private namespace | 17.9 ms |
+| 100 MB download, host namespace | 15.69 MB/s |
+| 100 MB download, private namespace | 15.86 MB/s |
+
+**The private namespace costs about 10.5 ms of startup**, which is pasta and
+the namespace setup, and no measurable throughput on a link-bound download:
+the bottleneck is the connection itself, and pasta adds nothing on it.
+Automatic mode pays this only for policies that allow egress; a denied egress
+keeps the namespace bailey builds anyway. `mode = "host"` restores the host's
+namespace for users who prefer the startup time.
+
 ## What this means
 
 - **Interactive programs, games, shells, editors, agents.** The cost is not

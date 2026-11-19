@@ -220,8 +220,11 @@ fn allowed_egress_reports_that_only_tcp_is_covered() {
     )
     .unwrap();
 
+    // Automatic mode puts this run in the private namespace, where the
+    // allowance is the whole story. On the host's namespace, where the
+    // fallback lands, the run must say what it does not cover.
     let output = isolated_command(dir.path())
-        .args(["run", "-c"])
+        .args(["run", "--no-proxy-net", "-c"])
         .arg(&config)
         .arg("/bin/true")
         .output()
@@ -639,29 +642,286 @@ except OSError:
     assert_eq!(stdout_of(&output), "host-refused");
 }
 
+/// A forward under allowed egress is carried by pasta in automatic mode, with
+/// no flag to ask for it: the mode key and the default cover what `--proxy-net`
+/// used to have to be spelled out for.
 #[test]
-fn allowed_egress_forward_requires_proxy_net() {
-    if python().is_none() {
-        eprintln!("skipping: needs python3");
+fn forwards_carry_without_a_flag_in_auto_mode() {
+    if !proxy_net_available() {
         return;
     }
-    let host = EchoServer::start();
+    let echo = EchoServer::start();
+    let hidden = EchoServer::start();
+    let inside = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let inside_port = inside.local_addr().unwrap().port();
     let output = run_python(
         &format!(
-            "[network]\negress = \"allow\"\n[[forward]]\nport = {}\n",
-            host.port
+            "[network]\negress = \"allow\"\n[[forward]]\nport = {inside_port}\nhost_port = {}\n",
+            echo.port
         ),
-        "print('target-ran')",
+        &format!(
+            r#"import socket
+with socket.create_connection(('127.0.0.1', {inside_port}), timeout=3) as s:
+    s.sendall(b'auto-forward')
+    assert s.recv(64) == b'auto-forward'
+print('forward-ok')
+for address, port in (('127.0.0.1', {host}), ('127.0.0.1', {hidden})):
+    try:
+        with socket.create_connection((address, port), timeout=1):
+            raise AssertionError('reached unforwarded endpoint')
+    except OSError:
+        pass
+print('other-host-ports-refused')
+"#,
+            host = echo.port,
+            hidden = hidden.port,
+        ),
     );
     assert!(
-        !output.status.success(),
-        "an unsafe forward must be refused"
+        output.status.success(),
+        "an automatic-mode forward failed: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
-    assert!(!stdout_of(&output).contains("target-ran"));
+    assert_eq!(stdout_of(&output), "forward-ok\nother-host-ports-refused");
+}
+
+/// Run a target under enforcement with extra environment, so a test can
+/// simulate a host whose helper lookups fail.
+fn run_with_env(
+    config_body: &str,
+    args: &[&str],
+    envs: &[(&str, &Path)],
+    target: &[&str],
+) -> std::process::Output {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("bailey.toml");
+    fs::write(&config, config_body).unwrap();
+    let mut command = isolated_command(dir.path());
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    command
+        .arg("run")
+        .args(args)
+        .arg("-c")
+        .arg(&config)
+        .args(target)
+        .output()
+        .unwrap()
+}
+
+/// Automatic mode with allowed egress picks the private namespace when the
+/// host provides it: no flag names it, and the target sees a private
+/// address, not the host's.
+#[test]
+fn auto_mode_uses_the_private_namespace() {
+    if !proxy_net_available() {
+        return;
+    }
+    let Some(host_address) = non_loopback_host_address() else {
+        eprintln!("skipping: no non-loopback host address");
+        return;
+    };
+    let output = run_python(
+        "[network]\negress = \"allow\"\n",
+        r#"import socket
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+    s.connect(('10.254.254.254', 1))
+    print('addr=' + s.getsockname()[0])
+"#,
+    );
+    assert!(
+        output.status.success(),
+        "the automatic-mode run must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = stdout_of(&output);
+    let address = stdout
+        .trim()
+        .strip_prefix("addr=")
+        .unwrap_or_else(|| panic!("the target must report its address: {stdout}"));
+    assert_ne!(
+        address,
+        host_address.to_string(),
+        "a private namespace must not show the host's address"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("--proxy-net"),
-        "the rejection must explain the required private network: {stderr}"
+        stderr.contains("network mode: private"),
+        "the summary must name the private mode: {stderr}"
+    );
+}
+
+/// A forward under allowed egress makes automatic mode need the private
+/// namespace, and a host without a trusted pasta refuses the run, naming
+/// both what it wanted and what was missing.
+#[test]
+fn auto_mode_refuses_when_a_forward_needs_it() {
+    if !netns_available() {
+        eprintln!("skipping: needs user namespaces");
+        return;
+    }
+    let helpers = tempfile::tempdir().unwrap();
+    let output = run_with_env(
+        "[network]\negress = \"allow\"\n[[forward]]\nport = 54321\n",
+        &[],
+        &[("BAILEY_HELPER_DIRS", helpers.path())],
+        &["/bin/true"],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "a forward without pasta must refuse the run: {stderr}"
+    );
+    assert!(
+        stderr.contains("the port forwards need the private namespace"),
+        "the refusal must name the forwards: {stderr}"
+    );
+    assert!(
+        stderr.contains("pasta, which is not in a trusted location"),
+        "the refusal must name the missing helper: {stderr}"
+    );
+}
+
+/// Without forwards or publications nothing needs the private namespace, so
+/// automatic mode continues on the host's namespace and says what it gave up.
+#[test]
+fn auto_mode_falls_back_when_nothing_needs_it() {
+    if !netns_available() {
+        eprintln!("skipping: needs user namespaces");
+        return;
+    }
+    let helpers = tempfile::tempdir().unwrap();
+    let output = run_with_env(
+        "[network]\negress = \"allow\"\n",
+        &[],
+        &[("BAILEY_HELPER_DIRS", helpers.path())],
+        &["/bin/true"],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "a run with nothing to place must continue: {stderr}"
+    );
+    assert!(
+        stderr.contains("network mode: host"),
+        "the summary must name the host mode: {stderr}"
+    );
+    assert!(
+        stderr.contains("automatic mode fell back"),
+        "the summary must say the fallback was automatic: {stderr}"
+    );
+}
+
+/// An explicit private mode without pasta refuses rather than continuing on
+/// the host's network: the request is the user's, and a downgrade would lie
+/// about where the session's traffic leaves from.
+#[test]
+fn private_mode_refuses_without_pasta() {
+    let helpers = tempfile::tempdir().unwrap();
+    let output = run_with_env(
+        "[network]\negress = \"allow\"\nmode = \"private\"\n",
+        &[],
+        &[("BAILEY_HELPER_DIRS", helpers.path())],
+        &["/bin/true"],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "an explicit private mode without pasta must refuse the run: {stderr}"
+    );
+    assert!(
+        stderr.contains("the policy's private mode"),
+        "the refusal must name the private mode: {stderr}"
+    );
+    assert!(
+        stderr.contains("the run is refused"),
+        "the refusal must say the run was refused: {stderr}"
+    );
+}
+
+/// The flag asks for the same private network the mode key does, so it
+/// refuses the same way, and says the flag asked.
+#[test]
+fn proxy_net_flag_refuses_without_pasta() {
+    let helpers = tempfile::tempdir().unwrap();
+    let output = run_with_env(
+        "[network]\negress = \"allow\"\n",
+        &["--proxy-net"],
+        &[("BAILEY_HELPER_DIRS", helpers.path())],
+        &["/bin/true"],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "--proxy-net without pasta must refuse the run: {stderr}"
+    );
+    assert!(
+        stderr.contains("private mode (flag --proxy-net)"),
+        "the refusal must name the flag that asked: {stderr}"
+    );
+}
+
+/// A configured broker confines the run to that broker: the target reaches
+/// it and nothing else, and the summary names the brokered mode and where
+/// the broker came from.
+#[test]
+fn configured_broker_confines_the_run() {
+    if !proxy_net_available() {
+        return;
+    }
+    let broker = EchoServer::start();
+    let other = EchoServer::start();
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("bailey.toml");
+    fs::write(
+        &config,
+        format!("[network]\nbroker = \"10.0.0.1:{}\"\n", broker.port),
+    )
+    .unwrap();
+    let output = isolated_command(dir.path())
+        .arg("run")
+        .arg("-c")
+        .arg(&config)
+        .args([
+            python().unwrap(),
+            "-c",
+            &format!(
+                r#"import socket
+with socket.create_connection(('10.0.0.1', {broker}), timeout=3) as s:
+    s.sendall(b'to-broker')
+    assert s.recv(64) == b'to-broker'
+print('broker-ok')
+try:
+    socket.create_connection(('10.0.0.1', {other}), timeout=2)
+    print('reached-other')
+except OSError:
+    print('other-dropped')
+"#,
+                broker = broker.port,
+                other = other.port,
+            ),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "the brokered run must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(stdout_of(&output), "broker-ok\nother-dropped");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("network mode: brokered"),
+        "the summary must name the brokered mode: {stderr}"
+    );
+    assert!(
+        stderr.contains(&config.display().to_string()),
+        "the summary must name where the broker came from: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("10.0.0.1:{}", broker.port)),
+        "the summary must name the broker's address: {stderr}"
     );
 }
 

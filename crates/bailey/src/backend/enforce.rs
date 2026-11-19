@@ -219,9 +219,13 @@ pub struct EnforceBackend {
     /// found from the world; this is for the ones a command adds, such as a
     /// confined shell's launch directory.
     pub implicit_write: Vec<PathBuf>,
-    /// The run is already in a namespace whose egress is held to one broker,
-    /// so it neither makes a namespace of its own nor reports UDP as open.
-    pub egress_broker: bool,
+    /// The network decision the run made above this backend, with the mode,
+    /// what chose it, and why.
+    ///
+    /// `None` for a caller that made no decision, which is `bailey audit`: it
+    /// selects through [`network::select`] and reports what the policy's mode
+    /// would have done instead of applying it.
+    pub network: Option<crate::backend::network::NetworkDecision>,
     /// A guard user namespace bailey created already bounds this process, so
     /// the namespace layers run beneath it instead of creating their own.
     ///
@@ -271,7 +275,9 @@ impl EnforceBackend {
         // running it would silently drop the promise.
         if !policy.network.publish_ports.is_empty() {
             return Err(BackendError::Command(
-                "published ports need the proxy network setup; run with --proxy-net".into(),
+                "published ports need the private namespace, which this run \
+                 did not establish"
+                    .into(),
             ));
         }
 
@@ -296,11 +302,10 @@ impl EnforceBackend {
         // inherited and impossible to drop.
         let nested = world::inside_sandbox();
         let inherited = network::Inherited::detect();
-        let mode = if self.egress_broker {
-            NetworkMode::Brokered
-        } else {
-            network::select(policy, userns)
-        };
+        let mode = self
+            .network
+            .as_ref()
+            .map_or_else(|| network::select(policy, userns), |decision| decision.mode);
         network::report(mode, policy, inherited);
         if network::bind_is_loopback_only(policy, mode) {
             eprintln!(
@@ -330,26 +335,37 @@ impl EnforceBackend {
         }
         match mode {
             NetworkMode::Isolated => report.applied("network namespace"),
-            NetworkMode::LandlockOnly
-                if !userns && inherited == network::Inherited::IsolatedNamespace =>
-            {
-                report.applied("network namespace (inherited)")
-            }
-            NetworkMode::LandlockOnly if !userns && inherited == network::Inherited::Brokered => {
-                report.applied("egress broker (inherited)")
-            }
-            NetworkMode::LandlockOnly if !userns && nested => report.skipped(
-                "network namespace",
-                "inside a sandbox that did not create one, so only TCP is restricted",
-            ),
-            // A policy that allows egress cannot use an empty namespace, which
-            // is a consequence of the policy rather than a gap in the host.
-            NetworkMode::LandlockOnly if !userns => report.skipped(
-                "network namespace",
-                "unprivileged user namespaces unavailable, so only TCP is restricted",
-            ),
-            NetworkMode::LandlockOnly => {}
+            NetworkMode::Private => report.applied("network namespace (private)"),
             NetworkMode::Brokered => report.applied("egress broker"),
+            NetworkMode::LandlockOnly => match inherited {
+                network::Inherited::IsolatedNamespace | network::Inherited::PrivateNamespace => {
+                    report.applied("network namespace (inherited)")
+                }
+                network::Inherited::Brokered => report.applied("egress broker (inherited)"),
+                _ if nested => report.skipped(
+                    "network namespace",
+                    "inside a sandbox that did not create one, so only TCP is restricted",
+                ),
+                // A policy that allows egress cannot use an empty namespace,
+                // which is a consequence of the policy rather than a gap in
+                // the host.
+                _ if !userns => report.skipped(
+                    "network namespace",
+                    "unprivileged user namespaces unavailable, so only TCP is restricted",
+                ),
+                _ => {}
+            },
+        }
+        // What chose the mode, and why this run got it: a mode set by a
+        // project config or a flag reads differently from one the automatic
+        // choice fell into, and a caller parsing the JSON sees the same line.
+        if let Some(decision) = &self.network {
+            report.applied(&format!(
+                "network mode: {} ({}: {})",
+                decision.mode.name(),
+                decision.source,
+                decision.reason
+            ));
         }
 
         let isolated = self.isolate && userns;
@@ -616,7 +632,16 @@ impl EnforceBackend {
         // The environment is built rather than inherited, so a caller's
         // credentials do not cross into the sandbox.
         command.env_clear();
-        command.envs(world::environment(policy, &world, mode));
+        // What this run's target sits in is what this run established, or,
+        // inside a sandbox, what this run inherited: the outer run's network
+        // is not this one's to restate, and a run inside the target must read
+        // the same truth a run inside this one would.
+        let published_net = if nested {
+            std::env::var("BAILEY_SANDBOX_NET").ok()
+        } else {
+            Some(network::Inherited::publish(mode).to_owned())
+        };
+        command.envs(world::environment(policy, &world, published_net.as_deref()));
         // Under isolation the working directory is entered after the pivot,
         // since the path only exists in the reconstructed root. Outside it, the
         // caller's directory is simply inherited.

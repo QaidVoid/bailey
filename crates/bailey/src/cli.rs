@@ -224,12 +224,12 @@ struct RunArgs {
     command: Vec<String>,
 }
 
-#[derive(Debug, clap::Args)]
+#[derive(Debug, Default, clap::Args)]
 struct NetworkArgs {
     /// Route egress through a private network namespace, so the session sees a
     /// synthetic address and MAC rather than the host's. Needs pasta and user
-    /// namespaces; without them the run continues and says the host stays
-    /// visible. With configured forwards, missing prerequisites refuse the run.
+    /// namespaces; where either is missing the run is refused rather than
+    /// silently staying on the host's network.
     #[arg(long, conflicts_with = "no_proxy_net")]
     proxy_net: bool,
     /// Never use a private network namespace, even where one was available.
@@ -240,13 +240,15 @@ struct NetworkArgs {
     /// Implies `--proxy-net`. The private namespace is given ADDR as the host's
     /// loopback stand-in, and a netfilter rule drops every outbound connection
     /// except one to ADDR:PORT, so the session reaches the broker and nothing
-    /// else. If the rule cannot be applied the run refuses rather than fall back
-    /// to open egress. `nft` must be present.
+    /// else. If the rule cannot be applied the run refuses rather than fall
+    /// back to open egress. Needs pasta, user namespaces and `nft`; where one
+    /// is missing the run is refused.
     #[arg(long, value_name = "ADDR:PORT", conflicts_with = "no_proxy_net")]
     egress_proxy: Option<String>,
     /// Publish this sandbox TCP port on host loopback, so a service bound
     /// inside the sandbox is reachable at `127.0.0.1:<PORT>` on the host.
-    /// Repeatable. Needs `--proxy-net` and namespace isolation.
+    /// Repeatable. Needs the private namespace, which automatic mode provides
+    /// where the host can, and namespace isolation.
     #[arg(long = "publish-port", value_name = "PORT")]
     publish_port: Vec<u16>,
 }
@@ -309,6 +311,10 @@ struct ShowArgs {
     /// target, or to the untrusted floor.
     #[arg(short, long)]
     profile: Option<String>,
+    /// The network flags, so the decision shown is the one a run with the same
+    /// invocation would make.
+    #[command(flatten)]
+    network: NetworkArgs,
     /// The target executable, by path or by name on `PATH`.
     target: String,
 }
@@ -519,6 +525,34 @@ fn cmd_doctor() -> anyhow::Result<i32> {
         );
     }
 
+    // The same decision a run makes from these facts, stated before anything
+    // runs: automatic mode does one thing on this host and refuses another,
+    // and a policy that names its mode outright is refused where the host
+    // cannot honour it.
+    let pasta = resolve_helper("pasta").is_ok();
+    let nft = resolve_helper("nft").is_ok();
+    if pasta && caps.unprivileged_userns {
+        println!("  private network: available");
+        println!("    runs that allow egress use the private network namespace by default");
+        if !nft {
+            degraded = true;
+            println!("    a broker cannot be confined, because its lockdown rule needs nft");
+        }
+    } else {
+        degraded = true;
+        let missing = if caps.unprivileged_userns {
+            "pasta, which is not in a trusted location"
+        } else {
+            "unprivileged user namespaces, which are unavailable"
+        };
+        println!("  private network: unavailable ({missing})");
+        println!("    runs that allow egress share the host's network namespace");
+        println!(
+            "    policies with forwards, published ports, a broker, or private \
+             mode are refused"
+        );
+    }
+
     let delegated = &caps.cgroup_delegated;
     let missing: Vec<&str> = ["memory", "pids", "cpu"]
         .into_iter()
@@ -588,7 +622,7 @@ const PROXY_ADDRESS_V4: &str = "10.0.2.15";
 const PROXY_ADDRESS_V6: &str = "fd00::2";
 
 /// Reads an `ADDR:PORT` egress-proxy value into an IPv4 address and a port.
-fn parse_egress_proxy(value: &str) -> anyhow::Result<(std::net::Ipv4Addr, u16)> {
+pub(crate) fn parse_egress_proxy(value: &str) -> anyhow::Result<(std::net::Ipv4Addr, u16)> {
     let (addr, port) = value
         .rsplit_once(':')
         .ok_or_else(|| anyhow::anyhow!("--egress-proxy must be ADDR:PORT, got {value:?}"))?;
@@ -648,7 +682,13 @@ fn lock_egress_to_broker(addr: std::net::Ipv4Addr, port: u16) -> anyhow::Result<
     })
 }
 
-/// Restrict loopback to the explicitly forwarded and published TCP ports.
+/// Restrict the namespace's loopback traffic to what keeps the boundary.
+///
+/// The blanket drops are gone: with bailey's pasta arguments and `--no-map-gw`,
+/// namespace loopback never reaches the host, so a drop there only broke the
+/// servers a target talks to over its own loopback. What stays is the
+/// anti-widening half: a forwarded port must not become a new remote egress
+/// allowance, and a publication must not expose anything but its own endpoint.
 fn proxy_loopback_ruleset(forwards: &[PortForward], publishes: &[u16], egress: &Egress) -> String {
     let mut ruleset = String::from(
         "table inet bailey_loopback {\n\
@@ -667,8 +707,18 @@ fn proxy_loopback_ruleset(forwards: &[PortForward], publishes: &[u16], egress: &
             "\t\tip daddr 127.0.0.1 tcp dport {} accept\n",
             forward.port
         ));
+        // pasta answers a forwarded port on the whole loopback range and on
+        // ::1, so the forward is held to the one address its contract names:
+        // the namespace may dial it at 127.0.0.1 and nowhere else.
+        ruleset.push_str(&format!(
+            "\t\tip daddr 127.0.0.0/8 tcp dport {} drop\n",
+            forward.port
+        ));
+        ruleset.push_str(&format!(
+            "\t\tip6 daddr ::1 tcp dport {} drop\n",
+            forward.port
+        ));
     }
-    ruleset.push_str("\t\tip daddr 127.0.0.0/8 drop\n\t\tip6 daddr ::1 drop\n");
     for forward in forwards {
         let already_allowed = match egress {
             Egress::AllowAll => true,
@@ -695,7 +745,78 @@ fn proxy_loopback_ruleset(forwards: &[PortForward], publishes: &[u16], egress: &
     ruleset
 }
 
-/// Select forwards carried by pasta rather than the denied-egress backend.
+/// Apply the network flags to the resolved policy as its highest layer.
+///
+/// `--proxy-net` requests the private namespace, `--no-proxy-net` the host's,
+/// and `--egress-proxy` names a broker. Whatever a config layer set, a flag
+/// passed to this run replaces it, and the source names the flag so the
+/// summary says what chose the mode.
+fn apply_network_flags(policy: &mut Policy, args: &NetworkArgs) -> anyhow::Result<()> {
+    if args.no_proxy_net {
+        policy.network.mode = crate::policy::NetworkMode::Host;
+        policy.network.mode_source = "flag --no-proxy-net".to_owned();
+    } else if args.proxy_net {
+        policy.network.mode = crate::policy::NetworkMode::Private;
+        policy.network.mode_source = "flag --proxy-net".to_owned();
+    }
+    if let Some(proxy) = &args.egress_proxy {
+        let (addr, port) = parse_egress_proxy(proxy)?;
+        policy.network.broker = Some((addr, port));
+        policy.network.broker_source = Some("flag --egress-proxy".to_owned());
+    }
+    Ok(())
+}
+
+/// Reject resolved network settings that contradict each other.
+///
+/// The check runs after the flags are mapped on, so a flag can rescue a
+/// contradiction a config layer wrote: `mode = "host"` beside a forward is
+/// refused, but `--proxy-net` beside the same forward raises the mode above
+/// the refusal. Every refusal names the layer or flag that set each side.
+fn check_network_contradictions(
+    policy: &Policy,
+    forwards: &[PortForward],
+    publishes: &[u16],
+) -> anyhow::Result<()> {
+    if policy.network.mode == crate::policy::NetworkMode::Host {
+        let source = &policy.network.mode_source;
+        if let Some((addr, port)) = policy.network.broker {
+            anyhow::bail!(
+                "host mode ({source}) cannot hold the broker at {addr}:{port} \
+                 ({}), which needs a private namespace",
+                policy.network.broker_source.as_deref().unwrap_or("unknown")
+            );
+        }
+        if !publishes.is_empty() {
+            anyhow::bail!(
+                "host mode ({source}) cannot publish ports, which need a \
+                 network namespace of the run's own"
+            );
+        }
+        if !forwards.is_empty() {
+            anyhow::bail!(
+                "host mode ({source}) cannot forward ports under allowed \
+                 egress, which needs a private namespace"
+            );
+        }
+    }
+    if let Some(source) = &policy.network.broker_source {
+        if !forwards.is_empty() {
+            anyhow::bail!(
+                "the broker set by {source} must remain the only egress, so \
+                 the policy's forwards cannot be carried"
+            );
+        }
+        if !publishes.is_empty() {
+            anyhow::bail!(
+                "the broker set by {source} leaves no route for the host to \
+                 reach a published port, so the publications cannot be carried"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// The user namespace limit the proxy namespace holds, decided from the
 /// layout table in the change design.
 ///
@@ -706,33 +827,25 @@ fn proxy_guard_limit(no_isolate: bool) -> u32 {
     if no_isolate { 0 } else { 1 }
 }
 
-fn proxy_forwards(
-    policy: &Policy,
-    args: &NetworkArgs,
-    no_isolate: bool,
-) -> anyhow::Result<Vec<PortForward>> {
+/// Select forwards carried by pasta rather than the denied-egress backend.
+///
+/// A forward under a denied egress is the backend's to carry, in the empty
+/// namespace the policy builds anyway, so the list is kept whole for the
+/// decision to see: a nested run refuses it there, where the namespace it
+/// needs cannot be made.
+fn collect_forwards(policy: &Policy, no_isolate: bool) -> anyhow::Result<Vec<PortForward>> {
     if policy.forwards.is_empty() {
         return Ok(Vec::new());
     }
-    if args.egress_proxy.is_some() {
-        anyhow::bail!(
-            "port forwards cannot be combined with --egress-proxy; the broker must remain the only egress"
-        );
-    }
-    if matches!(policy.network.egress, Egress::DenyAll) {
-        return Ok(Vec::new());
-    }
-    if !args.proxy_net || args.no_proxy_net {
-        anyhow::bail!("port forwards with allowed egress require --proxy-net");
-    }
-    if no_isolate {
+    if !matches!(policy.network.egress, Egress::DenyAll) && no_isolate {
         anyhow::bail!("port forwards need namespace isolation; remove --no-isolate");
     }
     forward::validate(&policy.forwards, &policy.network.bind_ports).map_err(anyhow::Error::msg)
 }
 
-/// Select sandbox ports to publish on host loopback.
-fn proxy_publish_ports(
+/// Merge the sandbox ports to publish on host loopback, from the flag and the
+/// policy.
+fn collect_publish_ports(
     policy: &Policy,
     args: &NetworkArgs,
     no_isolate: bool,
@@ -753,20 +866,11 @@ fn proxy_publish_ports(
     if publishes.is_empty() {
         return Ok(publishes);
     }
-    if args.egress_proxy.is_some() {
-        anyhow::bail!(
-            "published ports cannot be combined with --egress-proxy; a brokered \
-             run has no route for the host to reach"
-        );
-    }
     if matches!(policy.network.egress, Egress::DenyAll) {
         anyhow::bail!(
             "published ports need allowed egress; a denied network keeps the \
              sandbox unreachable"
         );
-    }
-    if !args.proxy_net || args.no_proxy_net {
-        anyhow::bail!("published ports require --proxy-net");
     }
     if no_isolate {
         anyhow::bail!("published ports need namespace isolation; remove --no-isolate");
@@ -788,6 +892,38 @@ fn proxy_publish_ports(
         }
     }
     Ok(publishes)
+}
+
+/// What the host can provide for a network decision.
+fn host_network_caps() -> network::HostCapabilities {
+    network::HostCapabilities {
+        user_namespaces: isolation::available(),
+        pasta: resolve_helper("pasta").is_ok(),
+        nft: resolve_helper("nft").is_ok(),
+    }
+}
+
+/// The decision a run would make for `policy` with these forwards and
+/// publications, whatever network this process starts in.
+fn network_decision(
+    policy: &Policy,
+    forwards: &[PortForward],
+    publishes: &[u16],
+) -> anyhow::Result<network::NetworkDecision> {
+    // Inside a sandbox the host cannot provide anything: the outer filter
+    // refuses every namespace this run could try to build, and the decision
+    // must say what that costs rather than probe for it.
+    let nested = world::inside_sandbox();
+    let caps = if nested {
+        network::HostCapabilities {
+            user_namespaces: false,
+            pasta: false,
+            nft: false,
+        }
+    } else {
+        host_network_caps()
+    };
+    network::decide(policy, &caps, nested, forwards, publishes)
 }
 
 /// Feeds a ruleset to `nft -f -`, returning an error with nft's own message.
@@ -814,15 +950,14 @@ fn run_nft(ruleset: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The bailey invocation to run inside the private namespace, the outer one
-/// with the marker added so the inner run confines rather than wrapping again.
+/// Re-run the target inside a pasta-provided network namespace when the
+/// decision calls for one.
 ///
-/// Re-run the target inside a pasta-provided network namespace when asked.
-///
-/// Returns the child's exit code when it wrapped, or `None` to run the target
-/// directly. Only an allowed egress shares the host's interfaces: a denied
-/// network is already in an empty namespace of its own, with no address to
-/// hide, and pasta cannot give one connectivity it is meant not to have.
+/// Returns `Wrapped::Parent` with the child's exit code when the parent should
+/// stop there, `Wrapped::Creator` once this process sits in the new namespace.
+/// The decision above this call refused the run where a prerequisite was
+/// missing, so a missing helper or user namespace cannot downgrade to the
+/// host's network here.
 ///
 /// The inner run keeps every layer of confinement; pasta only supplies the
 /// interface it runs behind, a private address and a synthetic MAC in place of
@@ -900,67 +1035,16 @@ fn pasta_arguments(
 }
 
 fn wrap_in_private_namespace(
-    policy: &crate::policy::Policy,
-    args: &NetworkArgs,
+    broker: Option<(std::net::Ipv4Addr, u16)>,
     forwards: &[PortForward],
     publishes: &[u16],
     announce: bool,
     guard_limit: u32,
 ) -> anyhow::Result<Wrapped> {
-    use crate::policy::Egress;
-
-    // An egress proxy needs the private namespace, so it implies --proxy-net.
-    let want_proxy = args.proxy_net || args.egress_proxy.is_some();
-    if args.no_proxy_net || !want_proxy {
-        return Ok(Wrapped::Unwrapped);
-    }
-    // A policy that denies egress outright has nothing to hide behind a
-    // namespace, except when an egress proxy needs one to hold the session to
-    // its broker.
-    if matches!(policy.network.egress, Egress::DenyAll) && args.egress_proxy.is_none() {
-        return Ok(Wrapped::Unwrapped);
-    }
-
-    // For a broker or explicit forwards the namespace is part of the access
-    // boundary, so a missing prerequisite must not downgrade to host networking.
-    let strict = args.egress_proxy.is_some() || !forwards.is_empty() || !publishes.is_empty();
-    let strict_feature = if args.egress_proxy.is_some() {
-        "--egress-proxy"
-    } else if !forwards.is_empty() && !publishes.is_empty() {
-        "port forwards and published ports with --proxy-net"
-    } else if !forwards.is_empty() {
-        "port forwards with --proxy-net"
-    } else {
-        "published ports with --proxy-net"
-    };
-    let pasta = match resolve_helper("pasta") {
-        Ok(path) => path,
-        Err(_) if strict => {
-            anyhow::bail!(
-                "{strict_feature} needs pasta, which is not in a trusted location; \
-                 the run is refused"
-            )
-        }
-        Err(_) => {
-            eprintln!(
-                "bailey: warning: --proxy-net was asked for but pasta is not in a \
-                 trusted location, so the host address stays visible"
-            );
-            return Ok(Wrapped::Unwrapped);
-        }
-    };
-    if !isolation::available() {
-        if strict {
-            anyhow::bail!(
-                "{strict_feature} needs user namespaces, which are unavailable; the run is refused"
-            );
-        }
-        eprintln!(
-            "bailey: warning: --proxy-net needs user namespaces, which are \
-             unavailable, so the host address stays visible"
-        );
-        return Ok(Wrapped::Unwrapped);
-    }
+    // The decision above this call refused the run when a prerequisite was
+    // missing, so the lookups here cannot fail honestly. Resolving again in
+    // an error would be a race with the decision, not a second opinion.
+    let pasta = resolve_helper("pasta")?;
 
     if announce {
         eprintln!(
@@ -975,10 +1059,7 @@ fn wrap_in_private_namespace(
     //
     // IPv6 only where the host has it: handing the namespace a v6 route the host
     // cannot follow would leave a program stalling on v6 before it fell back.
-    let egress_addr = match &args.egress_proxy {
-        Some(value) => Some(parse_egress_proxy(value)?.0.to_string()),
-        None => None,
-    };
+    let egress_addr = broker.map(|(addr, _)| addr.to_string());
     let pasta_args = pasta_arguments(egress_addr.as_deref(), host_has_ipv6(), forwards, publishes);
     // The namespace is made here rather than by pasta, and pasta is pointed at
     // it. Whoever installs the lockdown rule has to know which namespace it
@@ -1172,6 +1253,14 @@ fn refuse_root() -> anyhow::Result<()> {
     // outside, which the map says.
     let map = std::fs::read_to_string("/proc/self/uid_map").unwrap_or_default();
     if host_uid_of_root(&map) == Some(0) {
+        // An identity map also reads inside a nested user namespace, where 0
+        // stands for the outer sandbox's caller. That caller was refused as
+        // real root on the host already, and a child user namespace can only
+        // map what its parent has, so inside a bailey sandbox 0 is never real
+        // root again.
+        if world::inside_sandbox() {
+            return Ok(());
+        }
         anyhow::bail!(
             "bailey confines an unprivileged process and is running as real root; \
              a target would be root on the host too. Run it as the user it is for"
@@ -1199,41 +1288,62 @@ fn host_uid_of_root(map: &str) -> Option<u32> {
 
 /// Establish shared network confinement before hooks or target execution.
 ///
-/// Returns what the caller should do, and whether the caller now runs beneath
-/// the guard user namespace of a private namespace this process created.
+/// Flags are mapped onto the resolved policy as its highest layer, the
+/// contradictions are refused, and one decision covers the wrap, the lockdown,
+/// and what the backend reports. Returns what the caller should do, whether
+/// the caller now runs beneath the guard user namespace of a private namespace
+/// this process created, and the decision for the backend to report.
 fn prepare_network(
     policy: &mut Policy,
     args: &NetworkArgs,
     no_isolate: bool,
     announce: bool,
-) -> anyhow::Result<(Wrapped, bool)> {
+) -> anyhow::Result<(Wrapped, bool, Option<network::NetworkDecision>)> {
+    apply_network_flags(policy, args)?;
+    // --no-isolate promises a run of Landlock and seccomp alone, so automatic
+    // mode does not hand back a namespace with it. A policy or flag that asks
+    // for the private network outright is still honoured: the request is the
+    // user's, the fallback is ours.
+    if no_isolate && policy.network.mode == crate::policy::NetworkMode::Auto {
+        policy.network.mode = crate::policy::NetworkMode::Host;
+        policy.network.mode_source = "flag --no-isolate".to_owned();
+    }
+    // Validate publications first: a run that asks for both should be told
+    // about the publication it got wrong, not about a forward it configured
+    // correctly.
+    let publishes = collect_publish_ports(policy, args, no_isolate)?;
+    let forwards = collect_forwards(policy, no_isolate)?;
+    check_network_contradictions(policy, &forwards, &publishes)?;
+    let decision = network_decision(policy, &forwards, &publishes)?;
+
     // The proxy namespace doubles as the run's guard user namespace. With the
     // isolation layer nesting the run's own namespace inside it, one slot
     // stays free for that. With the target running in the proxy namespace
     // directly, none is left at all.
     let guard_limit = proxy_guard_limit(no_isolate);
-    // Validate publications first: a run that asks for both should be told
-    // about the publication it got wrong, not about a forward it configured
-    // correctly.
-    let proxy_publishes = proxy_publish_ports(policy, args, no_isolate)?;
-    let proxy_forwards = proxy_forwards(policy, args, no_isolate)?;
-    let made_the_namespace = match wrap_in_private_namespace(
-        policy,
-        args,
-        &proxy_forwards,
-        &proxy_publishes,
-        announce,
-        guard_limit,
-    )? {
-        Wrapped::Parent(code) => return Ok((Wrapped::Parent(code), false)),
-        Wrapped::Creator => true,
-        Wrapped::Unwrapped => false,
+    let made_the_namespace = match decision.mode {
+        network::NetworkMode::Private | network::NetworkMode::Brokered => {
+            match wrap_in_private_namespace(
+                policy.network.broker,
+                &forwards,
+                &publishes,
+                announce,
+                guard_limit,
+            )? {
+                Wrapped::Parent(code) => {
+                    return Ok((Wrapped::Parent(code), false, Some(decision)));
+                }
+                Wrapped::Creator => true,
+                Wrapped::Unwrapped => false,
+            }
+        }
+        network::NetworkMode::Isolated | network::NetworkMode::LandlockOnly => false,
     };
 
     // Inside the namespace now, whether by the wrap above or a re-exec into it.
     // The lockdown goes on before the target is confined and run, so there is
     // no window in which the target has both a network and no egress rule.
-    if let Some(proxy) = &args.egress_proxy {
+    if let Some((addr, port)) = policy.network.broker {
         // Only the process that created the namespace installs a rule in it.
         // This is not a check on something a caller said; it is which branch of
         // the fork above this process took, and a caller cannot choose that.
@@ -1243,7 +1353,6 @@ fn prepare_network(
                  this run's own, and none was created; the run is refused"
             );
         }
-        let (addr, port) = parse_egress_proxy(proxy)?;
         lock_egress_to_broker(addr, port)?;
         // Landlock gates egress by port, and the broker does not listen on the
         // policy's ports. The netfilter rule already holds egress to the broker
@@ -1251,17 +1360,16 @@ fn prepare_network(
         // reach; it only stops Landlock from refusing the one allowed hop.
         permit_egress_port(policy, port);
     } else if made_the_namespace {
-        let ruleset =
-            proxy_loopback_ruleset(&proxy_forwards, &proxy_publishes, &policy.network.egress);
+        let ruleset = proxy_loopback_ruleset(&forwards, &publishes, &policy.network.egress);
         if let Err(err) = run_nft(&ruleset) {
-            if !proxy_forwards.is_empty() || !proxy_publishes.is_empty() {
+            if !forwards.is_empty() || !publishes.is_empty() {
                 anyhow::bail!(
                     "the forwarding firewall could not be installed, so the run is refused: {err}"
                 );
             }
             eprintln!("bailey: warning: host loopback stays reachable: {err}");
         }
-        for forward in &proxy_forwards {
+        for forward in &forwards {
             permit_egress_port(policy, forward.port);
             if announce {
                 eprintln!(
@@ -1270,22 +1378,22 @@ fn prepare_network(
                 );
             }
         }
-        for port in &proxy_publishes {
+        for port in &publishes {
             if announce {
                 eprintln!(
                     "bailey: publish host 127.0.0.1:{port} to sandbox port {port} through pasta"
                 );
             }
         }
-        if !proxy_forwards.is_empty() {
+        if !forwards.is_empty() {
             policy.forwards.clear();
         }
-        if !proxy_publishes.is_empty() {
+        if !publishes.is_empty() {
             // Publishing implies the sandbox may bind the port. An empty bind
             // list means binds are unrestricted already, so only a list that
             // already restricts them needs the published port added.
             if !policy.network.bind_ports.is_empty() {
-                for port in &proxy_publishes {
+                for port in &publishes {
                     if !policy.network.bind_ports.contains(port) {
                         policy.network.bind_ports.push(*port);
                     }
@@ -1302,6 +1410,7 @@ fn prepare_network(
             Wrapped::Unwrapped
         },
         made_the_namespace,
+        Some(decision),
     ))
 }
 
@@ -1318,7 +1427,7 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
     report_untrusted(&program, args.config.as_deref());
     warn_if_target_denied(&resolved.policy, &program);
 
-    let (wrapped, guard_in_place) = prepare_network(
+    let (wrapped, guard_in_place, decision) = prepare_network(
         &mut resolved.policy,
         &args.network,
         args.no_isolate,
@@ -1349,7 +1458,7 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
         },
         always_cgroup: false,
         implicit_write: Vec::new(),
-        egress_broker: args.network.egress_proxy.is_some(),
+        network: decision,
         guard_in_place,
     };
     let code = backend.run(&resolved.policy, &target)?;
@@ -1398,7 +1507,7 @@ fn cmd_shell(args: ShellArgs) -> anyhow::Result<i32> {
         .set
         .insert("BAILEY_SANDBOX_DIR".into(), dir.display().to_string());
 
-    let (wrapped, guard_in_place) =
+    let (wrapped, guard_in_place, decision) =
         prepare_network(&mut resolved.policy, &args.network, args.no_isolate, true)?;
     if let Wrapped::Parent(code) = wrapped {
         return Ok(code);
@@ -1420,7 +1529,7 @@ fn cmd_shell(args: ShellArgs) -> anyhow::Result<i32> {
         // The launch directory is granted for writing on the user's behalf, so
         // a narrower grant their config makes beneath it is kept narrow.
         implicit_write: vec![dir.clone()],
-        egress_broker: args.network.egress_proxy.is_some(),
+        network: decision,
         guard_in_place,
     };
     let code = backend.run(&resolved.policy, &target)?;
@@ -1554,6 +1663,31 @@ fn cmd_audit(args: AuditArgs) -> anyhow::Result<i32> {
              enforce with `bailey run`."
         );
     }
+    // Audit runs in the host namespace by design, so a policy whose mode asks
+    // for more than Landlock's TCP rules reports the gap rather than quietly
+    // skipping it. The findings stay about what was recorded.
+    if !args.unconfined {
+        if let Some((addr, port)) = resolved.policy.network.broker {
+            eprintln!(
+                "bailey: note: audit runs in the host namespace, so the broker \
+                 at {addr}:{port} ({}) is not applied; the trace records what \
+                 Landlock's TCP rules allow alone",
+                resolved
+                    .policy
+                    .network
+                    .broker_source
+                    .as_deref()
+                    .unwrap_or("unknown")
+            );
+        } else if resolved.policy.network.mode == crate::policy::NetworkMode::Private {
+            eprintln!(
+                "bailey: note: audit runs in the host namespace, so the private \
+                 network set by {} is not applied; the trace records what \
+                 Landlock's TCP rules allow alone",
+                resolved.policy.network.mode_source
+            );
+        }
+    }
     let backend = AuditBackend {
         unconfined: args.unconfined,
         // Not defaulted on, unlike `run`: see the check above.
@@ -1602,14 +1736,15 @@ fn cmd_audit(args: AuditArgs) -> anyhow::Result<i32> {
 fn cmd_show(args: ShowArgs) -> anyhow::Result<i32> {
     let target = resolve_target(&args.target)?;
     let profile = select_profile(args.profile.as_deref(), &target)?;
-    let resolved = resolve(
+    let mut resolved = resolve(
         &profile,
         &target,
         args.config.as_deref(),
         &args.quick_grants,
     )?;
+    apply_network_flags(&mut resolved.policy, &args.network)?;
     print_sources(&profile, &target, args.config.as_deref());
-    print_policy(&resolved, &target);
+    print_policy(&resolved, &target, &args.network);
     Ok(0)
 }
 
@@ -1935,6 +2070,24 @@ const HELPER_DIRS: [&str; 6] = [
     "/usr/local/bin",
 ];
 
+/// The directories [`resolve_helper`] searches, honouring an override.
+///
+/// `BAILEY_HELPER_DIRS` names whole directories, colon-separated, in place of
+/// the fixed ones. It exists so the answers a run gives can be checked
+/// without the helpers themselves: pointing it at an empty directory makes
+/// every lookup fail, which is what a host without pasta or `nft` answers.
+/// The trust test still applies to whatever is found, so the override can
+/// only make bailey refuse more, never run something its own directories
+/// would not.
+fn helper_dirs() -> Vec<std::borrow::Cow<'static, str>> {
+    match std::env::var_os("BAILEY_HELPER_DIRS") {
+        Some(value) => std::env::split_paths(&value)
+            .map(|dir| std::borrow::Cow::Owned(dir.to_string_lossy().into_owned()))
+            .collect(),
+        None => HELPER_DIRS.iter().map(|dir| (*dir).into()).collect(),
+    }
+}
+
 /// Find a helper program in a trusted location, refusing one anyone else can
 /// write.
 ///
@@ -1945,8 +2098,8 @@ pub fn resolve_helper(name: &str) -> anyhow::Result<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
 
     let mut rejected = Vec::new();
-    for dir in HELPER_DIRS {
-        let candidate = Path::new(dir).join(name);
+    for dir in helper_dirs() {
+        let candidate = Path::new(dir.as_ref()).join(name);
         let Ok(meta) = std::fs::metadata(&candidate) else {
             continue;
         };
@@ -2103,12 +2256,29 @@ fn print_hooks(out: &mut impl io::Write, hooks: &Hooks) {
 /// The body is in [`print_policy_to`] so a test can drive the real report into a
 /// buffer. A test that printed only the hooks section would stay green when the
 /// section's call site here was deleted, which is the wiring this guards.
-fn print_policy(resolved: &Resolved, target: &Path) {
-    print_policy_to(&mut io::stdout(), resolved, target);
+fn print_policy(resolved: &Resolved, target: &Path, network: &NetworkArgs) {
+    print_policy_to(&mut io::stdout(), resolved, target, network);
+}
+
+/// The decision a run would make for the policy as this invocation resolves
+/// it, including the flags it was passed.
+fn network_decision_for_show(
+    policy: &Policy,
+    args: &NetworkArgs,
+) -> anyhow::Result<network::NetworkDecision> {
+    let forwards = collect_forwards(policy, false)?;
+    let publishes = collect_publish_ports(policy, args, false)?;
+    check_network_contradictions(policy, &forwards, &publishes)?;
+    network_decision(policy, &forwards, &publishes)
 }
 
 /// The report [`print_policy`] prints, written to `out`.
-fn print_policy_to(out: &mut impl io::Write, resolved: &Resolved, target: &Path) {
+fn print_policy_to(
+    out: &mut impl io::Write,
+    resolved: &Resolved,
+    target: &Path,
+    network: &NetworkArgs,
+) {
     let policy = &resolved.policy;
 
     writeln!(out, "filesystem:").expect("writing the policy report");
@@ -2157,8 +2327,32 @@ fn print_policy_to(out: &mut impl io::Write, resolved: &Resolved, target: &Path)
         .expect("writing the policy report");
     writeln!(out, "  publish_ports: {:?}", policy.network.publish_ports)
         .expect("writing the policy report");
-    let mode = network::select(policy, isolation::available());
-    writeln!(out, "  mode: {}", mode.describe()).expect("writing the policy report");
+    if let Some((addr, port)) = policy.network.broker {
+        writeln!(
+            out,
+            "  broker: {addr}:{port} (set by {})",
+            policy.network.broker_source.as_deref().unwrap_or("unknown")
+        )
+        .expect("writing the policy report");
+    }
+    // The same decision a run with this invocation would make, refusal
+    // included: a policy the host cannot honour shows as refused here rather
+    // than as a mode that would never come into force.
+    let decision = network_decision_for_show(policy, network);
+    match &decision {
+        Ok(decision) => writeln!(
+            out,
+            "  mode: {} ({}: {})",
+            decision.mode.name(),
+            decision.source,
+            decision.reason
+        )
+        .expect("writing the policy report"),
+        Err(err) => writeln!(out, "  mode: refused ({err})").expect("writing the policy report"),
+    }
+    let mode = decision
+        .map(|decision| decision.mode)
+        .unwrap_or(network::NetworkMode::LandlockOnly);
 
     writeln!(out, "devices:").expect("writing the policy report");
     if policy.devices.is_empty() {
@@ -2186,7 +2380,8 @@ fn print_policy_to(out: &mut impl io::Write, resolved: &Resolved, target: &Path)
     }
 
     writeln!(out, "environment:").expect("writing the policy report");
-    for (name, value) in world::environment(policy, &world, mode) {
+    for (name, value) in world::environment(policy, &world, Some(network::Inherited::publish(mode)))
+    {
         let origin = if policy.env.set.contains_key(&name) {
             "set"
         } else if policy.env.passes(&name) {
@@ -2384,23 +2579,37 @@ mod tests {
         options: &[&str],
     ) -> anyhow::Result<Vec<PortForward>> {
         let args = proxy_args(options);
-        proxy_forwards(policy, &args.network, args.no_isolate)
+        collect_forwards(policy, args.no_isolate)
     }
 
     #[test]
-    fn online_forwards_require_explicit_isolated_proxy_networking() {
+    fn online_forwards_collect_without_a_flag() {
         let mut policy = Policy::default();
         policy.forwards.push(PortForward {
             port: 8081,
             host_port: 8080,
         });
-        assert!(parsed_proxy_forwards(&policy, &[]).unwrap().is_empty());
-        assert!(parsed_proxy_forwards(&policy, &["--egress-proxy", "169.254.169.1:8443"]).is_err());
+        // A denied egress keeps the forwards for the backend, which carries
+        // them in the namespace the policy builds anyway.
+        assert_eq!(
+            parsed_proxy_forwards(&policy, &[]).unwrap(),
+            policy.forwards
+        );
+        assert_eq!(
+            parsed_proxy_forwards(&policy, &["--proxy-net"]).unwrap(),
+            policy.forwards
+        );
+        assert_eq!(
+            parsed_proxy_forwards(&policy, &["--no-proxy-net"]).unwrap(),
+            policy.forwards
+        );
+        assert_eq!(
+            parsed_proxy_forwards(&policy, &["--egress-proxy", "169.254.169.1:8443"]).unwrap(),
+            policy.forwards
+        );
         policy.network.egress = Egress::AllowAll;
-        assert!(parsed_proxy_forwards(&policy, &[]).is_err());
-        assert!(parsed_proxy_forwards(&policy, &["--no-proxy-net"]).is_err());
+        // Allowed egress hands the forwards to pasta, which needs isolation.
         assert!(parsed_proxy_forwards(&policy, &["--proxy-net", "--no-isolate"]).is_err());
-        assert!(parsed_proxy_forwards(&policy, &["--egress-proxy", "169.254.169.1:8443"]).is_err());
         assert_eq!(
             parsed_proxy_forwards(&policy, &["--proxy-net"]).unwrap(),
             policy.forwards
@@ -2474,11 +2683,14 @@ mod tests {
     }
 
     #[test]
-    fn proxy_loopback_default_blocks_all_loopback() {
+    fn proxy_loopback_default_admits_the_sandbox_loopback() {
         let rules = proxy_loopback_ruleset(&[], &[], &Egress::AllowAll);
         assert!(rules.contains("policy accept;"));
-        assert!(rules.contains("ip daddr 127.0.0.0/8 drop"));
-        assert!(rules.contains("ip6 daddr ::1 drop"));
+        // The blanket drops are gone: namespace loopback never reaches the
+        // host under bailey's pasta arguments, so a drop there would only
+        // break the servers the target talks to over its own loopback.
+        assert!(!rules.contains("ip daddr 127.0.0.0/8 drop"));
+        assert!(!rules.contains("ip6 daddr ::1 drop"));
         assert!(!rules.contains("dport"));
         assert!(!rules.contains("ct state"));
     }
@@ -2493,16 +2705,22 @@ mod tests {
         let permit = rules
             .find("ip daddr 127.0.0.1 tcp dport 8081 accept")
             .unwrap();
-        let deny = rules.find("ip daddr 127.0.0.0/8 drop").unwrap();
-        assert!(permit < deny);
+        let deny_loopback = rules
+            .find("ip daddr 127.0.0.0/8 tcp dport 8081 drop")
+            .unwrap();
+        assert!(permit < deny_loopback);
         assert!(rules.find("ct state established accept").unwrap() < permit);
         assert!(rules.contains("policy accept;"));
-        assert!(rules.contains("ip6 daddr ::1 drop"));
         assert!(rules.contains("ip daddr 10.0.2.15 tcp dport 8081 drop"));
         assert!(rules.contains("ip6 daddr fd00::2 tcp dport 8081 drop"));
+        assert!(rules.contains("ip6 daddr ::1 tcp dport 8081 drop"));
         assert!(!rules.contains("udp"));
         assert!(!rules.contains("dport 8080"));
         assert!(!rules.contains("oif lo accept"));
+        // No blanket drop may come back: the sandbox's own servers on other
+        // loopback addresses and ports stay reachable.
+        assert!(!rules.contains("127.0.0.0/8 drop\n"));
+        assert!(!rules.contains("\t\tip6 daddr ::1 drop\n"));
     }
 
     #[test]
@@ -2552,43 +2770,34 @@ mod tests {
     }
 
     #[test]
-    fn published_ports_require_explicit_isolated_proxy_networking() {
-        let args = publish_args(&["--proxy-net", "--publish-port", "3800"]);
-        let policy = |egress: Egress| {
+    fn published_ports_collect_from_the_flag_and_the_policy() {
+        let args = publish_args(&["--publish-port", "3800"]);
+        let policy = |egress: Egress, publish: &[u16]| {
             let mut policy = Policy::default();
             policy.network.egress = egress;
+            policy.network.publish_ports = publish.to_vec();
             policy
         };
         assert_eq!(
-            proxy_publish_ports(&policy(Egress::AllowAll), &args, false).unwrap(),
+            collect_publish_ports(&policy(Egress::AllowAll, &[]), &args, false).unwrap(),
             vec![3800]
         );
-        assert!(proxy_publish_ports(&policy(Egress::DenyAll), &args, false).is_err());
-        assert!(proxy_publish_ports(&policy(Egress::AllowAll), &args, true).is_err());
-        assert!(
-            proxy_publish_ports(
-                &policy(Egress::AllowAll),
+        // The policy's own publications merge with the flag's, without
+        // repeating one.
+        assert_eq!(
+            collect_publish_ports(
+                &policy(Egress::AllowAll, &[3800, 4000]),
                 &publish_args(&["--publish-port", "3800"]),
                 false
             )
-            .is_err()
+            .unwrap(),
+            vec![3800, 4000]
         );
+        assert!(collect_publish_ports(&policy(Egress::DenyAll, &[]), &args, false).is_err());
+        assert!(collect_publish_ports(&policy(Egress::AllowAll, &[]), &args, true).is_err());
         assert!(
-            proxy_publish_ports(
-                &policy(Egress::AllowAll),
-                &publish_args(&[
-                    "--egress-proxy",
-                    "169.254.169.1:8443",
-                    "--publish-port",
-                    "3800"
-                ]),
-                false
-            )
-            .is_err()
-        );
-        assert!(
-            proxy_publish_ports(
-                &policy(Egress::AllowAll),
+            collect_publish_ports(
+                &policy(Egress::AllowAll, &[]),
                 &publish_args(&["--publish-port", "0"]),
                 false
             )
@@ -2605,12 +2814,124 @@ mod tests {
             host_port: 8080,
         });
         let publish = |port: &str| {
-            let args = publish_args(&["--proxy-net", "--publish-port", port]);
-            proxy_publish_ports(&policy, &args, false)
+            let args = publish_args(&["--publish-port", port]);
+            collect_publish_ports(&policy, &args, false)
         };
         assert!(publish("8081").is_err(), "the forward's sandbox port");
         assert!(publish("8080").is_err(), "the forward's host port");
         assert_eq!(publish("3800").unwrap(), vec![3800]);
+    }
+
+    /// Each contradictory combination the policy-config delta names, refused
+    /// with both sides named.
+    #[test]
+    fn contradictory_network_settings_are_refused_naming_the_layers() {
+        let forward = PortForward {
+            port: 8081,
+            host_port: 8080,
+        };
+        let forwards = [forward];
+        let host_mode = |broker: bool, broker_source: &str| {
+            let mut policy = Policy::default();
+            policy.network.egress = Egress::AllowAll;
+            policy.network.mode = crate::policy::NetworkMode::Host;
+            policy.network.mode_source = "/global/bailey.toml".to_owned();
+            if broker {
+                policy.network.broker = Some(("169.254.169.1".parse().unwrap(), 8443));
+                policy.network.broker_source = Some(broker_source.to_owned());
+            }
+            policy
+        };
+
+        // Host mode with a broker.
+        let err = check_network_contradictions(&host_mode(true, "/global/bailey.toml"), &[], &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("host mode"), "{err}");
+        assert!(err.contains("/global/bailey.toml"), "{err}");
+        assert!(err.contains("169.254.169.1:8443"), "{err}");
+
+        // Host mode with published ports.
+        let err = check_network_contradictions(&host_mode(false, ""), &[], &[3800])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("host mode"), "{err}");
+        assert!(err.contains("/global/bailey.toml"), "{err}");
+
+        // Host mode with forwards under allowed egress.
+        let err = check_network_contradictions(&host_mode(false, ""), &forwards, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("host mode"), "{err}");
+        assert!(err.contains("forward"), "{err}");
+
+        // A broker with forwards, and a broker with published ports.
+        let mut brokered = Policy::default();
+        brokered.network.egress = Egress::AllowAll;
+        brokered.network.broker = Some(("169.254.169.1".parse().unwrap(), 8443));
+        brokered.network.broker_source = Some("/project/bailey.toml".to_owned());
+        let err = check_network_contradictions(&brokered, &forwards, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("broker"), "{err}");
+        assert!(err.contains("/project/bailey.toml"), "{err}");
+        let err = check_network_contradictions(&brokered, &[], &[3800])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("broker"), "{err}");
+        assert!(err.contains("/project/bailey.toml"), "{err}");
+
+        // A mode the flags raised above the refusal is no contradiction: this
+        // is how --proxy-net rescues a config layer that asked for host mode
+        // beside a forward.
+        let mut rescued = host_mode(false, "");
+        rescued.network.mode = crate::policy::NetworkMode::Private;
+        rescued.network.mode_source = "flag --proxy-net".to_owned();
+        check_network_contradictions(&rescued, &forwards, &[]).unwrap();
+    }
+
+    /// Each flag overrides each config value, as the highest layer.
+    #[test]
+    fn network_flags_override_every_config_value() {
+        let config_layer = |mode: &str, broker: bool| {
+            let mut policy = Policy::default();
+            policy.network.egress = Egress::AllowAll;
+            policy.network.mode = crate::policy::NetworkMode::parse(mode).unwrap();
+            policy.network.mode_source = "/project/bailey.toml".to_owned();
+            if broker {
+                policy.network.broker = Some(("169.254.169.9".parse().unwrap(), 9000));
+                policy.network.broker_source = Some("/project/bailey.toml".to_owned());
+            }
+            policy
+        };
+
+        // --proxy-net over a config's host mode.
+        let mut policy = config_layer("host", false);
+        apply_network_flags(&mut policy, &publish_args(&["--proxy-net"])).unwrap();
+        assert_eq!(policy.network.mode, crate::policy::NetworkMode::Private);
+        assert_eq!(policy.network.mode_source, "flag --proxy-net");
+
+        // --no-proxy-net over a config's private mode.
+        let mut policy = config_layer("private", false);
+        apply_network_flags(&mut policy, &publish_args(&["--no-proxy-net"])).unwrap();
+        assert_eq!(policy.network.mode, crate::policy::NetworkMode::Host);
+        assert_eq!(policy.network.mode_source, "flag --no-proxy-net");
+
+        // --egress-proxy over a config's broker.
+        let mut policy = config_layer("auto", true);
+        apply_network_flags(
+            &mut policy,
+            &publish_args(&["--egress-proxy", "169.254.169.1:8443"]),
+        )
+        .unwrap();
+        assert_eq!(
+            policy.network.broker,
+            Some(("169.254.169.1".parse().unwrap(), 8443))
+        );
+        assert_eq!(
+            policy.network.broker_source.as_deref(),
+            Some("flag --egress-proxy")
+        );
     }
 
     #[test]
@@ -2631,15 +2952,14 @@ mod tests {
     }
 
     #[test]
-    fn publication_rules_admit_the_local_connection_before_the_loopback_drop() {
+    fn publication_rules_admit_the_local_connection() {
         let rules = proxy_loopback_ruleset(&[], &[3800], &Egress::AllowAll);
         let established = rules.find("ct state established accept").unwrap();
         let accept = rules
             .find("ip daddr 127.0.0.1 tcp dport 3800 accept")
             .unwrap();
-        let drop = rules.find("ip daddr 127.0.0.0/8 drop").unwrap();
-        assert!(established < accept && accept < drop);
-        assert!(rules.contains("ip6 daddr ::1 drop"));
+        assert!(established < accept);
+        assert!(!rules.contains("127.0.0.0/8 drop"));
         // A publication is not an egress allowance, so it gets no remote drop.
         assert!(!rules.contains("\t\ttcp dport 3800 drop"));
         assert!(!rules.contains("udp"));
@@ -2760,7 +3080,7 @@ mod tests {
         };
 
         let mut out = Vec::new();
-        print_policy_to(&mut out, &resolved, &target);
+        print_policy_to(&mut out, &resolved, &target, &NetworkArgs::default());
         let report = String::from_utf8(out).unwrap();
 
         assert!(report.contains("hooks:"), "{report}");
@@ -2785,7 +3105,12 @@ mod tests {
         report_hooks(&mut trusted, &config);
 
         let mut shown = Vec::new();
-        print_policy_to(&mut shown, &Resolved::default(), &target);
+        print_policy_to(
+            &mut shown,
+            &Resolved::default(),
+            &target,
+            &NetworkArgs::default(),
+        );
         let report = String::from_utf8(shown).unwrap();
 
         assert!(

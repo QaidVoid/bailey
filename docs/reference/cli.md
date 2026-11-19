@@ -35,10 +35,10 @@ exit status.
 | `--deny <PATH>` | Deny a path outright, retracting any grant. Repeatable |
 | `--allow-net <PORT>` | Allow outbound TCP to this port, on any host. Repeatable |
 | `-p, --profile <NAME>` | Profile used as the base, bundled or your own. Defaults to one that claims the target, else `untrusted` |
-| `--proxy-net` | Use a private network namespace with pasta connectivity. Required explicitly for publications and forwards with allowed egress |
-| `--publish-port <PORT>` | Publish a sandbox TCP port at host `127.0.0.1:PORT`. Repeatable; requires `--proxy-net`, isolation, and allowed egress |
-| `--no-proxy-net` | Disable proxy networking |
-| `--egress-proxy <ADDR:PORT>` | Restrict egress to a host broker. Implies `--proxy-net`; cannot be combined with forwards or publications |
+| `--proxy-net` | Ask for the private network namespace outright; the run is refused where the host cannot provide it |
+| `--publish-port <PORT>` | Publish a sandbox TCP port at host `127.0.0.1:PORT`. Repeatable; needs the private namespace, isolation, and allowed egress |
+| `--no-proxy-net` | Share the host's network namespace, with Landlock's TCP rules as the only restriction |
+| `--egress-proxy <ADDR:PORT>` | Restrict egress to a host broker; cannot be combined with forwards or publications |
 | `--no-isolate` | Run without namespace isolation, leaving Landlock and seccomp |
 | `--isolate` | Accepted and redundant: isolation is the default |
 | `--quiet` | Do not print what the run enforced |
@@ -56,27 +56,30 @@ The target executable is granted read and execute implicitly, as the lowest
 config layer, so a binary outside the system paths runs without config. Any user
 layer can retract that grant.
 
-For `[[forward]]` entries with allowed egress, `--proxy-net` requires isolation,
-pasta, working unprivileged user namespaces, and `nft`. Missing prerequisites
-refuse the run. Only the configured TCP loopback services are exposed, while
-the existing internet allowance is retained and other host loopback services
-stay blocked. See [network confinement](/guide/network).
+For `[[forward]]` entries with allowed egress, the private namespace they are
+carried by is provided by automatic mode wherever the host can, and
+`--proxy-net` asks for it outright. The namespace needs isolation, pasta, and
+working unprivileged user namespaces, and a run that needs it where the host
+cannot provide it is refused, naming what was missing. Only the configured TCP
+loopback services are exposed, while the existing internet allowance is
+retained and other host loopback services stay blocked. See
+[network confinement](/guide/network).
 
 For example, with an egress allowance in the policy, publish a sandbox dev
 server on port 3800:
 
 ```sh
-bailey run --proxy-net --publish-port 3800 /usr/bin/python3 -m http.server 3800 --bind 127.0.0.1
+bailey run --publish-port 3800 /usr/bin/python3 -m http.server 3800 --bind 127.0.0.1
 ```
 
 `--publish-port` is repeatable for both `run` and `shell`. It does not grant
 egress. Publication is IPv4 TCP only and host-loopback-only, never LAN-facing.
-Port 0 and ports matching either end of a forward are refused, as are
-`--no-proxy-net`, `--no-isolate`, `--egress-proxy`, and denied egress.
-Pasta, working unprivileged user namespaces, and `nft` are mandatory; a missing
-prerequisite or firewall installation failure refuses the run. Each publication
-is reported before the target starts. Unrelated host loopback services stay
-blocked. See [publishing a sandbox service](/guide/network#publishing-a-sandbox-service).
+Port 0 and ports matching either end of a forward are refused, as are host
+mode, a broker, `--no-proxy-net`, `--no-isolate`, and denied egress.
+Pasta, working unprivileged user namespaces, and `nft` are needed there; a
+missing prerequisite or firewall installation failure refuses the run. Each
+publication is reported before the target starts. Unrelated host loopback
+services stay blocked. See [publishing a sandbox service](/guide/network#publishing-a-sandbox-service).
 
 ## `bailey shell`
 
@@ -99,19 +102,19 @@ the same policy without being invoked through bailey.
 | `--deny <PATH>` | Deny a path outright, retracting any grant. Repeatable |
 | `--allow-net <PORT>` | Allow outbound TCP to this port, on any host. Repeatable |
 | `-p, --profile <NAME>` | Profile used as the base |
-| `--proxy-net` | Use a private network namespace with pasta connectivity. Required explicitly for publications and forwards with allowed egress |
-| `--publish-port <PORT>` | Publish a sandbox TCP port at host `127.0.0.1:PORT`. Repeatable; requires `--proxy-net`, isolation, and allowed egress |
-| `--no-proxy-net` | Disable proxy networking |
-| `--egress-proxy <ADDR:PORT>` | Restrict egress to a host broker. Implies `--proxy-net`; cannot be combined with forwards or publications |
+| `--proxy-net` | Ask for the private network namespace outright; the run is refused where the host cannot provide it |
+| `--publish-port <PORT>` | Publish a sandbox TCP port at host `127.0.0.1:PORT`. Repeatable; needs the private namespace, isolation, and allowed egress |
+| `--no-proxy-net` | Share the host's network namespace, with Landlock's TCP rules as the only restriction |
+| `--egress-proxy <ADDR:PORT>` | Restrict egress to a host broker; cannot be combined with forwards or publications |
 | `--no-isolate` | Run without namespace isolation, leaving Landlock and seccomp |
 
 Network options have the same behavior as for `bailey run`. Online TCP forwards
-require explicit `--proxy-net`, isolation, pasta, working unprivileged user
-namespaces, and `nft`; missing prerequisites refuse the launch. Broker mode is
+need the private namespace, which automatic mode arranges where the host can;
+missing prerequisites refuse the launch. Broker mode is
 also fail-closed and cannot be combined with forwards, publications, or
 `--no-isolate`.
-`--proxy-net` alone does not add connectivity when policy denies egress. See
-[network confinement](/guide/network).
+Asking for the private network does not add connectivity when policy denies
+egress. See [network confinement](/guide/network).
 
 The launch directory is granted read, write, and execute as the lowest layer, so
 a shell is useful in a directory with no config; any layer can retract it. The
@@ -166,13 +169,17 @@ bailey show [OPTIONS] <TARGET>
 ```
 
 Prints the profile base, every config file that was found in precedence order,
-and the merged policy, including the hooks it will run outside the sandbox.
-Exits 0.
+and the merged policy, including the hooks it will run outside the sandbox and
+the network decision a run with the same invocation would make, refusal
+included. The network flags are accepted so the decision shown is the one a
+run would make. Exits 0.
 
 | Option | Description |
 | --- | --- |
 | `-c, --config <FILE>` | Explicit config file |
 | `-p, --profile <NAME>` | Bundled profile used as the base |
+| `--proxy-net`, `--no-proxy-net`, `--egress-proxy <ADDR:PORT>`, `--publish-port <PORT>` | The network flags, so the decision shown is the one a run with the same invocation would make |
+| `--allow-net <PORT>` | Allow outbound TCP to this port, on any host. Repeatable |
 
 A discovered file that did not apply is listed with the reason, followed by the
 command that would accept it, so the policy explains its own gaps.
@@ -234,8 +241,9 @@ A shell with no integration is refused rather than given untested code. See
 
 Reports what this host can enforce and what each gap costs: the Landlock ABI and
 which policy elements it covers, user namespaces, cgroup delegation, kernel BTF,
-and whether the audit helper can actually load its programs. See
-[knowing what was enforced](/guide/diagnostics).
+whether the private network mode is available, with what automatic mode
+will do as a result, and whether the audit helper can actually load its
+programs. See [knowing what was enforced](/guide/diagnostics).
 
 ## `bailey completions <shell>` and `bailey man`
 

@@ -1,12 +1,12 @@
 # Additive profile for a tool that fetches over the network and nothing more.
 #
 # Outbound HTTPS and the files needed to verify it. This egress rule enforces
-# TCP to port 443, and only in the host's network namespace, which is the
-# default when a policy allows egress: there the agent reaches any host on
-# 443, and UDP is unrestricted. `--proxy-net` moves the run into a private
-# namespace that hides the host's address and loopback, and
-# `--egress-proxy ADDR:PORT` confines egress to a broker instead. The modes
-# are in the network guide, docs/guide/network.md.
+# TCP to port 443. Automatic mode (the default) places an egress-allowing run
+# in the private network namespace, which hides the host's address and
+# loopback and needs pasta and user namespaces. `mode = "host"` in a config
+# shares the host's namespace instead, where UDP is unrestricted, and
+# `broker = "ADDR:PORT"` or `--egress-proxy ADDR:PORT` confines egress to a
+# broker instead. The modes are in the network guide, docs/guide/network.md.
 
 [filesystem]
 read = ["/etc/ssl", "/usr/share/ca-certificates", "/etc/resolv.conf", "/etc/hosts"]

@@ -73,25 +73,72 @@ pub struct EgressRule {
     pub port: Option<u16>,
 }
 
+/// How a run with allowed egress picks its network namespace.
+///
+/// A policy that denies egress is unaffected by this setting: it always gets
+/// the loopback-only namespace, which is the only way to deny every protocol
+/// at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NetworkMode {
+    /// Use the private namespace whenever the host can provide it. Fall back
+    /// to the host namespace with a warning when it cannot, unless the policy
+    /// needs the private namespace, in which case the run is refused.
+    #[default]
+    Auto,
+    /// Always use the private namespace, and refuse the run when the host
+    /// cannot provide it.
+    Private,
+    /// Keep the host's network namespace, where Landlock's TCP port rules are
+    /// the only restriction.
+    Host,
+}
+
+impl NetworkMode {
+    /// Parse the value a config file writes, or `None` for anything else.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "auto" => Some(Self::Auto),
+            "private" => Some(Self::Private),
+            "host" => Some(Self::Host),
+            _ => None,
+        }
+    }
+}
+
 /// Network access intent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkPolicy {
     /// Outbound connection policy.
     pub egress: Egress,
+    /// How the run picks a namespace when egress is allowed.
+    pub mode: NetworkMode,
+    /// The egress broker a run is held to, as `ADDR:PORT`. Implies the private
+    /// namespace, whatever `mode` says.
+    pub broker: Option<(std::net::Ipv4Addr, u16)>,
     /// TCP ports the target is allowed to bind.
     pub bind_ports: Vec<u16>,
     /// TCP ports on which the host may reach a service bound inside the
     /// sandbox. Each is published on host loopback only, and only when the run
     /// uses a private network namespace.
     pub publish_ports: Vec<u16>,
+    /// The config layer or flag that set [`NetworkPolicy::mode`], for the
+    /// summary and `bailey show` to name.
+    pub mode_source: String,
+    /// The config layer or flag that set [`NetworkPolicy::broker`], when one
+    /// is set.
+    pub broker_source: Option<String>,
 }
 
 impl Default for NetworkPolicy {
     fn default() -> Self {
         Self {
             egress: Egress::DenyAll,
+            mode: NetworkMode::Auto,
+            broker: None,
             bind_ports: Vec::new(),
             publish_ports: Vec::new(),
+            mode_source: "the default (auto)".to_owned(),
+            broker_source: None,
         }
     }
 }

@@ -59,8 +59,9 @@ covers your whole home directory.
 ## Choosing network access
 
 The shell uses the same network options as `bailey run`. With an egress
-allowance, `bailey shell --proxy-net` uses a private network namespace with
-pasta connectivity. It does not add connectivity to a policy that denies egress.
+allowance, automatic mode uses a private network namespace with pasta
+connectivity, and `bailey shell --proxy-net` asks for it outright. Neither adds
+connectivity to a policy that denies egress.
 
 For example, allow HTTPS and forward a host service on port 8080:
 
@@ -74,28 +75,32 @@ port = 8080
 ```
 
 ```sh
-bailey shell --proxy-net
+bailey shell
 # Inside the shell, localhost:8080 reaches the host service.
 ```
 
-The forward does not grant internet access on port 8080. Online forwards require
-explicit `--proxy-net`, isolation, pasta, working unprivileged user namespaces,
-and `nft`; missing prerequisites refuse the launch.
+No flag is needed: automatic mode provides the private namespace the forward is
+carried by. The forward does not grant internet access on port 8080. Online
+forwards need the private namespace, isolation, pasta, and working
+unprivileged user namespaces, which automatic mode arranges where the host
+can; a launch that needs them where the host cannot provide them is refused,
+naming what was missing.
 
 To reach a dev server inside the shell from the host, use
-`bailey shell --proxy-net --publish-port 3800` with allowed egress and permission
+`bailey shell --publish-port 3800` with allowed egress and permission
 to bind port 3800. A server bound to sandbox `127.0.0.1:3800` or
 `0.0.0.0:3800` is reachable at host `127.0.0.1:3800`, not on the host's LAN
 addresses. The flag is repeatable; `[network] publish_ports = [3800]` is the
 config equivalent. Publication does not grant egress or expose unrelated host
 loopback services, and never publishes UDP or IPv6. It requires the same
 fail-closed prerequisites as online forwards and is refused with denied egress,
-`--no-proxy-net`, `--no-isolate`, or `--egress-proxy`. See the
+`mode = "host"`, `--no-proxy-net`, `--no-isolate`, or a broker. See the
 [worked example](/guide/network#publishing-a-sandbox-service).
 
 To make a host broker the only egress path instead, use
-`bailey shell --egress-proxy 169.254.169.1:8443`. This implies `--proxy-net`
-and cannot be combined with forwards, publications, or `--no-isolate`. See
+`bailey shell --egress-proxy 169.254.169.1:8443`, or set
+`broker = "169.254.169.1:8443"` in the policy. It cannot be combined with
+forwards, publications, or `--no-isolate`. See
 [network confinement](/guide/network) for broker setup and enforcement details.
 
 ## Your shell starts without your dotfiles
@@ -198,10 +203,10 @@ authority. This is a tool for scoping work, not a jail.
 | `--shell <PATH>` | The shell to run. Defaults to `$SHELL`, then `/bin/sh` |
 | `-c, --config <FILE>` | Explicit config file, highest precedence |
 | `-p, --profile <NAME>` | Profile used as the base |
-| `--proxy-net` | Use a private network namespace with pasta connectivity for allowed egress |
-| `--publish-port <PORT>` | Publish a sandbox TCP port at host `127.0.0.1:PORT`. Repeatable; requires `--proxy-net`, isolation, and allowed egress |
-| `--no-proxy-net` | Disable proxy networking |
-| `--egress-proxy <ADDR:PORT>` | Restrict egress to a host broker. Implies `--proxy-net` |
+| `--proxy-net` | Ask for the private network namespace outright; the run is refused where the host cannot provide it |
+| `--publish-port <PORT>` | Publish a sandbox TCP port at host `127.0.0.1:PORT`. Repeatable; needs the private namespace, isolation, and allowed egress |
+| `--no-proxy-net` | Share the host's network namespace, with Landlock's TCP rules as the only restriction |
+| `--egress-proxy <ADDR:PORT>` | Restrict egress to a host broker |
 | `--no-isolate` | Landlock and seccomp only, without the rebuilt world |
 
 The shell's exit status is bailey's, so `bailey shell` composes in a script the

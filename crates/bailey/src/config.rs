@@ -321,6 +321,10 @@ struct RawNetwork {
     egress: Option<String>,
     #[serde(default)]
     egress_allow: Vec<RawEgressRule>,
+    /// How a run with allowed egress picks its namespace.
+    mode: Option<String>,
+    /// The egress broker a run is held to, as `ADDR:PORT`.
+    broker: Option<String>,
     #[serde(default)]
     bind_ports: Vec<u16>,
     #[serde(default)]
@@ -380,6 +384,11 @@ struct Accumulator {
     /// The egress allowance, with the path of the layer that set it, for the
     /// same reason as `self_fuse` above.
     egress: Option<(Egress, PathBuf)>,
+    /// How the run picks a namespace when egress is allowed, with the layer
+    /// that set it, so the summary and `show` can name the source.
+    mode: Option<(crate::policy::NetworkMode, PathBuf)>,
+    /// The egress broker a run is held to, with the layer that set it.
+    broker: Option<((std::net::Ipv4Addr, u16), PathBuf)>,
     bind_ports: Vec<u16>,
     publish_ports: Vec<u16>,
     devices: BTreeMap<PathBuf, Access>,
@@ -562,6 +571,10 @@ fn apply_layer(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> 
         // A port forward is the same kind of promise, made about a TCP port.
         acc.forwards.clear();
         acc.publish_ports.clear();
+        // A broker is the same kind of promise made about the whole egress
+        // path: a run held to one inherits it silently unless the reset
+        // clears it, which is what a reset means here too.
+        acc.broker = None;
     }
     // After the reset, with this layer's grants: a layer that resets and
     // relocates in one breath means to keep its own placement, and clearing
@@ -590,6 +603,23 @@ fn apply_layer(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> 
     if let Some(network) = &layer.raw.network {
         if network.egress.is_some() || !network.egress_allow.is_empty() {
             acc.egress = Some((build_egress(network, &layer.path)?, layer.path.clone()));
+        }
+        if let Some(mode) = &network.mode {
+            let Some(mode) = crate::policy::NetworkMode::parse(mode) else {
+                return Err(ConfigError::Invalid {
+                    path: layer.path.clone(),
+                    reason: format!("network mode `{mode}` is not one of auto, private, host"),
+                });
+            };
+            acc.mode = Some((mode, layer.path.clone()));
+        }
+        if let Some(broker) = &network.broker {
+            let broker =
+                crate::cli::parse_egress_proxy(broker).map_err(|err| ConfigError::Invalid {
+                    path: layer.path.clone(),
+                    reason: format!("network broker: {err}"),
+                })?;
+            acc.broker = Some((broker, layer.path.clone()));
         }
         for port in &network.bind_ports {
             if !acc.bind_ports.contains(port) {
@@ -963,8 +993,19 @@ fn finalize(mut acc: Accumulator) -> Result<Resolved, ConfigError> {
                     .egress
                     .map(|(egress, _)| egress)
                     .unwrap_or(Egress::DenyAll),
+                mode: acc.mode.as_ref().map(|(mode, _)| *mode).unwrap_or_default(),
+                broker: acc.broker.as_ref().map(|(broker, _)| *broker),
                 bind_ports: acc.bind_ports,
                 publish_ports: acc.publish_ports,
+                mode_source: acc
+                    .mode
+                    .as_ref()
+                    .map(|(_, path)| format!("{}", path.display()))
+                    .unwrap_or_else(|| "the default (auto)".to_owned()),
+                broker_source: acc
+                    .broker
+                    .as_ref()
+                    .map(|(_, path)| path.display().to_string()),
             },
             devices,
             resources: acc.resources,
@@ -1341,6 +1382,7 @@ fn global_config_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::NetworkMode;
 
     fn layer(base: &str, toml_src: &str) -> Layer {
         Layer {
@@ -1771,6 +1813,87 @@ mod tests {
         let resolved = merge(&layers).unwrap();
         assert_eq!(resolved.policy.network.egress, Egress::AllowAll);
         assert_eq!(resolved.policy.network.bind_ports, vec![1, 2]);
+    }
+
+    #[test]
+    fn nearest_layer_wins_for_mode_and_broker() {
+        let layers = [
+            layer(
+                "/global",
+                "[network]\nmode = \"host\"\nbroker = \"169.254.169.1:8443\"",
+            ),
+            layer(
+                "/project",
+                "[network]\nmode = \"private\"\nbroker = \"169.254.169.2:9000\"",
+            ),
+        ];
+        let resolved = merge(&layers).unwrap();
+        assert_eq!(resolved.policy.network.mode, NetworkMode::Private);
+        assert_eq!(
+            resolved.policy.network.broker,
+            Some(("169.254.169.2".parse().unwrap(), 9000))
+        );
+        assert_eq!(resolved.policy.network.mode_source, "/project/bailey.toml");
+        assert_eq!(
+            resolved.policy.network.broker_source.as_deref(),
+            Some("/project/bailey.toml")
+        );
+    }
+
+    #[test]
+    fn mode_defaults_to_auto_with_a_named_source() {
+        let resolved = merge(&[layer("/base", "[filesystem]\nread = [\"/a\"]")]).unwrap();
+        assert_eq!(resolved.policy.network.mode, NetworkMode::Auto);
+        assert_eq!(resolved.policy.network.mode_source, "the default (auto)");
+        assert_eq!(resolved.policy.network.broker, None);
+        assert_eq!(resolved.policy.network.broker_source, None);
+    }
+
+    #[test]
+    fn unknown_mode_is_rejected_naming_the_layer_and_values() {
+        let layers = [layer("/base", "[network]\nmode = \"vpn\"")];
+        let err = merge(&layers).unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid { .. }));
+        let text = err.to_string();
+        assert!(text.contains("/base"), "the layer is named: {text}");
+        assert!(
+            text.contains("auto"),
+            "the accepted values are named: {text}"
+        );
+    }
+
+    #[test]
+    fn malformed_broker_is_rejected_naming_the_layer() {
+        let layers = [layer("/base", "[network]\nbroker = \"localhost\"")];
+        let err = merge(&layers).unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid { .. }));
+        let text = err.to_string();
+        assert!(text.contains("/base"), "the layer is named: {text}");
+        assert!(
+            text.contains("ADDR:PORT"),
+            "the expected form is named: {text}"
+        );
+    }
+
+    #[test]
+    fn reset_clears_an_inherited_broker() {
+        let layers = [
+            layer("/global", "[network]\nbroker = \"169.254.169.1:8443\""),
+            layer("/project", "[filesystem]\nreset = true"),
+        ];
+        let resolved = merge(&layers).unwrap();
+        assert_eq!(resolved.policy.network.broker, None);
+        assert_eq!(resolved.policy.network.broker_source, None);
+    }
+
+    #[test]
+    fn reset_does_not_clear_the_mode() {
+        let layers = [
+            layer("/global", "[network]\nmode = \"private\""),
+            layer("/project", "[filesystem]\nreset = true"),
+        ];
+        let resolved = merge(&layers).unwrap();
+        assert_eq!(resolved.policy.network.mode, NetworkMode::Private);
     }
 
     #[test]

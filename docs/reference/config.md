@@ -99,8 +99,10 @@ before the run starts.
 | --- | --- | --- |
 | `egress` | `"deny"` or `"allow"` | Outbound policy. Default `"deny"` |
 | `egress_allow` | list of tables | Permitted destinations, `{ host, port }` |
+| `mode` | `"auto"`, `"private"` or `"host"` | How the network is placed. Default `"auto"` |
+| `broker` | `"ADDR:PORT"` | Hold the run to one egress route, through a broker at that address |
 | `bind_ports` | list of integers | TCP ports the target may bind |
-| `publish_ports` | list of integers | Sandbox TCP ports published on the host at `127.0.0.1:PORT`; requires `--proxy-net` and allowed egress |
+| `publish_ports` | list of integers | Sandbox TCP ports published on the host at `127.0.0.1:PORT`; needs the private namespace and allowed egress |
 
 ```toml
 [network]
@@ -109,7 +111,29 @@ bind_ports = [27015]
 ```
 
 `egress_allow` takes precedence over `egress` when both are present. `bind_ports`
-accumulate across layers; `egress` is replaced by the nearest layer that sets it.
+and `publish_ports` accumulate across layers; `egress`, `mode` and `broker` are
+replaced by the nearest layer that sets them, and `filesystem.reset = true`
+clears an inherited broker.
+
+`mode` picks how the network is placed. `auto`, the default, uses the private
+namespace wherever the host provides it, falls back to the host's namespace
+when nothing in the policy needs the private one, and refuses a policy that
+needs it where the host cannot provide it, naming pasta or the user namespaces
+as the missing prerequisite. `private` asks for the private namespace outright
+and refuses the run where pasta or working unprivileged user namespaces are
+missing, rather than silently staying on the host's network. `host` shares the
+host's namespace, where Landlock's TCP port rules are the only restriction.
+A policy that denies egress keeps its own loopback-only namespace in every
+mode, because the namespace is the only way to deny every protocol at once.
+
+`broker` is a boundary the policy itself names: every outbound connection
+except one to `ADDR:PORT` is dropped, so the session reaches the broker and
+nothing else. It needs the private namespace and `nft`, and refuses the run
+where either is missing.
+
+Resolved settings that contradict each other are refused at resolution,
+naming the layers that set them: host mode with forwards, published ports, or
+a broker under allowed egress, or a broker beside forwards or published ports.
 
 `publish_ports = [3800]` makes a TCP service bound inside the sandbox on
 `127.0.0.1:3800` or `0.0.0.0:3800` reachable from the host at
@@ -118,13 +142,14 @@ layers and are cleared alongside forwards by `[filesystem] reset = true`.
 Port 0 is a config error. A publication matching either a forward's sandbox
 port or its host port is refused.
 
-Publication requires explicit `--proxy-net`, namespace isolation, and allowed
-egress. It is refused with `--no-proxy-net`, `--no-isolate`, `--egress-proxy`,
-`egress = "deny"`, or audit. Missing pasta, working unprivileged user namespaces,
-or `nft`, or failure to install the firewall, refuses the run rather than
-degrading it. Each publication is reported before the target starts.
-Publication grants no outbound egress and leaves unrelated host loopback
-services blocked. Only TCP over IPv4 is published, never UDP or IPv6. See
+Publication needs the private namespace and namespace isolation, which
+automatic mode provides where the host can. It is refused with
+`mode = "host"`, a broker, `--no-proxy-net`, `--no-isolate`, `egress = "deny"`,
+or audit. Missing pasta, working unprivileged user namespaces, or `nft`, or
+failure to install the firewall, refuses the run rather than degrading it.
+Each publication is reported before the target starts. Publication grants no
+outbound egress and leaves unrelated host loopback services blocked. Only TCP
+over IPv4 is published, never UDP or IPv6. See
 [publishing a sandbox service](/guide/network#publishing-a-sandbox-service).
 
 - `host` is advisory. Landlock matches on TCP port only, and bailey warns when
@@ -265,12 +290,16 @@ Two different host ports for one sandbox port is refused, as is a forward
 sharing a port the policy already binds. Isolation is required. With denied
 egress, only the forwarded services are reachable.
 
-With `egress = "allow"` or `egress_allow`, forwards require an explicit
-`--proxy-net` on `bailey run` or `bailey shell`. Pasta, working unprivileged
-user namespaces, and `nft` are mandatory; failure refuses the run rather than dropping the protection.
-Omitting `--proxy-net`, using `--no-isolate`, or combining forwards with
-`--egress-proxy` is refused. The existing internet allowance is preserved,
-not widened to include forward-only TCP ports on remote hosts.
+With `egress = "allow"` or `egress_allow`, forwards are carried by pasta in the
+private namespace, which automatic mode provides where the host can; a config
+or `--proxy-net` that names `private` outright makes the request explicit.
+Pasta and working unprivileged user namespaces are needed there, and a run
+whose policy needs the private namespace where the host cannot provide it is
+refused, naming pasta and the forward, rather than dropping the protection.
+Host mode, `--no-proxy-net`, or `--no-isolate` alongside allowed egress is
+refused, as is a forward beside a broker or `--egress-proxy`. The existing
+internet allowance is preserved, not widened to include forward-only TCP
+ports on remote hosts.
 
 Only explicit TCP forwards are enabled, with no automatic, inbound, or UDP
 forwarding. They are private to the sandbox. Denied-egress forwards serve

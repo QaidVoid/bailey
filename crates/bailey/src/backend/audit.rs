@@ -61,7 +61,7 @@ impl AuditBackend {
             // whether or not the policy sets limits.
             always_cgroup: true,
             implicit_write: Vec::new(),
-            egress_broker: false,
+            network: None,
             guard_in_place: false,
         };
         let confined = backend.spawn(&envelope, target)?;

@@ -1,6 +1,7 @@
 //! Integration tests for what bailey reports about a host and about a run.
 
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
@@ -10,6 +11,36 @@ fn bailey() -> &'static str {
 
 fn run(args: &[&str]) -> std::process::Output {
     Command::new(bailey()).args(args).output().unwrap()
+}
+
+/// Run a target under enforcement with a config file, so a report can name
+/// where a policy's choice came from.
+fn run_with_config(
+    config_body: &str,
+    args: &[&str],
+    envs: &[(&str, &Path)],
+) -> (std::process::Output, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("bailey.toml");
+    fs::write(&config, config_body).unwrap();
+    let mut command = Command::new(bailey());
+    command
+        .current_dir(dir.path())
+        .env("HOME", dir.path())
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env("XDG_DATA_HOME", dir.path().join("data"));
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let output = command
+        .arg("run")
+        .args(args)
+        .arg("-c")
+        .arg(&config)
+        .arg("/bin/true")
+        .output()
+        .unwrap();
+    (output, dir)
 }
 
 #[test]
@@ -58,6 +89,161 @@ fn a_run_reports_what_it_enforced() {
     assert!(
         summary.contains("enforced:") && summary.contains("landlock"),
         "a run must say what it enforced: {summary}"
+    );
+}
+
+/// A mode a config chose is reported with the file that chose it, in the
+/// summary and in the JSON a caller parses.
+#[test]
+fn a_configured_mode_is_reported_with_its_source() {
+    let (output, dir) =
+        run_with_config("[network]\negress = \"allow\"\nmode = \"host\"\n", &[], &[]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let config = dir.path().join("bailey.toml");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("network mode: host") && stderr.contains(&config.display().to_string()),
+        "the summary must name the host mode and the file that set it: {stderr}"
+    );
+
+    let (output, dir) = run_with_config(
+        "[network]\negress = \"allow\"\nmode = \"host\"\n",
+        &["--json"],
+        &[],
+    );
+    assert!(output.status.success());
+    let config = dir.path().join("bailey.toml");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("network mode: host") && stdout.contains(&config.display().to_string()),
+        "the JSON must carry the mode, its reason and its source: {stdout}"
+    );
+}
+
+/// Automatic mode that falls back says the private namespace was unavailable
+/// and names the prerequisite it missed.
+#[test]
+fn an_automatic_fallback_names_the_missing_prerequisite() {
+    let helpers = tempfile::tempdir().unwrap();
+    let (output, _) = run_with_config(
+        "[network]\negress = \"allow\"\n",
+        &[],
+        &[("BAILEY_HELPER_DIRS", helpers.path())],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("automatic mode fell back")
+            && stderr.contains("pasta is not in a trusted location"),
+        "the fallback must name the private namespace and the missing helper: {stderr}"
+    );
+}
+
+/// A flag overrides every config layer, and the report says the flag chose.
+#[test]
+fn a_flag_override_is_reported_as_the_flag() {
+    let (output, _) = run_with_config("[network]\negress = \"allow\"\n", &["--no-proxy-net"], &[]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("network mode: host (flag --no-proxy-net:"),
+        "the summary must name the flag that chose the host mode: {stderr}"
+    );
+}
+
+/// The private-network line answers what a run allowing egress will do, and
+/// it needs pasta, user namespaces and `nft` to answer "available".
+#[test]
+fn doctor_reports_the_private_network_available() {
+    if bailey::backend::isolation::available() {
+        for helper in ["pasta", "nft"] {
+            if bailey::cli::resolve_helper(helper).is_err() {
+                eprintln!("skipping: needs trusted {helper}");
+                return;
+            }
+        }
+    } else {
+        eprintln!("skipping: needs user namespaces");
+        return;
+    }
+    let output = run(&["doctor"]);
+    let report = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        report.contains("private network: available"),
+        "a host with pasta and user namespaces reports the private network: {report}"
+    );
+    assert!(
+        report.contains("runs that allow egress use the private network namespace by default"),
+        "the report must say what automatic mode will do: {report}"
+    );
+}
+
+/// A host without a trusted pasta is one where automatic mode shares the
+/// host's namespace and refuses policies that need the private one.
+#[test]
+fn doctor_reports_missing_pasta_and_its_consequences() {
+    let helpers = tempfile::tempdir().unwrap();
+    let mut command = Command::new(bailey());
+    command.env("BAILEY_HELPER_DIRS", helpers.path());
+    let output = command.arg("doctor").output().unwrap();
+    let report = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        report.contains("private network: unavailable (pasta, which is not in a trusted location)"),
+        "an empty helper search must report pasta missing: {report}"
+    );
+    assert!(
+        report.contains("runs that allow egress share the host's network namespace"),
+        "the report must say what runs allowing egress will do: {report}"
+    );
+    assert!(
+        report.contains(
+            "policies with forwards, published ports, a broker, or private mode are refused"
+        ),
+        "the report must say what is refused: {report}"
+    );
+}
+
+/// `nft` is the broker's own prerequisite: without it the private namespace
+/// still works, but a broker cannot be confined.
+#[test]
+fn doctor_reports_a_missing_nft_degrades_the_broker() {
+    if !bailey::backend::isolation::available() {
+        eprintln!("skipping: needs user namespaces");
+        return;
+    }
+    if bailey::cli::resolve_helper("pasta").is_err() {
+        eprintln!("skipping: needs trusted pasta");
+        return;
+    }
+    // A directory holding a stand-in pasta and no nft, so only the broker's
+    // prerequisite is missing.
+    let helpers = tempfile::tempdir().unwrap();
+    let stand_in = helpers.path().join("pasta");
+    fs::write(&stand_in, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&stand_in, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut command = Command::new(bailey());
+    command.env("BAILEY_HELPER_DIRS", helpers.path());
+    let output = command.arg("doctor").output().unwrap();
+    let report = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        report.contains("private network: available"),
+        "a host with pasta but no nft still provides the private network: {report}"
+    );
+    assert!(
+        report.contains("a broker cannot be confined, because its lockdown rule needs nft"),
+        "the report must name what nft's absence costs: {report}"
     );
 }
 
