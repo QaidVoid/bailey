@@ -48,7 +48,7 @@ sandbox helps.
 | Cannot read or write ungranted paths | Landlock | Enforced |
 | Cannot see ungranted paths | Mount namespace, `pivot_root` | Enforced unless `--no-isolate` |
 | Cannot see or signal host processes | PID namespace | Enforced unless `--no-isolate` |
-| Cannot open ungranted TCP connections | Landlock network rules | Enforced on Linux 6.7+ |
+| Cannot open ungranted TCP connections | Landlock network rules, plus the seccomp refusal of MPTCP and SMC sockets | Enforced on Linux 6.7+; the seccomp part needs seccomp filters |
 | Cannot reach host abstract UNIX sockets | Landlock scoping, network namespace | Enforced on Linux 6.12+ |
 | Cannot signal processes outside the sandbox | Landlock scoping, PID namespace | Enforced on Linux 6.12+ |
 | Cannot send UDP, QUIC, or DNS | Network namespace | Enforced when egress is denied |
@@ -60,8 +60,9 @@ sandbox helps.
 ## Where the guarantees end
 
 **Non-TCP traffic under a partial allowance.** Allowing any egress drops the
-network namespace, leaving only TCP port rules. There is no mode that allows some
-UDP and denies the rest.
+network namespace, leaving only TCP port rules. Every other protocol, UDP and
+SCTP among them, is unrestricted there. There is no mode that allows some UDP
+and denies the rest.
 
 **Variables you pass.** `pass` forwards a variable verbatim, so passing one that
 holds a credential puts that credential in the sandbox.

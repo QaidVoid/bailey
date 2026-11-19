@@ -171,7 +171,7 @@ pub fn report(mode: NetworkMode, policy: &Policy, inherited: Inherited) {
         ),
         Egress::Allow(_) => eprintln!(
             "bailey: warning: outbound access is restricted by TCP port only; \
-             UDP, QUIC, and DNS are not restricted"
+             non-TCP protocols such as UDP, QUIC, SCTP, and DNS are not restricted"
         ),
         Egress::AllowAll => {}
     }

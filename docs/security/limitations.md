@@ -9,13 +9,18 @@ different decisions.
 ### A partial egress allowance restricts TCP only
 
 When the policy allows any egress, or binds a port, the target stays in the
-host's network namespace and only Landlock's TCP port rules apply. UDP, QUIC,
-DNS, and ICMP are unrestricted in that mode, and the run says so:
+host's network namespace and only Landlock's TCP port rules apply. Landlock has
+no rule for any other protocol, so UDP, QUIC, DNS, ICMP, and stream protocols
+such as SCTP are unrestricted in that mode, and the run says so:
 
 ```
 bailey: warning: outbound access is restricted by TCP port only;
-UDP, QUIC, and DNS are not restricted
+non-TCP protocols such as UDP, QUIC, SCTP, and DNS are not restricted
 ```
+
+The MPTCP and SMC socket families are refused outright in every mode, because
+they reach TCP endpoints without Landlock's port rules seeing them; that closes
+the protocol side, not the UDP side.
 
 The same mode leaves the host's loopback reachable, since the target shares your
 network namespace.

@@ -52,13 +52,15 @@ That is a genuinely weaker position, and the run says so:
 
 ```
 bailey: warning: outbound access is restricted by TCP port only;
-UDP, QUIC, and DNS are not restricted
+non-TCP protocols such as UDP, QUIC, SCTP, and DNS are not restricted
 ```
 
 Two things are worth knowing about this mode, because both are permanent rather
 than pending:
 
-- **UDP, QUIC, DNS, and ICMP are unrestricted.** Landlock has no rule for them.
+- **UDP, QUIC, DNS, ICMP, and stream protocols such as SCTP are unrestricted.**
+  Landlock has no rule for them. MPTCP and SMC are refused outright instead,
+  since they would carry TCP traffic past the port rules.
 - **The host's loopback is reachable.** The target shares your network namespace,
   so a service on `127.0.0.1` is subject only to the TCP port rules, and any UDP
   port on loopback is reachable outright.

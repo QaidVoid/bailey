@@ -132,7 +132,7 @@ that silently becomes a full deny.
 `egress = "deny"` puts the target in its own network namespace, where every
 protocol fails. Allowing any egress, or binding a port, means the target stays in
 the host's network namespace with only TCP ports enforced, and the run warns that
-UDP, QUIC, and DNS are unrestricted. See
+non-TCP protocols such as UDP, QUIC, SCTP, and DNS are unrestricted. See
 [network confinement](/guide/network).
 :::
 

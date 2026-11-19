@@ -234,6 +234,150 @@ fn allowed_egress_reports_that_only_tcp_is_covered() {
     );
 }
 
+/// Host listeners on an ungranted loopback port, over both address families.
+/// Returns the port and the two listeners left nonblocking, so the test can
+/// count what was accepted after the run.
+fn ungranted_listeners() -> (u16, TcpListener, TcpListener) {
+    let v4 = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = v4.local_addr().unwrap().port();
+    let v6 = TcpListener::bind(("::1", port)).unwrap();
+    v4.set_nonblocking(true).unwrap();
+    v6.set_nonblocking(true).unwrap();
+    (port, v4, v6)
+}
+
+fn accepted_count(listener: &TcpListener) -> usize {
+    let mut accepted = 0;
+    while listener.accept().is_ok() {
+        accepted += 1;
+    }
+    accepted
+}
+
+/// An MPTCP socket must not sidestep the TCP port rules on connect, over
+/// either address family. Before the protocol guard this connected: an
+/// MPTCP socket is not `sk_is_tcp()`, so Landlock skipped it.
+#[test]
+fn mptcp_cannot_reach_an_ungranted_port() {
+    if python().is_none() {
+        eprintln!("skipping: needs python3");
+        return;
+    }
+    let (port, v4, v6) = ungranted_listeners();
+    let output = run_python(
+        "[network]\negress_allow = [{ host = \"*\", port = 443 }]\n",
+        &format!(
+            "import socket\n\
+             for family, address in ((2, '127.0.0.1'), (10, '::1')):\n\
+             \x20   try:\n\
+             \x20       s = socket.socket(family, socket.SOCK_STREAM, 262)\n\
+             \x20       s.settimeout(2)\n\
+             \x20       s.connect((address, {port}))\n\
+             \x20       print(family, 'CONNECTED')\n\
+             \x20   except OSError as e:\n\
+             \x20       print(family, 'errno', e.errno)\n",
+            port = port,
+        ),
+    );
+    assert_eq!(
+        stdout_of(&output),
+        "2 errno 92\n10 errno 92",
+        "an MPTCP connect to an ungranted port must fail with the kernel's \
+         disabled-feature errno on both families"
+    );
+    assert_eq!(accepted_count(&v4), 0, "the IPv4 listener was reached");
+    assert_eq!(accepted_count(&v6), 0, "the IPv6 listener was reached");
+}
+
+/// An MPTCP socket must not sidestep the bind rules either: without
+/// `bind_ports` the target binds nothing, MPTCP or not.
+#[test]
+fn mptcp_cannot_bind_an_ungranted_port() {
+    if python().is_none() {
+        eprintln!("skipping: needs python3");
+        return;
+    }
+    // Hold the port first so the attempt below is known to target a free one,
+    // and drop it once the port is recorded.
+    let held = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let port = held.local_addr().unwrap().port();
+    drop(held);
+    let output = run_python(
+        "[network]\negress_allow = [{ host = \"*\", port = 443 }]\n",
+        &format!(
+            "import socket\n\
+             try:\n\
+             \x20   s = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 262)\n\
+             \x20   s.bind(('127.0.0.1', {port}))\n\
+             \x20   s.listen(1)\n\
+             \x20   print('BOUND')\n\
+             except OSError as e:\n\
+             \x20   print('errno', e.errno)\n",
+            port = port,
+        ),
+    );
+    assert_eq!(
+        stdout_of(&output),
+        "errno 92",
+        "an MPTCP bind without bind_ports must fail with the kernel's \
+         disabled-feature errno"
+    );
+    // The port stayed free: nothing took it, which is the property the bind
+    // refusal exists to keep.
+    let probe = TcpListener::bind(("127.0.0.1", port)).unwrap();
+    drop(probe);
+}
+
+/// Every stream protocol the kernel offers must respect the port rules. The
+/// inventory comes from the enumeration in the change's design: on a kernel
+/// with MPTCP, only 0, 6, 132 and 262 create stream sockets, and before the
+/// protocol guard 262 reached the ungranted port. Removing the MPTCP refusal
+/// makes this fail; the SMC refusal cannot be observed on a host without SMC
+/// support, where the kernel refuses the family on its own.
+#[test]
+fn every_stream_protocol_respects_port_rules() {
+    if python().is_none() {
+        eprintln!("skipping: needs python3");
+        return;
+    }
+    let (port, v4, v6) = ungranted_listeners();
+    let output = run_python(
+        "[network]\negress_allow = [{ host = \"*\", port = 443 }]\n",
+        &format!(
+            "import socket\n\
+             for protocol in (0, 6, 132, 262):\n\
+             \x20   for family, address in ((2, '127.0.0.1'), (10, '::1')):\n\
+             \x20       try:\n\
+             \x20           s = socket.socket(family, socket.SOCK_STREAM, protocol)\n\
+             \x20           s.settimeout(2)\n\
+             \x20           s.connect((address, {port}))\n\
+             \x20           print(protocol, family, 'CONNECTED')\n\
+             \x20       except OSError as e:\n\
+             \x20           print(protocol, family, 'errno', e.errno)\n\
+             try:\n\
+             \x20   socket.socket(43, socket.SOCK_STREAM, 0)\n\
+             \x20   print('smc CREATED')\n\
+             except OSError as e:\n\
+             \x20   print('smc errno', e.errno)\n",
+            port = port,
+        ),
+    );
+    // TCP is refused by Landlock with EACCES, MPTCP by the protocol guard
+    // with ENOPROTOOPT. SCTP cannot speak to a TCP listener, so its refusal
+    // comes from the network; what matters is that it never connects.
+    assert_eq!(
+        stdout_of(&output),
+        "0 2 errno 13\n0 10 errno 13\n\
+         6 2 errno 13\n6 10 errno 13\n\
+         132 2 errno 111\n132 10 errno 111\n\
+         262 2 errno 92\n262 10 errno 92\n\
+         smc errno 97",
+        "no stream protocol may reach an ungranted port"
+    );
+    assert_eq!(accepted_count(&v4), 0, "the IPv4 listener was reached");
+    assert_eq!(accepted_count(&v6), 0, "the IPv6 listener was reached");
+}
+
 /// Host TCP and UDP services whose sockets stay held until their workers stop.
 struct EchoServer {
     port: u16,

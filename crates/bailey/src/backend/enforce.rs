@@ -2002,7 +2002,7 @@ fn build_seccomp_filter(self_fuse: bool) -> anyhow::Result<seccompiler::BpfProgr
         SeccompAction::Errno(libc::EPERM as u32),
         target_arch()?,
     )?;
-    Ok(guard_architecture(filter.try_into()?))
+    Ok(prepend_seccomp_guards(filter.try_into()?))
 }
 
 /// `AUDIT_ARCH_*` value for the architecture the filter was built for. seccomp
@@ -2013,7 +2013,12 @@ const NATIVE_AUDIT_ARCH: u32 = 0xc000_003e;
 #[cfg(target_arch = "aarch64")]
 const NATIVE_AUDIT_ARCH: u32 = 0xc000_00b7;
 
-/// Prepends an architecture check to a generated filter.
+/// Builds the guard instructions that precede every generated filter.
+///
+/// These carry the refusals the generated seccompiler filter cannot express,
+/// because seccompiler gives every rule in a filter the same action and these
+/// need errnos of their own, plus the architecture check that seccompiler
+/// never writes.
 ///
 /// seccompiler compares the syscall number and never looks at
 /// `seccomp_data.arch`. A denied syscall reached through a foreign ABI carries
@@ -2027,7 +2032,7 @@ const NATIVE_AUDIT_ARCH: u32 = 0xc000_00b7;
 /// the native architecture but sets bit 30 of the number. A refused call
 /// returns `EPERM`, the same as any other denial, so a foreign ABI is closed
 /// rather than left to the incidental behaviour of the rest of the filter.
-fn guard_architecture(program: seccompiler::BpfProgram) -> seccompiler::BpfProgram {
+fn seccomp_guards() -> Vec<seccompiler::sock_filter> {
     use seccompiler::sock_filter;
 
     // Classic BPF opcodes and seccomp offsets, which libc does not name.
@@ -2037,8 +2042,19 @@ fn guard_architecture(program: seccompiler::BpfProgram) -> seccompiler::BpfProgr
     const BPF_RET_K: u16 = 0x06;
     const ARCH_OFFSET: u32 = 4; // offsetof(seccomp_data, arch)
     const NR_OFFSET: u32 = 0; // offsetof(seccomp_data, nr)
+    // Low words of `seccomp_data.args[0]` and `args[2]`, the `socket` family
+    // and protocol. Little-endian, which is all bailey builds for.
+    const SOCKET_FAMILY_OFFSET: u32 = 16;
+    const SOCKET_PROTOCOL_OFFSET: u32 = 32;
     const X32_SYSCALL_BIT: u32 = 0x4000_0000;
     const RET_ERRNO_EPERM: u32 = 0x0005_0000 | (libc::EPERM as u32);
+    const RET_ERRNO_EAFNOSUPPORT: u32 = 0x0005_0000 | (libc::EAFNOSUPPORT as u32);
+    const RET_ERRNO_EPROTONOSUPPORT: u32 = 0x0005_0000 | (libc::EPROTONOSUPPORT as u32);
+    const RET_ERRNO_ENOPROTOOPT: u32 = 0x0005_0000 | (libc::ENOPROTOOPT as u32);
+
+    const AF_SMC: i32 = 43;
+    const IPPROTO_SMC: i32 = 256;
+    const IPPROTO_MPTCP: i32 = 262;
 
     let stmt = |code: u16, k: u32| sock_filter {
         code,
@@ -2067,10 +2083,57 @@ fn guard_architecture(program: seccompiler::BpfProgram) -> seccompiler::BpfProgr
             stmt(BPF_RET_K, RET_ERRNO_EPERM),
         ]);
     }
-    let _ = NR_OFFSET;
 
-    prologue.extend(program);
+    // Landlock's TCP rules act only on sockets where `sk_is_tcp()` holds, so
+    // these socket kinds would slip past every TCP port rule while still
+    // reaching TCP endpoints: MPTCP is a stream protocol that falls back to
+    // plain TCP on the wire, and SMC falls back through a socket the kernel
+    // opens without the caller's Landlock domain. SMC answers either as its
+    // own family or, on 6.11 and later, as an INET socket naming the SMC
+    // protocol, so both shapes are refused at `socket()`, before a socket
+    // exists to connect or bind with, and with the errno a kernel without
+    // the feature returns, so aware clients fall back to TCP and stay under
+    // Landlock. The block matches the arguments by their low words, as an
+    // `int` argument's upper register word carries nothing the kernel itself
+    // relies on. It reloads the syscall number rather than reusing the load
+    // above, so it reads the same on every supported architecture.
+    let mut socket_guards = vec![
+        // A = seccomp_data.nr
+        stmt(BPF_LD_W_ABS, NR_OFFSET),
+        // not a socket call: jump past the rest of the block to the filter
+        sock_filter {
+            code: BPF_JMP_JEQ_K,
+            jt: 0,
+            jf: 0,
+            k: libc::SYS_socket as u32,
+        },
+        // A = the family argument
+        stmt(BPF_LD_W_ABS, SOCKET_FAMILY_OFFSET),
+        // family AF_SMC: fall into the refusal; otherwise skip it
+        jump(BPF_JMP_JEQ_K, AF_SMC as u32, 0, 1),
+        stmt(BPF_RET_K, RET_ERRNO_EAFNOSUPPORT),
+        // A = the protocol argument
+        stmt(BPF_LD_W_ABS, SOCKET_PROTOCOL_OFFSET),
+        // protocol IPPROTO_SMC: fall into the refusal; otherwise skip it
+        jump(BPF_JMP_JEQ_K, IPPROTO_SMC as u32, 0, 1),
+        stmt(BPF_RET_K, RET_ERRNO_EPROTONOSUPPORT),
+        // protocol IPPROTO_MPTCP: fall into the refusal; otherwise skip it
+        jump(BPF_JMP_JEQ_K, IPPROTO_MPTCP as u32, 0, 1),
+        stmt(BPF_RET_K, RET_ERRNO_ENOPROTOOPT),
+    ];
+    // From the gate, a jump of `jf` skips everything between it and the first
+    // instruction after the block.
+    socket_guards[1].jf = (socket_guards.len() - 2) as u8;
+    prologue.extend_from_slice(&socket_guards);
+
     prologue
+}
+
+/// Prepends the guard prologue to a generated filter.
+fn prepend_seccomp_guards(program: seccompiler::BpfProgram) -> seccompiler::BpfProgram {
+    let mut guarded = seccomp_guards();
+    guarded.extend(program);
+    guarded
 }
 
 fn target_arch() -> anyhow::Result<seccompiler::TargetArch> {
@@ -2287,6 +2350,242 @@ mod tests {
     fn the_seccomp_filter_builds_with_the_clone_rules() {
         assert!(build_seccomp_filter(false).is_ok());
         assert!(build_seccomp_filter(true).is_ok());
+    }
+
+    /// Mirrors `seccomp_data` so a probe can be written field by field and
+    /// read back as the bytes a BPF program loads from.
+    #[repr(C)]
+    struct SeccompDataProbe {
+        nr: i32,
+        arch: u32,
+        instruction_pointer: u64,
+        args: [u64; 6],
+    }
+
+    const BPF_LD_W_ABS: u16 = 0x20;
+    const BPF_JMP_JEQ_K: u16 = 0x15;
+    const BPF_JMP_JGE_K: u16 = 0x35;
+    const BPF_RET_K: u16 = 0x06;
+    const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+
+    /// Runs the guards over a probe's bytes and returns the `SECCOMP_RET_*`
+    /// action. `None` means the guards fell through to the generated filter,
+    /// which is where allowed calls go.
+    fn simulate_guards(guards: &[seccompiler::sock_filter], data: &[u8]) -> Option<u32> {
+        let mut pc = 0usize;
+        let mut acc: u32 = 0;
+        loop {
+            let insn = guards.get(pc)?;
+            match insn.code {
+                BPF_LD_W_ABS => {
+                    let at = insn.k as usize;
+                    acc = u32::from_le_bytes(data[at..at + 4].try_into().unwrap());
+                    pc += 1;
+                }
+                BPF_JMP_JEQ_K => {
+                    pc = if acc == insn.k {
+                        pc + 1 + insn.jt as usize
+                    } else {
+                        pc + 1 + insn.jf as usize
+                    };
+                }
+                BPF_JMP_JGE_K => {
+                    pc = if acc >= insn.k {
+                        pc + 1 + insn.jt as usize
+                    } else {
+                        pc + 1 + insn.jf as usize
+                    };
+                }
+                BPF_RET_K => return Some(insn.k),
+                other => panic!("guard instruction at {pc} has unknown opcode {other:#x}"),
+            }
+        }
+    }
+
+    fn probe_bytes(data: &SeccompDataProbe) -> &[u8] {
+        unsafe {
+            std::slice::from_raw_parts(
+                std::ptr::from_ref(data).cast::<u8>(),
+                std::mem::size_of::<SeccompDataProbe>(),
+            )
+        }
+    }
+
+    /// The socket guards match the arguments by their low words at the offsets
+    /// the `seccomp_data` layout defines, and refuse exactly MPTCP and SMC.
+    /// The probe is built field by field, so a wrong offset in the guards
+    /// reads the wrong word and fails here.
+    #[test]
+    fn the_socket_guards_read_the_low_words_of_the_family_and_protocol() {
+        assert_eq!(std::mem::offset_of!(SeccompDataProbe, args), 16);
+        assert_eq!(
+            std::mem::offset_of!(SeccompDataProbe, args) + 2 * std::mem::size_of::<u64>(),
+            32
+        );
+
+        let guards = seccomp_guards();
+        let probe = |nr: i32, arch: u32, family: i32, protocol: i32| {
+            let data = SeccompDataProbe {
+                nr,
+                arch,
+                instruction_pointer: 0,
+                args: [
+                    family as u64,
+                    libc::SOCK_STREAM as u64,
+                    protocol as u64,
+                    0,
+                    0,
+                    0,
+                ],
+            };
+            simulate_guards(&guards, probe_bytes(&data))
+        };
+
+        let socket = libc::SYS_socket as i32;
+        assert_eq!(
+            probe(socket, NATIVE_AUDIT_ARCH, libc::AF_INET, 262),
+            Some(SECCOMP_RET_ERRNO | libc::ENOPROTOOPT as u32),
+            "an MPTCP socket must be refused with ENOPROTOOPT"
+        );
+        assert_eq!(
+            probe(socket, NATIVE_AUDIT_ARCH, libc::AF_INET, 256),
+            Some(SECCOMP_RET_ERRNO | libc::EPROTONOSUPPORT as u32),
+            "an INET socket naming the SMC protocol must be refused with \
+             EPROTONOSUPPORT, not left to become an SMC socket on kernels \
+             that have it"
+        );
+        assert_eq!(
+            probe(socket, NATIVE_AUDIT_ARCH, libc::AF_INET6, 256),
+            Some(SECCOMP_RET_ERRNO | libc::EPROTONOSUPPORT as u32),
+            "the SMC protocol refusal must not depend on the address family"
+        );
+        assert_eq!(
+            probe(socket, NATIVE_AUDIT_ARCH, 43, 0),
+            Some(SECCOMP_RET_ERRNO | libc::EAFNOSUPPORT as u32),
+            "an AF_SMC socket must be refused with EAFNOSUPPORT"
+        );
+        // Both refusals must work regardless of what the other argument holds,
+        // which is what pins the two offsets apart.
+        assert_eq!(
+            probe(socket, NATIVE_AUDIT_ARCH, 43, 262),
+            Some(SECCOMP_RET_ERRNO | libc::EAFNOSUPPORT as u32),
+            "the family check must fire before the protocol check"
+        );
+        assert_eq!(
+            probe(socket, NATIVE_AUDIT_ARCH, libc::AF_INET, 0),
+            None,
+            "protocol 0 is ordinary TCP and must reach the filter"
+        );
+        assert_eq!(
+            probe(socket, NATIVE_AUDIT_ARCH, libc::AF_INET, libc::IPPROTO_TCP),
+            None,
+            "protocol IPPROTO_TCP must reach the filter"
+        );
+        assert_eq!(
+            probe(socket, NATIVE_AUDIT_ARCH, libc::AF_INET6, 132),
+            None,
+            "SCTP stays outside these guards"
+        );
+        assert_eq!(
+            probe(socket, NATIVE_AUDIT_ARCH, libc::AF_INET6, 262),
+            Some(SECCOMP_RET_ERRNO | libc::ENOPROTOOPT as u32),
+            "the MPTCP refusal must not depend on the address family"
+        );
+        assert_eq!(
+            probe(libc::SYS_clone as i32, NATIVE_AUDIT_ARCH, libc::AF_INET, 0),
+            None,
+            "a non-socket call must leave the guard block untouched"
+        );
+        assert_eq!(
+            probe(socket, 0xc000_00b7, libc::AF_INET, 0),
+            Some(SECCOMP_RET_ERRNO | libc::EPERM as u32),
+            "a foreign architecture must still be refused with EPERM"
+        );
+    }
+
+    /// Exit codes the probe child reports back. 1 to 5 name the assertion that
+    /// failed, 70 and 72 name the setup steps, so a host without unprivileged
+    /// seccomp reads as a skip rather than as a broken filter.
+    const PROBE_PRCTL_FAILED: i32 = 70;
+    const PROBE_SECCOMP_FAILED: i32 = 72;
+
+    /// Installs the built filter in a forked child and probes `socket()`
+    /// through it, so each guard's errno is the one the kernel actually hands
+    /// to userspace.
+    #[test]
+    fn the_filter_refuses_mptcp_and_smc_sockets_in_a_child() {
+        let program = build_seccomp_filter(false).expect("the filter builds");
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            unsafe {
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                    libc::_exit(PROBE_PRCTL_FAILED);
+                }
+                let fprog = libc::sock_fprog {
+                    len: program.len() as u16,
+                    filter: program.as_ptr().cast::<libc::sock_filter>().cast_mut(),
+                };
+                if libc::syscall(libc::SYS_seccomp, libc::SECCOMP_SET_MODE_FILTER, 0, &fprog) != 0 {
+                    libc::_exit(PROBE_SECCOMP_FAILED);
+                }
+                let errno_of = |family: i32, kind: i32, protocol: i32| {
+                    let fd = libc::socket(family, kind, protocol);
+                    if fd >= 0 {
+                        libc::close(fd);
+                        0
+                    } else {
+                        *libc::__errno_location()
+                    }
+                };
+                if errno_of(43, libc::SOCK_STREAM, 0) != libc::EAFNOSUPPORT {
+                    libc::_exit(1);
+                }
+                if errno_of(libc::AF_INET, libc::SOCK_STREAM, 262) != libc::ENOPROTOOPT {
+                    libc::_exit(2);
+                }
+                if errno_of(libc::AF_INET, libc::SOCK_STREAM, 256) != libc::EPROTONOSUPPORT {
+                    libc::_exit(6);
+                }
+                if errno_of(libc::AF_INET, libc::SOCK_STREAM, 0) != 0 {
+                    libc::_exit(3);
+                }
+                if errno_of(libc::AF_INET, libc::SOCK_STREAM, libc::IPPROTO_TCP) != 0 {
+                    libc::_exit(4);
+                }
+                if errno_of(libc::AF_INET, libc::SOCK_DGRAM, 0) != 0 {
+                    libc::_exit(5);
+                }
+                libc::_exit(0);
+            }
+        }
+
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(
+            waited,
+            pid,
+            "waitpid failed: {}",
+            std::io::Error::last_os_error()
+        );
+        assert!(libc::WIFEXITED(status), "the probe child did not exit");
+        match libc::WEXITSTATUS(status) {
+            0 => {}
+            code if code == PROBE_SECCOMP_FAILED => {
+                eprintln!("skipping: this host will not install an unprivileged seccomp filter")
+            }
+            code if code == PROBE_PRCTL_FAILED => {
+                eprintln!("skipping: this host will not set no_new_privs")
+            }
+            1 => panic!("the AF_SMC refusal returned the wrong errno"),
+            2 => panic!("the MPTCP refusal returned the wrong errno"),
+            6 => panic!("the SMC protocol refusal returned the wrong errno"),
+            3 => panic!("socket(AF_INET, SOCK_STREAM, 0) was refused by the filter"),
+            4 => panic!("socket(AF_INET, SOCK_STREAM, IPPROTO_TCP) was refused by the filter"),
+            5 => panic!("socket(AF_INET, SOCK_DGRAM, 0) was refused by the filter"),
+            other => panic!("the probe child exited with unexpected code {other}"),
+        }
     }
 
     /// A forward is a dial the target means to make, on a loopback that has

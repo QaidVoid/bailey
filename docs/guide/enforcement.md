@@ -68,6 +68,20 @@ refused, since either would otherwise carry a denied syscall past the rules
 under a number they never named. A 32-bit program that relies on those entry
 points does not run here.
 
+Two socket kinds are refused in the same prologue, because Landlock's TCP port
+rules do not reach them. Landlock's network hooks act only on sockets the
+kernel classifies as TCP, and an `IPPROTO_MPTCP` socket is not one of those
+although it falls back to plain TCP on the wire, and an `AF_SMC` socket falls
+back through a socket the kernel opens without the caller's Landlock domain.
+Either one would connect or bind any port a TCP socket was refused for. The
+filter refuses them at `socket()`, on every address family, with the errno a
+kernel without the feature returns: `ENOPROTOOPT` for MPTCP, which is what
+`net.mptcp.enabled = 0` gives, and `EAFNOSUPPORT` for SMC. MPTCP-aware clients
+read that as a kernel without MPTCP and fall back to plain TCP, where the
+Landlock rules hold. The refusals apply in every network mode, including
+denied egress where the namespace already makes them moot, so the filter has
+one shape regardless of policy.
+
 ::: warning A denylist, not an allowlist
 This is a hardening layer. A complete allowlist would be stronger, and it is also
 the kind of thing that breaks a program six months later when a libc update starts

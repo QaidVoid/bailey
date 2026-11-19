@@ -184,8 +184,9 @@ BAILEY_BPF_HELPER=$PWD/target/release/bailey-bpf-helper bailey audit ./program
 
 ## A network rule seems to do nothing
 
-The traffic is probably not TCP. Only TCP connect and bind are restricted; UDP,
-QUIC, and DNS are not. See [known limitations](/security/limitations).
+The traffic is probably not TCP. Only TCP connect and bind are restricted; other
+protocols, UDP, QUIC, SCTP, and DNS among them, are not. See
+[known limitations](/security/limitations).
 
 A rule with no `port` no longer fails quietly: it is a resolution error naming
 the layer.
