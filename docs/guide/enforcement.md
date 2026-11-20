@@ -198,6 +198,30 @@ Where the search picks the wrong one, name it explicitly:
 export BAILEY_CGROUP_ROOT=/sys/fs/cgroup/bailey
 ```
 
+Where the search finds nothing at all, and no override names one, a run with
+limits asks the systemd user manager for a transient scope with `Delegate=yes`
+and moves bailey into a leaf of it, so the same walk then finds the scope. The
+request goes over the manager's private socket, and bailey is identified to the
+manager by the connection's peer credentials, never by a process id: a pid is
+only meaningful in a PID namespace, so nothing else can be moved in bailey's
+place.
+
+The request is only made where a scope can be had and trusted to last:
+
+- systemd must be init. Other inits, elogind included, are not asked, and
+  `BAILEY_CGROUP_ROOT` remains the way to name a cgroup on them.
+- Your user must linger (`loginctl enable-linger`). A manager that does not
+  linger stops at your last logout, and a scope it granted would take a
+  detached run (`tmux`, `nohup`) down with it that survives logout today.
+- The private socket must be owned by your uid and served by your uid, which
+  the kernel confirms before anything is sent.
+
+A run that gets a scope leaves the logind session: `loginctl` and polkit no
+longer see bailey or the target as part of it. Inside an outer bailey sandbox,
+or with `BAILEY_CGROUP_ROOT` set, no request is made at all. Anything that goes
+wrong leaves the run as it was before, with the manager's reason, if one was
+received, appended to the summary.
+
 This is best-effort throughout. Without such a cgroup, limits are skipped and the
 run's summary says so rather than failing the run. `bailey doctor` answers the
 same question before you start.

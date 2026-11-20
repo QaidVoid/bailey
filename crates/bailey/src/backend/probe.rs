@@ -134,7 +134,7 @@ pub fn runnable_as_caller(meta: &std::fs::Metadata) -> bool {
 /// override variable and the search alike, so the answer is the set a run
 /// asking for all three would actually get, join permission included: a root
 /// the target could not join must not read as delegated.
-fn cgroup_delegated() -> Vec<&'static str> {
+pub(crate) fn cgroup_delegated() -> Vec<&'static str> {
     CONTROLLERS
         .into_iter()
         .filter(|controller| cgroup::usable_root(&[*controller]).is_some())

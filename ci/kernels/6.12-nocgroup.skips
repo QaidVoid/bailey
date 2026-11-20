@@ -5,9 +5,12 @@ audit::execution_of_a_child_program_is_recorded # no audit helper configured
 audit::startup_access_is_recorded # no audit helper configured
 audit::the_target_is_confined_during_an_audit # no audit helper configured
 audit::unconfined_is_an_explicit_opt_in # no audit helper configured
+cgroup::a_cgroup_root_override_suppresses_the_scope_request # needs a systemd host
+cgroup::a_session_without_delegation_gets_a_user_scope # no systemd user manager to ask
 cgroup::cgroup_is_removed_after_the_run # no delegated cgroup to create runs in
 cgroup::forked_descendant_is_in_the_run_cgroup # no delegated cgroup to create runs in
 cgroup::limits_apply_under_isolation # no delegated cgroup to create runs in
+cgroup::the_scope_is_gone_after_the_run # no systemd user manager to ask
 enforce::the_address_space_fallback_stays_off_where_a_cgroup_carries_memory # no delegated cgroup carries memory here
 generate::a_recorded_run_produces_a_policy_that_run_accepts # no audit helper with capabilities on this host
 network::auto_mode_uses_the_private_namespace # the host's address is the sandbox's own (QEMU slirp)

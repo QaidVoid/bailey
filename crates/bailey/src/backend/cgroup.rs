@@ -16,8 +16,14 @@
 //! when bailey itself lives under it.
 
 use std::fs;
+use std::io;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use crate::backend::{dbus, random_suffix};
 use crate::policy::ResourceLimits;
 
 /// Where the unified hierarchy is mounted.
@@ -26,6 +32,24 @@ const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 /// Environment variable naming the cgroup to create runs in, for when the search
 /// below picks the wrong one.
 pub(crate) const ROOT_OVERRIDE: &str = "BAILEY_CGROUP_ROOT";
+
+/// How `sd_booted()` recognises a host systemd runs as init on: a directory
+/// systemd creates at boot and nothing else does.
+const SYSTEMD_RUN_DIR: &str = "/run/systemd/system";
+
+/// Where logind records users whose service manager runs without any session.
+const LINGER_DIR: &str = "/var/lib/systemd/linger";
+
+/// The user manager's bus-less endpoint, relative to `XDG_RUNTIME_DIR`; the
+/// socket `systemctl --user` itself speaks to.
+const MANAGER_SOCKET: &str = "systemd/private";
+
+/// How long the manager gets to answer, and to start the scope it accepted.
+const MANAGER_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How often the confirmation looks at `/proc/self/cgroup` within
+/// [`MANAGER_TIMEOUT`].
+const CONFIRM_INTERVAL: Duration = Duration::from_millis(5);
 
 /// The controllers a set of limits needs.
 pub fn needed_controllers(limits: &ResourceLimits) -> Vec<&'static str> {
@@ -212,9 +236,228 @@ pub(crate) fn control_file(controller: &str) -> &'static str {
     }
 }
 
+/// What asking the user manager for a delegated scope ended in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UserScope {
+    /// A gate stopped the request before anything was sent. The reason is
+    /// what `bailey doctor` reports; a run keeps its own reason unchanged.
+    Unavailable(String),
+    /// The request was sent and the manager refused it, or the scope it
+    /// accepted never appeared. The reason joins the run's skipped reason.
+    Refused(String),
+    /// The scope exists and bailey sits in a leaf of it.
+    Granted(String),
+}
+
+/// Ask the user manager for a delegated scope holding bailey, and move into a
+/// leaf of it so the ordinary search finds a delegated root.
+///
+/// Bailey is never named by a process id: the `PIDs` property holds a single
+/// zero, which the manager resolves through the connection's peer credentials.
+/// A pid is only meaningful in a PID namespace, and bailey cannot know which
+/// namespace the manager behind a socket lives in; the kernel's translation
+/// of its own credentials needs no such knowledge. The socket must belong to
+/// the caller and be served by the caller's uid, so the manager asked is the
+/// caller's own.
+pub(crate) fn request_user_scope() -> UserScope {
+    if let Some(reason) = scope_gate_stop() {
+        return UserScope::Unavailable(reason);
+    }
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").unwrap_or_default();
+    let path = Path::new(&runtime).join(MANAGER_SOCKET);
+    let Ok(mut stream) = UnixStream::connect(&path) else {
+        let reason = std::io::Error::last_os_error();
+        return UserScope::Refused(format!("cannot connect to {}: {reason}", path.display()));
+    };
+    let caller = caller_uid();
+    match peer_uid(&stream) {
+        Ok(uid) if uid == caller => {}
+        Ok(uid) => {
+            return UserScope::Refused(format!(
+                "{} is served by uid {uid}, not this user",
+                path.display()
+            ));
+        }
+        Err(error) => {
+            return UserScope::Refused(format!(
+                "the peer credentials of {} cannot be read: {error}",
+                path.display()
+            ));
+        }
+    }
+    let _ = stream.set_read_timeout(Some(MANAGER_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(MANAGER_TIMEOUT));
+    if let Err(reason) = dbus::authenticate(&mut stream, caller) {
+        return UserScope::Refused(format!("the user manager handshake failed: {reason}"));
+    }
+    let unit = format!("bailey-{}.{}.scope", std::process::id(), random_suffix());
+    if let Err(reason) = dbus::start_transient_unit(&mut stream, &unit) {
+        return UserScope::Refused(format!("the user manager refused the scope: {reason}"));
+    }
+    // StartTransientUnit returns once the job is queued, not when the scope
+    // has started, so the move is confirmed by reading it back.
+    if !confirm_scope(&unit) {
+        return UserScope::Refused(
+            "the user manager accepted the request, but the scope never appeared \
+             under /proc/self/cgroup"
+                .to_owned(),
+        );
+    }
+    if let Err(error) = enter_supervisor_leaf() {
+        return UserScope::Refused(format!(
+            "the scope exists but bailey could not move into a leaf of it: {error}"
+        ));
+    }
+    UserScope::Granted(unit)
+}
+
+/// The first gate that stops a scope request, cheapest first.
+///
+/// The order is the order of cost: two environment lookups, two stat calls,
+/// then the socket's metadata. Gates three and onward are also what keeps
+/// hosts without systemd paying nothing: the run stops there after one stat.
+fn scope_gate_stop() -> Option<String> {
+    if std::env::var_os(ROOT_OVERRIDE).is_some() {
+        return Some(
+            "BAILEY_CGROUP_ROOT is set, and the cgroup it names answers instead".to_owned(),
+        );
+    }
+    if crate::backend::world::inside_sandbox() {
+        return Some(
+            "this run is inside a bailey sandbox, and the manager outside it must \
+             not be asked to move anything"
+                .to_owned(),
+        );
+    }
+    systemd_init_reason()
+        .or_else(linger_reason)
+        .or_else(socket_reason)
+}
+
+fn systemd_init_reason() -> Option<String> {
+    (!Path::new(SYSTEMD_RUN_DIR).is_dir())
+        .then(|| "systemd is not init; there is no user manager to ask".to_owned())
+}
+
+fn linger_reason() -> Option<String> {
+    let user = login_name().unwrap_or_else(|| caller_uid().to_string());
+    (!Path::new(LINGER_DIR).join(&user).exists()).then(|| {
+        "the user manager does not linger, so a scope it serves would be torn down \
+         at the last logout, taking detached runs with it; opt in with: \
+         loginctl enable-linger"
+            .to_owned()
+    })
+}
+
+fn socket_reason() -> Option<String> {
+    let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") else {
+        return Some(
+            "XDG_RUNTIME_DIR is not set, so the user manager's socket is unknown".to_owned(),
+        );
+    };
+    let path = Path::new(&runtime).join(MANAGER_SOCKET);
+    let meta = match fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(_) => return Some(format!("no user manager socket at {}", path.display())),
+    };
+    socket_meta_reason(&meta.file_type(), meta.uid(), caller_uid())
+        .map(|reason| format!("{}: {}", path.display(), reason))
+}
+
+/// Whether a socket file with this type and owner is the caller's own
+/// manager's. Pure over the metadata so a socket owned by another uid is
+/// testable without privileges.
+fn socket_meta_reason(kind: &fs::FileType, uid: u32, caller: u32) -> Option<&'static str> {
+    if !kind.is_socket() {
+        return Some("is not a socket");
+    }
+    (uid != caller).then_some("is not owned by this user")
+}
+
+/// The login name the linger marker is filed under: `USER` when the caller's
+/// environment says so, else a scan of `/etc/passwd`. An unfindable name is
+/// read as the uid string, which misses the marker and leaves the feature
+/// off; a run is never weakened by a name this lookup fails on.
+fn login_name() -> Option<String> {
+    if let Some(user) = std::env::var_os("USER").filter(|user| !user.is_empty()) {
+        return Some(user.to_string_lossy().into_owned());
+    }
+    let passwd = fs::read_to_string("/etc/passwd").ok()?;
+    let uid = caller_uid();
+    passwd.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        let name = fields.next()?.to_owned();
+        let _group = fields.next()?;
+        let owner: u32 = fields.next()?.parse().ok()?;
+        (owner == uid).then_some(name)
+    })
+}
+
+/// The uid the kernel recorded for the socket's peer at `connect()`.
+fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
+    let mut creds = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut creds as *mut libc::ucred).cast(),
+            &mut len,
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(creds.uid)
+}
+
+fn caller_uid() -> u32 {
+    unsafe { libc::geteuid() }
+}
+
+/// Whether a line of `/proc/self/cgroup` names `unit`: the line's path must
+/// end in the unit's full name, so a path that merely begins with the same
+/// text reads as no match.
+fn cgroup_line_names(line: &str, unit: &str) -> bool {
+    line.trim().ends_with(unit)
+}
+
+/// Wait for the scope to appear as bailey's own cgroup.
+fn confirm_scope(unit: &str) -> bool {
+    for _ in 0..(MANAGER_TIMEOUT.as_millis() / CONFIRM_INTERVAL.as_millis()) {
+        if let Ok(content) = fs::read_to_string("/proc/self/cgroup")
+            && content.lines().any(|line| cgroup_line_names(line, unit))
+        {
+            return true;
+        }
+        std::thread::sleep(CONFIRM_INTERVAL);
+    }
+    false
+}
+
+/// Move bailey into a leaf of its new scope.
+///
+/// A delegated scope starts with bailey as its only process, and the kernel
+/// refuses to enable controllers for the children of a cgroup that holds
+/// processes. The leaf is what makes the scope usable: writing zero to the
+/// leaf's `cgroup.procs` moves the whole process, every thread included, and
+/// the ordinary walk up from the leaf then finds the scope.
+fn enter_supervisor_leaf() -> io::Result<()> {
+    let scope = own().ok_or_else(|| io::Error::other("no unified-hierarchy cgroup"))?;
+    let leaf = scope.join("supervisor");
+    fs::create_dir(&leaf)?;
+    fs::write(leaf.join("cgroup.procs"), "0")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::MetadataExt;
 
     #[test]
     fn controllers_follow_the_limits_that_are_set() {
@@ -267,5 +510,58 @@ mod tests {
             common_ancestor(own, own),
             PathBuf::from("/sys/fs/cgroup/ci/session")
         );
+    }
+
+    /// A real listener socket is accepted for its owner and refused for any
+    /// other uid.
+    #[test]
+    fn a_socket_for_another_uid_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(dir.path().join("s")).unwrap();
+        let meta = fs::symlink_metadata(dir.path().join("s")).unwrap();
+        let caller = meta.uid();
+        assert!(listener.local_addr().is_ok());
+        assert_eq!(socket_meta_reason(&meta.file_type(), caller, caller), None);
+        assert_eq!(
+            socket_meta_reason(&meta.file_type(), caller + 1, caller),
+            Some("is not owned by this user")
+        );
+    }
+
+    /// A regular file where the socket should be is refused whatever it is
+    /// owned by, which is what a stopped or masked manager leaves behind.
+    #[test]
+    fn a_regular_file_in_the_sockets_place_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not-a-socket");
+        fs::write(&file, "").unwrap();
+        let meta = fs::symlink_metadata(&file).unwrap();
+        let caller = meta.uid();
+        assert_eq!(
+            socket_meta_reason(&meta.file_type(), caller, caller),
+            Some("is not a socket")
+        );
+    }
+
+    /// The confirmation matches a cgroup path that ends in the unit's name
+    /// and nothing shorter: a prefix of the name, or the same text inside a
+    /// longer component, is a different cgroup.
+    #[test]
+    fn the_confirmation_matches_the_whole_unit_name() {
+        let unit = "bailey-42-abcdef0123456789.scope";
+        assert!(cgroup_line_names(
+            "0::/user.slice/user-1000.slice/user@1000.service/bailey-42-abcdef0123456789.scope",
+            unit
+        ));
+        assert!(!cgroup_line_names("0::/user.slice/user-1000/bailey", unit));
+        assert!(!cgroup_line_names(
+            "0::/user.slice/user-1000.slice/user@1000.service/bailey-42-abcdef0123456789.scope2",
+            unit
+        ));
+        // The leaf entered after the match does not read as the scope again.
+        assert!(!cgroup_line_names(
+            "0::/user.slice/user-1000.slice/user@1000.service/bailey-42-abcdef0123456789.scope/supervisor",
+            unit
+        ));
     }
 }

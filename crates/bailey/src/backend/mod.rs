@@ -8,6 +8,7 @@
 pub mod audit;
 pub mod audit_helper;
 pub mod cgroup;
+pub(crate) mod dbus;
 pub mod enforce;
 pub mod forward;
 pub mod fuse;
@@ -30,6 +31,19 @@ pub struct Target {
     pub args: Vec<String>,
     /// Working directory, or `None` to inherit the current one.
     pub cwd: Option<PathBuf>,
+}
+
+/// A suffix another process cannot predict.
+///
+/// Drawn from the hasher seeds the standard library takes from the operating
+/// system, so a name built from it cannot be pre-created by a process that
+/// only knows the pid.
+pub(crate) fn random_suffix() -> String {
+    use std::hash::{BuildHasher, Hasher};
+
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u32(std::process::id());
+    format!("{:016x}", hasher.finish())
 }
 
 /// An error produced while establishing a sandbox or running a target.

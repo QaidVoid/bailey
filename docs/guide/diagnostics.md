@@ -17,6 +17,7 @@ kernel:
   user namespaces: yes
   cgroup delegation: no
     resource limits will be skipped
+    systemd is not init; there is no user manager to ask
 audit:
   kernel BTF: yes
   helper: ready (/usr/local/bin/bailey-bpf-helper)
@@ -25,6 +26,18 @@ audit:
 Each answer is followed by what it costs. "Landlock: yes" would not tell you
 whether network policy is enforced, which needs ABI 4; the indented lines are the
 part you can act on.
+
+Where limits would otherwise be skipped, `doctor` asks the systemd user manager
+for a delegated scope the same way a run would, and says where the delegation
+came from:
+
+```
+  cgroup delegation: memory, pids, cpu (systemd user scope)
+```
+
+or the one reason a scope could not be had: no systemd, a user manager that does
+not linger (`loginctl enable-linger` to opt in), a private socket that is
+missing or not served by your uid, or the manager's own refusal.
 
 `doctor` starts the audit helper to find out whether it can really load its
 programs, rather than guessing from the file being present.
@@ -47,6 +60,19 @@ bailey: not enforced, resource limits: Permission denied (os error 13)
 
 A layer you turned off is not listed. `--no-isolate` is a choice, not a gap, and
 restating your command line would bury the things that are.
+
+A run whose cgroup came from the systemd user manager names it in the same list:
+
+```
+bailey: enforced: landlock, resource limits, systemd user scope
+```
+
+and a scope request that reached the manager and was refused adds the refusal to
+the limits' reason, so a run is never quieter about why it degraded than before:
+
+```
+bailey: not enforced, resource limits: no cgroup this user may create runs in; ...; systemd user scope: the manager's answer
+```
 
 For scripts:
 

@@ -47,6 +47,22 @@ jobs:
       - name: Test
         run: cargo test
 
+  # Delegation through the systemd user manager is tested only by
+  # hand, because whether a runner has a user manager it may hand over a
+  # delegated cgroup is an image property that can change under us, and a
+  # red job for that would be noise rather than signal. To exercise it by
+  # hand, on a host with systemd as init and a user that lingers:
+  #
+  #   sudo loginctl enable-linger "$USER"
+  #   export XDG_RUNTIME_DIR=/run/user/$(id -u)
+  #   cargo test -p bailey --test cgroup
+  #
+  # a_session_without_delegation_gets_a_user_scope must run rather than
+  # skip, and `bailey doctor` must report `cgroup delegation: ... (systemd
+  # user scope)`. The kernel matrix's guests boot without systemd, so the
+  # new cgroup tests are expected to skip there, which ci/kernels/<id>.skips
+  # records.
+
   # ci/kernels.json is also read by guest.sh inside each guest, and the
   # matrix cannot read files at parse time, so one tiny job hands it over.
   read-matrix:

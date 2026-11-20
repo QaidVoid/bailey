@@ -5,6 +5,9 @@ audit::execution_of_a_child_program_is_recorded # no audit helper configured
 audit::startup_access_is_recorded # no audit helper configured
 audit::the_target_is_confined_during_an_audit # no audit helper configured
 audit::unconfined_is_an_explicit_opt_in # no audit helper configured
+cgroup::a_cgroup_root_override_suppresses_the_scope_request # needs a systemd host
+cgroup::a_session_without_delegation_gets_a_user_scope # the session already has a delegated cgroup
+cgroup::the_scope_is_gone_after_the_run # the session already has a delegated cgroup
 enforce::a_file_cannot_grow_past_the_limit # Landlock unavailable
 enforce::a_fuse_mount_is_performed_and_placed # Landlock unavailable
 enforce::a_process_limit_holds_without_a_cgroup # Landlock unavailable

@@ -11,12 +11,12 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
-use crate::backend::probe;
 use crate::backend::world::{self, World};
 use crate::backend::{
     Backend, Target, audit::AuditBackend, enforce::EnforceBackend, enforce::Summary, forward,
     isolation, network,
 };
+use crate::backend::{cgroup, probe};
 use crate::config::{self, Resolved};
 use crate::event::Trace;
 use crate::hook::{self, Shell};
@@ -585,12 +585,48 @@ fn cmd_doctor() -> anyhow::Result<i32> {
         .into_iter()
         .filter(|controller| !delegated.contains(controller))
         .collect();
-    if delegated.is_empty() {
+    let no_delegation = |degraded: &mut bool| {
         println!("  cgroup delegation: no");
-        degraded = true;
+        *degraded = true;
         println!("    resource limits will be skipped");
         println!("    a run needs a cgroup it may create children in, with the memory, pids");
         println!("    and cpu controllers delegated; set BAILEY_CGROUP_ROOT to name one");
+    };
+    if delegated.is_empty() && std::env::var_os(cgroup::ROOT_OVERRIDE).is_none() {
+        // Where nothing is delegated and no override names a root, a run
+        // would ask the user manager for a scope. Doctor asks the same way,
+        // so its answer is the answer a run would get.
+        match cgroup::request_user_scope() {
+            cgroup::UserScope::Granted(_) => {
+                let now = probe::cgroup_delegated();
+                if now.is_empty() {
+                    no_delegation(&mut degraded);
+                    println!("    the scope was granted, but no controller reached a child of it");
+                } else {
+                    let missing_now: Vec<&str> = ["memory", "pids", "cpu"]
+                        .into_iter()
+                        .filter(|controller| !now.contains(controller))
+                        .collect();
+                    println!(
+                        "  cgroup delegation: {} (systemd user scope)",
+                        now.join(", ")
+                    );
+                    if !missing_now.is_empty() {
+                        degraded = true;
+                        println!(
+                            "    limits using {} will be skipped",
+                            missing_now.join(", ")
+                        );
+                    }
+                }
+            }
+            cgroup::UserScope::Refused(reason) | cgroup::UserScope::Unavailable(reason) => {
+                no_delegation(&mut degraded);
+                println!("    {reason}");
+            }
+        }
+    } else if delegated.is_empty() {
+        no_delegation(&mut degraded);
     } else if missing.is_empty() {
         println!("  cgroup delegation: {}", delegated.join(", "));
     } else {

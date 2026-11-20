@@ -290,6 +290,18 @@ explicitly. See [enforcement layers](/guide/enforcement).
 `RLIMIT_NPROC` stand-in for `pids_max` on the runs that make a user namespace of
 their own.
 
+### The user-manager scope reaches further, on stricter terms
+
+On a systemd host where the search finds no delegated subtree, bailey asks the
+user manager for a delegated scope instead. The manager identifies bailey by
+the connection's peer credentials, so no other process can be moved in bailey's
+place, but the terms are the manager's: it must linger, or a detached run
+would be killed at the last logout, and its private socket must be owned and
+served by the calling uid. A process the target leaves behind keeps the scope
+alive after bailey exits, where it is visible under `systemctl --user`; the
+run's own cgroup is still removed. Hosts without systemd are unchanged and
+keep needing `BAILEY_CGROUP_ROOT`.
+
 ### The address-space fallback bounds each process, not the run
 
 Where `memory` is set and no cgroup could carry it, an explicit `address_space`

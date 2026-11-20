@@ -41,7 +41,7 @@ use crate::backend::isolation::{self, BindMount, Conceal, IsolationPlan, ReadOnl
 use crate::backend::network::{self, NetworkMode};
 use crate::backend::relay;
 use crate::backend::world::{self, World};
-use crate::backend::{Backend, BackendError, Target};
+use crate::backend::{Backend, BackendError, Target, random_suffix};
 use crate::policy::{self, Egress, FsRule, Policy, PortForward, ResourceLimits};
 use crate::strings::quoted as json_string;
 
@@ -646,13 +646,13 @@ impl EnforceBackend {
             // The policy asked for none, so there is nothing to report.
         } else if procs.is_some() {
             report.applied("resource limits");
+            if cgroup.scope.is_some() {
+                report.applied("systemd user scope");
+            }
         } else {
             report.skipped(
                 "resource limits",
-                cgroup
-                    .failure
-                    .as_deref()
-                    .unwrap_or("no writable delegated cgroup"),
+                &limits_skip_reason(cgroup.failure.as_deref(), cgroup.scope_failure.as_deref()),
             );
         }
         if policy.resources.file_bytes.is_some() {
@@ -1280,19 +1280,6 @@ fn runtime_dir_host() -> Option<PathBuf> {
         return None;
     }
     (meta.permissions().mode() & 0o777 == 0o700).then_some(dir)
-}
-
-/// A suffix another process cannot predict.
-///
-/// Drawn from the hasher seeds the standard library takes from the operating
-/// system, so a name built from it cannot be pre-created by a process that
-/// only knows the pid.
-fn random_suffix() -> String {
-    use std::hash::{BuildHasher, Hasher};
-
-    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
-    hasher.write_u32(std::process::id());
-    format!("{:016x}", hasher.finish())
 }
 
 /// Remove the staging leftovers of runs that are no longer alive.
@@ -2450,6 +2437,13 @@ fn target_arch() -> anyhow::Result<seccompiler::TargetArch> {
 struct CgroupGuard {
     dir: Option<PathBuf>,
     failure: Option<String>,
+    /// The user-manager scope the run's cgroup came from, when one was asked
+    /// for and granted.
+    scope: Option<String>,
+    /// Why the scope request failed after it was sent, when it was. A gate
+    /// that stopped the request leaves this unset: the run's reason stays
+    /// what it was before scope requests existed.
+    scope_failure: Option<String>,
 }
 
 impl CgroupGuard {
@@ -2462,18 +2456,48 @@ impl CgroupGuard {
             return Self {
                 dir: None,
                 failure: None,
+                scope: None,
+                scope_failure: None,
             };
         }
-        match try_create_cgroup(limits) {
+        let needed = cgroup::needed_controllers(limits);
+        let mut base = cgroup::usable_root(&needed);
+        let mut scope = None;
+        let mut scope_failure = None;
+        if base.is_none() {
+            match cgroup::request_user_scope() {
+                cgroup::UserScope::Granted(unit) => {
+                    // The scope holds bailey now, so the same walk as before
+                    // finds it as the nearest usable ancestor.
+                    base = cgroup::usable_root(&needed);
+                    scope = Some(unit);
+                }
+                cgroup::UserScope::Refused(reason) => scope_failure = Some(reason),
+                cgroup::UserScope::Unavailable(_) => {}
+            }
+        }
+        // Not reported here: the run summary carries it, so a single fact
+        // does not appear twice.
+        match base
+            .ok_or_else(|| {
+                io::Error::other(
+                    "no cgroup this user may create runs in; a delegated subtree is \
+                     needed, or name one with BAILEY_CGROUP_ROOT",
+                )
+            })
+            .and_then(|base| create_run_cgroup(base, limits))
+        {
             Ok(dir) => Self {
                 dir: Some(dir),
                 failure: None,
+                scope,
+                scope_failure: None,
             },
-            // Not reported here: the run summary carries it, so a single fact
-            // does not appear twice.
             Err(err) => Self {
                 dir: None,
                 failure: Some(err.to_string()),
+                scope: None,
+                scope_failure,
             },
         }
     }
@@ -2501,14 +2525,9 @@ impl Drop for CgroupGuard {
     }
 }
 
-fn try_create_cgroup(limits: &ResourceLimits) -> io::Result<PathBuf> {
-    let needed = cgroup::needed_controllers(limits);
-    let base = cgroup::usable_root(&needed).ok_or_else(|| {
-        io::Error::other(
-            "no cgroup this user may create runs in; a delegated subtree is \
-             needed, or name one with BAILEY_CGROUP_ROOT",
-        )
-    })?;
+/// Create the run's own cgroup under an already-found `base`, with the
+/// policy's limits written into it.
+fn create_run_cgroup(base: PathBuf, limits: &ResourceLimits) -> io::Result<PathBuf> {
     // A pid is reused, so a leftover directory from an earlier run with the
     // same number would be joined and written to rather than replaced. Created
     // outright, so an existing one is an error rather than a surprise.
@@ -2537,6 +2556,17 @@ fn try_create_cgroup(limits: &ResourceLimits) -> io::Result<PathBuf> {
     Ok(dir)
 }
 
+/// The skipped reason for resource limits: the failure that stopped the
+/// cgroup, with the user manager's refusal appended when one was received. A
+/// request that no gate let through leaves the reason unchanged.
+fn limits_skip_reason(failure: Option<&str>, scope_failure: Option<&str>) -> String {
+    let reason = failure.unwrap_or("no writable delegated cgroup");
+    match scope_failure {
+        Some(refusal) => format!("{reason}; systemd user scope: {refusal}"),
+        None => reason.to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2556,6 +2586,31 @@ mod tests {
         assert!(
             CONNECT_SKIP_REASON.contains("can be connected to"),
             "the reason must say what the policy loses: {CONNECT_SKIP_REASON}"
+        );
+    }
+
+    /// The skipped reason for limits must stay byte-identical on a host where
+    /// no request was ever sent, and name the manager's refusal when one was.
+    #[test]
+    fn the_limits_skip_reason_carries_the_scope_refusal() {
+        assert_eq!(
+            limits_skip_reason(
+                Some(
+                    "no cgroup this user may create runs in; a delegated subtree is \
+                      needed, or name one with BAILEY_CGROUP_ROOT"
+                ),
+                None,
+            ),
+            "no cgroup this user may create runs in; a delegated subtree is \
+             needed, or name one with BAILEY_CGROUP_ROOT"
+        );
+        assert_eq!(
+            limits_skip_reason(
+                None,
+                Some("org.freedesktop.systemd1.ScopeNotRunning: refused")
+            ),
+            "no writable delegated cgroup; systemd user scope: \
+             org.freedesktop.systemd1.ScopeNotRunning: refused"
         );
     }
 

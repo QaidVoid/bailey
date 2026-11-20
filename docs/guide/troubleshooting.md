@@ -150,6 +150,20 @@ There is no writable delegated cgroup v2 for your session. On a systemd system,
 running inside a user session usually provides one; running from a bare TTY or an
 unusual init may not.
 
+Over SSH on a systemd host, bailey asks the user manager for a delegated scope
+instead. `bailey doctor` names whatever stopped that, and each reason has its
+own remedy:
+
+- systemd is not init, or there is no user manager: there is nothing to ask.
+  `BAILEY_CGROUP_ROOT` pointing at a delegated directory is the way out.
+- The user manager does not linger: `loginctl enable-linger` starts a manager
+  that runs without a session, which is what lets bailey hand the scope back
+  after the run instead of taking detached jobs (`tmux`, `nohup`) down at the
+  last logout with it.
+- No private socket at `$XDG_RUNTIME_DIR/systemd/private`, or one not owned and
+  served by your uid: the manager bailey would ask is not the caller's own, and
+  nothing is sent to one it cannot prove is.
+
 ## Relative paths fail under `--isolate`
 
 ```
