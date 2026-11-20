@@ -2088,7 +2088,28 @@ fn cmd_profile_generate(args: GenerateArgs) -> anyhow::Result<i32> {
              accesses, so nothing in a trace can imply them. Carry them over yourself."
         );
     }
-    print!("{}", reconcile::generate_profile(&selected));
+    let (profile, withheld) = reconcile::generate_profile(&selected);
+    if !withheld.is_empty() {
+        eprintln!(
+            "bailey: never generated {} access(es): {}. Write any grant you still \
+             want by hand; no flag changes this.",
+            withheld.len(),
+            withheld.join(", ")
+        );
+    }
+    print!("{profile}");
+    match trace.usage.as_ref() {
+        None => println!("# Resource peaks: recorded before peaks were measured."),
+        Some(usage) => match reconcile::suggest_resources(usage, &resolved.policy.resources) {
+            Some(block) => print!("{block}"),
+            // Nothing to suggest: the recorded reasons say what was lost.
+            None => {
+                for reason in &usage.unmeasured {
+                    println!("# {reason}");
+                }
+            }
+        },
+    }
     Ok(0)
 }
 

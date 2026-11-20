@@ -42,6 +42,7 @@ use crate::backend::network::{self, NetworkMode};
 use crate::backend::relay;
 use crate::backend::world::{self, World};
 use crate::backend::{Backend, BackendError, Target, random_suffix};
+use crate::event::Usage;
 use crate::policy::{self, Egress, FsRule, Policy, PortForward, ResourceLimits};
 use crate::strings::quoted as json_string;
 
@@ -221,7 +222,10 @@ pub struct EnforceBackend {
     /// How to report what the run enforced.
     pub summary: Summary,
     /// Put the target in a cgroup of its own even when the policy sets no
-    /// limits, so something else can scope to it.
+    /// limits, so something else can scope to it. The cgroup is then asked to
+    /// carry the measuring controllers too, so the run's `memory.peak` and
+    /// `pids.peak` can be read from it; a host that delegates only what the
+    /// limits need still gets the cgroup, without the peaks.
     pub always_cgroup: bool,
     /// Writable paths granted on the user's behalf rather than by their config.
     ///
@@ -952,8 +956,19 @@ impl Confined {
     }
 
     /// Wait for the target to exit and tear the run's world down.
-    pub fn wait(mut self) -> Result<i32, BackendError> {
+    pub fn wait(self) -> Result<i32, BackendError> {
+        self.wait_measured().map(|(code, _)| code)
+    }
+
+    /// Wait for the target, read the run's resource peaks from its cgroup, and
+    /// tear the run's world down.
+    ///
+    /// The peaks only exist while the cgroup does, so they are read after the
+    /// target exits and before the guard removes the directory. A caller that
+    /// wants them must come here rather than to [`Self::wait`].
+    pub fn wait_measured(mut self) -> Result<(i32, Usage), BackendError> {
         let status = self.child.wait().map_err(BackendError::Io)?;
+        let usage = self.cgroup.peaks();
         drop(self.cgroup);
         // The staging directory was only ever a mountpoint in the target's own
         // namespace; on the host it is an empty directory, removed when the
@@ -975,7 +990,7 @@ impl Confined {
             // Already printed, before the target ever ran.
             Summary::Established | Summary::Quiet => {}
         }
-        Ok(exit.code)
+        Ok((exit.code, usage))
     }
 }
 
@@ -2461,7 +2476,22 @@ impl CgroupGuard {
             };
         }
         let needed = cgroup::needed_controllers(limits);
-        let mut base = cgroup::usable_root(&needed);
+        // A run asked for a cgroup without limits is also asked for the
+        // measuring controllers, so the peaks can be read from it. Falling
+        // back to the limits' controllers alone is today's request: a host
+        // that delegates only those keeps the scoping and loses the peaks.
+        let wanted = if even_without_limits {
+            cgroup::measuring_controllers(&needed)
+        } else {
+            needed.clone()
+        };
+        let mut base = None;
+        for controllers in cgroup::controller_searches(even_without_limits, &wanted, &needed) {
+            if let Some(root) = cgroup::usable_root(&controllers) {
+                base = Some(root);
+                break;
+            }
+        }
         let mut scope = None;
         let mut scope_failure = None;
         if base.is_none() {
@@ -2469,7 +2499,7 @@ impl CgroupGuard {
                 cgroup::UserScope::Granted(unit) => {
                     // The scope holds bailey now, so the same walk as before
                     // finds it as the nearest usable ancestor.
-                    base = cgroup::usable_root(&needed);
+                    base = cgroup::usable_root(&wanted);
                     scope = Some(unit);
                 }
                 cgroup::UserScope::Refused(reason) => scope_failure = Some(reason),
@@ -2505,6 +2535,22 @@ impl CgroupGuard {
     /// The `cgroup.procs` path the target writes itself into before exec.
     fn procs_path(&self) -> Option<PathBuf> {
         self.dir.as_ref().map(|dir| dir.join("cgroup.procs"))
+    }
+
+    /// The run's resource peaks, read from the cgroup before it is removed.
+    /// A run with no cgroup reports both peaks as unmeasured, with the reason.
+    fn peaks(&self) -> Usage {
+        match &self.dir {
+            Some(dir) => cgroup::read_peaks(dir),
+            None => Usage {
+                memory_peak_bytes: None,
+                tasks_peak: None,
+                unmeasured: vec![
+                    "memory: no cgroup for this run".to_owned(),
+                    "tasks: no cgroup for this run".to_owned(),
+                ],
+            },
+        }
     }
 
     /// The kernel's id for this cgroup, which is what a BPF program comparing
@@ -2586,6 +2632,24 @@ mod tests {
         assert!(
             CONNECT_SKIP_REASON.contains("can be connected to"),
             "the reason must say what the policy loses: {CONNECT_SKIP_REASON}"
+        );
+    }
+
+    /// A run that never got a cgroup reports both peaks as unmeasured with
+    /// the reason, which is what an audit on such a host writes to its trace.
+    #[test]
+    fn a_run_without_a_cgroup_reports_its_peaks_unmeasured() {
+        let guard = CgroupGuard::create(&ResourceLimits::default(), false);
+        assert!(guard.dir.is_none());
+        let usage = guard.peaks();
+        assert_eq!(usage.memory_peak_bytes, None);
+        assert_eq!(usage.tasks_peak, None);
+        assert_eq!(
+            usage.unmeasured,
+            vec![
+                "memory: no cgroup for this run",
+                "tasks: no cgroup for this run",
+            ]
         );
     }
 

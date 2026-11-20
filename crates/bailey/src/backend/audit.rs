@@ -50,7 +50,7 @@ impl AuditBackend {
         let envelope = envelope(policy, target);
         report_envelope(&envelope, policy);
 
-        let mut recorder = audit_helper::Recorder::start()?;
+        let recorder = audit_helper::Recorder::start()?;
         let backend = EnforceBackend {
             isolate: self.isolate,
             stop_before_exec: true,
@@ -65,8 +65,10 @@ impl AuditBackend {
             guard_in_place: false,
         };
         let confined = backend.spawn(&envelope, target)?;
-        let code = audit_helper::record(&mut recorder, confined)?;
-        Ok((code, recorder.finish()))
+        // `record` is the only funnel for a confined audit: it waits through
+        // `wait_measured`, so its trace always carries the run's peaks,
+        // measured or explained.
+        audit_helper::record(recorder, confined)
     }
 }
 
@@ -101,5 +103,86 @@ fn report_envelope(envelope: &Policy, policy: &Policy) {
         eprintln!("bailey: audit envelope: policy plus read on the target's own directory");
     } else {
         eprintln!("bailey: audit envelope: the resolved policy, unchanged");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Report a unit test as skipped and record the skip where CI asks for
+    /// it, mirroring `tests/common/mod.rs` and the other lib-side helpers:
+    /// the same printed line, the same log shape, keyed by crate and module
+    /// path.
+    fn skip(reason: &str) {
+        eprintln!("skipping: {reason}");
+        let Some(path) = std::env::var_os("BAILEY_TEST_SKIP_LOG") else {
+            return;
+        };
+        let Ok(mut log) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        else {
+            return;
+        };
+        use std::io::Write as _;
+        let name = std::thread::current();
+        let test = name.name().unwrap_or("unknown");
+        let _ = writeln!(log, "{}::{}\t{}", env!("CARGO_CRATE_NAME"), test, reason);
+    }
+
+    /// A trivial target that exits at once.
+    fn target() -> Target {
+        Target {
+            program: PathBuf::from("/bin/true"),
+            args: Vec::new(),
+            cwd: None,
+        }
+    }
+
+    /// Every observer path through `run_and_record` returns a trace whose
+    /// usage is `Some`, measured or explained. A second observer added later
+    /// (the unprivileged fallback's seccomp notification) must go through the
+    /// same funnel, or this fails.
+    #[test]
+    fn every_observer_path_records_a_usage() {
+        if !matches!(
+            crate::backend::probe::probe(true).helper,
+            crate::backend::probe::HelperStatus::Ready(_)
+        ) {
+            skip("no audit helper configured");
+            return;
+        }
+
+        let policy = Policy::default();
+        let (unconfined, trace) = AuditBackend {
+            unconfined: true,
+            isolate: false,
+        }
+        .run_and_record(&policy, &target())
+        .expect("an unconfined run of /bin/true");
+        assert_eq!(unconfined, 0);
+        let usage = trace.usage.expect("the unconfined path records a usage");
+        assert_eq!(usage.memory_peak_bytes, None);
+        assert!(
+            usage
+                .unmeasured
+                .iter()
+                .all(|reason| reason.contains("unconfined run, no cgroup"))
+        );
+
+        let (_, trace) = AuditBackend::default()
+            .run_and_record(&policy, &target())
+            .expect("a confined run of /bin/true");
+        let usage = trace
+            .usage
+            .expect("the confined observer path records a usage");
+        // Measured where the cgroup carried the peaks, explained where it did
+        // not; never absent.
+        assert!(
+            usage.memory_peak_bytes.is_some() || !usage.unmeasured.is_empty(),
+            "each peak is either measured or explained: {usage:?}"
+        );
     }
 }

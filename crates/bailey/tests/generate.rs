@@ -301,3 +301,266 @@ fn many_files_in_one_directory_become_the_directory() {
         "a lone file stays a file: {profile}"
     );
 }
+
+/// A trace with reads of `/`, the home, and a credential, generated with
+/// `--include-high-risk`: the flag can include high-risk findings, but the
+/// never tier sits above it. The connect is still granted, and stderr names
+/// everything that was left out.
+#[test]
+fn credentials_and_home_are_never_generated() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let trace = dir.path().join("trace.json");
+    let home_dir = home.path().display();
+    fs::write(
+        &trace,
+        format!(
+            r#"{{"version":1,"dropped":0,"events":[
+              {{"kind":"read","resource":{{"path":"/"}},"pid":10,"timestamp_ns":0,"resolution":"absolute"}},
+              {{"kind":"read","resource":{{"path":"{home_dir}"}},"pid":10,"timestamp_ns":0,"resolution":"absolute"}},
+              {{"kind":"read","resource":{{"path":"{home_dir}/.ssh/id_ed25519"}},"pid":10,"timestamp_ns":0,"resolution":"absolute"}},
+              {{"kind":"connect","resource":{{"net":{{"host":"1.2.3.4","port":443}}}},"pid":10,"timestamp_ns":0,"resolution":"not_applicable"}}
+            ]}}"#
+        ),
+    )
+    .unwrap();
+
+    let target = dir.path().join("game");
+    fs::write(&target, "").unwrap();
+
+    let output = Command::new(bailey())
+        .args(["profile", "generate", "--include-high-risk", "--trace"])
+        .arg(&trace)
+        .arg("--target")
+        .arg(&target)
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let profile = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        profile.contains("443"),
+        "the connect is a flag-included high-risk access and is granted: {profile}"
+    );
+    let granted = read_paths(&profile, "read");
+    assert!(
+        granted.is_empty(),
+        "no read grant may survive this trace: {granted:?}"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("never generated 3 access(es)"),
+        "the count is on stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains(&home_dir.to_string()),
+        "the home is named: {stderr}"
+    );
+    assert!(
+        stderr.contains("id_ed25519"),
+        "the credential is named: {stderr}"
+    );
+}
+
+/// A direct read of a credential directory, not a file beneath it, is also
+/// never generated: `is_credential_path` matches the contents, and the
+/// ancestor rule covers the directory itself.
+#[test]
+fn direct_directory_findings_are_never_generated() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let trace = dir.path().join("trace.json");
+    let target_dir = dir.path().display();
+    let home_dir = home.path().display();
+    fs::write(
+        &trace,
+        format!(
+            r#"{{"version":1,"dropped":0,"events":[
+              {{"kind":"read","resource":{{"path":"{home_dir}/.config"}},"pid":10,"timestamp_ns":0,"resolution":"absolute"}},
+              {{"kind":"read","resource":{{"path":"{home_dir}/.ssh"}},"pid":10,"timestamp_ns":0,"resolution":"absolute"}},
+              {{"kind":"read","resource":{{"path":"{target_dir}/data.pak"}},"pid":10,"timestamp_ns":0,"resolution":"absolute"}}
+            ]}}"#
+        ),
+    )
+    .unwrap();
+
+    let target = dir.path().join("game");
+    fs::write(&target, "").unwrap();
+
+    let output = Command::new(bailey())
+        .args(["profile", "generate", "--include-high-risk", "--trace"])
+        .arg(&trace)
+        .arg("--target")
+        .arg(&target)
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let profile = String::from_utf8_lossy(&output.stdout);
+    let granted = read_paths(&profile, "read");
+    assert_eq!(
+        granted,
+        vec![format!("{target_dir}/data.pak")],
+        "only the ordinary file is granted: {profile}"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("never generated 2 access(es)"),
+        "both directories are named on stderr: {stderr}"
+    );
+}
+
+/// A target that lives directly in the home and reads it: without the never
+/// tier this produced `read = ["<home>"]` with no flags at all, because a
+/// read under the target directory is routine. The home is still the home.
+#[test]
+fn a_home_directory_target_does_not_grant_home() {
+    let home = tempfile::tempdir().unwrap();
+    let trace = home.path().join("trace.json");
+    let home_dir = home.path().display();
+    fs::write(
+        &trace,
+        format!(
+            r#"{{"version":1,"dropped":0,"events":[
+              {{"kind":"read","resource":{{"path":"{home_dir}"}},"pid":10,"timestamp_ns":0,"resolution":"absolute"}},
+              {{"kind":"read","resource":{{"path":"{home_dir}/data.pak"}},"pid":10,"timestamp_ns":0,"resolution":"absolute"}}
+            ]}}"#,
+        ),
+    )
+    .unwrap();
+
+    let target = home.path().join("game");
+    fs::write(&target, "").unwrap();
+
+    let output = Command::new(bailey())
+        .args(["profile", "generate", "--trace"])
+        .arg(&trace)
+        .arg("--target")
+        .arg(&target)
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let profile = String::from_utf8_lossy(&output.stdout);
+    let granted = read_paths(&profile, "read");
+    assert_eq!(
+        granted,
+        vec![format!("{home_dir}/data.pak")],
+        "the file under the target is routine, the home itself is not: {profile}"
+    );
+}
+
+/// The read paths of a generated profile, parsed from its TOML.
+fn read_paths(profile: &str, key: &str) -> Vec<String> {
+    let parsed: toml::Table =
+        toml::from_str(profile).expect("a generated profile always parses as TOML");
+    parsed
+        .get("filesystem")
+        .and_then(|filesystem| filesystem.get(key))
+        .and_then(toml::Value::as_array)
+        .map(|paths| {
+            paths
+                .iter()
+                .map(|path| path.as_str().expect("a path string").to_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A trace with measured peaks gets a suggestion that parses and applies
+/// nothing: saving the output shows no limits, and uncommenting the block is
+/// what applies the suggested numbers.
+#[test]
+fn a_suggestion_parses_and_applies_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let trace = dir.path().join("trace.json");
+    let target_dir = dir.path().display();
+    let mib: u64 = 1_048_576;
+    fs::write(
+        &trace,
+        format!(
+            r#"{{"version":1,"dropped":0,"events":[
+              {{"kind":"read","resource":{{"path":"{target_dir}/data.pak"}},"pid":10,"timestamp_ns":0,"resolution":"absolute"}}
+            ],"usage":{{"memory_peak_bytes":{},"tasks_peak":40,"unmeasured":[]}}}}"#,
+            300 * mib
+        ),
+    )
+    .unwrap();
+
+    let target = dir.path().join("game");
+    fs::write(&target, "").unwrap();
+
+    let output = Command::new(bailey())
+        .args(["profile", "generate", "--trace"])
+        .arg(&trace)
+        .arg("--target")
+        .arg(&target)
+        .env("XDG_CONFIG_HOME", dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let profile = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        profile.contains("Uncomment to apply"),
+        "the suggestion labels itself: {profile}"
+    );
+
+    let saved = dir.path().join("bailey.toml");
+    fs::write(&saved, profile.as_bytes()).unwrap();
+    let shown = Command::new(bailey())
+        .args(["show", "-c"])
+        .arg(&saved)
+        .arg(&target)
+        .env("XDG_CONFIG_HOME", dir.path())
+        .output()
+        .unwrap();
+    let report = String::from_utf8_lossy(&shown.stdout);
+    assert!(
+        report.contains("memory_bytes: None"),
+        "saving the output applies no memory limit: {report}"
+    );
+    assert!(
+        report.contains("pids_max: None"),
+        "saving the output applies no process limit: {report}"
+    );
+
+    // A person who read the block uncomments it deliberately.
+    let applied: String = profile
+        .lines()
+        .map(|line| {
+            if line.starts_with("#[resources]")
+                || line.starts_with("#memory")
+                || line.starts_with("#pids_max")
+            {
+                line.strip_prefix('#').unwrap_or(line).to_owned()
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let uncommented = dir.path().join("applied.toml");
+    fs::write(&uncommented, applied).unwrap();
+    let shown = Command::new(bailey())
+        .args(["show", "-c"])
+        .arg(&uncommented)
+        .arg(&target)
+        .env("XDG_CONFIG_HOME", dir.path())
+        .output()
+        .unwrap();
+    let report = String::from_utf8_lossy(&shown.stdout);
+    let expected = 600 * mib;
+    assert!(
+        report.contains(&format!("memory_bytes: Some({expected})")),
+        "uncommenting applies the suggested memory: {report}"
+    );
+    assert!(
+        report.contains("pids_max: Some(80)"),
+        "uncommenting applies the suggested pids_max: {report}"
+    );
+}

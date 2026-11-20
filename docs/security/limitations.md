@@ -337,6 +337,20 @@ A program that behaves while it thinks it is being watched, or that only
 misbehaves on a certain date, produces a clean trace. Audit tightens software you
 have some reason to trust; it does not vet unknown code.
 
+### The resource peaks describe one run, and a generous one
+
+Where the audit's cgroup carries the accounting, the trace records the run's
+`memory.peak` and `pids.peak`. Three things they are not:
+
+- They describe the one run you audited. A different input, a bigger file, a
+  busier day: all can need more. A limit derived from one trace can kill the
+  program on the next run, which is why the suggested block is commented out.
+- `memory.peak` includes page cache, so a program that read a lot of files
+  reports a peak well above its working set. The number leans high, not low.
+- The peak is read when the target you launched exits. A child that daemonizes
+  and keeps running, or that grows after its parent is gone, is past the end of
+  the trace, and its later growth is never seen.
+
 ## Other
 
 ### A denied access is not reported

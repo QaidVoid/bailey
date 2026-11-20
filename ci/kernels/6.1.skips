@@ -1,10 +1,13 @@
 audit::a_short_lived_child_is_recorded_when_scoping_by_cgroup # no audit helper configured
 audit::an_audit_of_a_network_mode_it_cannot_honour_names_the_gap # no audit helper configured
 audit::an_ungranted_egress_attempt_is_refused_during_an_audit # no audit helper configured
+audit::an_unmeasured_peak_says_why # no audit helper configured
 audit::execution_of_a_child_program_is_recorded # no audit helper configured
+audit::peaks_are_recorded_when_the_cgroup_carries_them # no audit helper configured
 audit::startup_access_is_recorded # no audit helper configured
 audit::the_target_is_confined_during_an_audit # no audit helper configured
 audit::unconfined_is_an_explicit_opt_in # no audit helper configured
+bailey::backend::audit::tests::every_observer_path_records_a_usage # no audit helper with capabilities on this host
 cgroup::a_cgroup_root_override_suppresses_the_scope_request # needs a systemd host
 cgroup::a_session_without_delegation_gets_a_user_scope # the session already has a delegated cgroup
 cgroup::the_scope_is_gone_after_the_run # the session already has a delegated cgroup

@@ -6,13 +6,20 @@
 //! reads, access outside the target directory) is flagged and never included in
 //! a generated profile unless the caller explicitly selects it, so auditing an
 //! untrusted target never silently blesses its behavior.
+//!
+//! One tier sits above even that: paths a profile should never name whatever
+//! the flags say (`/`, the home and its ancestors, credential paths), so no
+//! flag combination can bless the whole home. And where the trace carries the
+//! run's measured peaks, a commented-out resource block suggests limits from
+//! them, since a profile that applies nothing is free and a live one derived
+//! from a single run is a gamble.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use crate::backend::world;
-use crate::event::{AccessEvent, AccessKind, Resolution, Resource};
-use crate::policy::{Access, Egress, Policy};
+use crate::event::{AccessEvent, AccessKind, Resolution, Resource, Usage};
+use crate::policy::{Access, Egress, Policy, ResourceLimits};
 
 /// The risk assigned to an ungranted access.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,96 +82,23 @@ pub fn reconcile(trace: &[AccessEvent], policy: &Policy, target_dir: &Path) -> V
 ///
 /// The caller decides which findings to include; nothing here is implicit. To
 /// honor the never-auto-trust rule, callers should exclude high-risk findings
-/// unless the user explicitly confirmed them.
-/// How many entries a directory needs before a grant names it rather than them.
-const COALESCE_AT: usize = 3;
-
-/// Replace many paths under one directory with the directory itself.
-///
-/// A trace of a real program is thousands of files: one run of a coding agent
-/// read 1,760, of which 192 sat in a single directory of syntax definitions. A
-/// grant per file is unreadable, and a policy nobody reads gets replaced by
-/// something far wider. Bailey's grants are hierarchies, so the useful answer is
-/// the directory.
-///
-/// This grants more than was observed, which is the trade: wide enough to read,
-/// narrow enough to mean something. It stops where a directory has fewer than
-/// [`COALESCE_AT`] entries, which is what keeps it from walking up to the home.
-fn coalesce(paths: BTreeSet<String>) -> (BTreeSet<String>, bool) {
-    let mut current: BTreeSet<PathBuf> = paths.iter().map(PathBuf::from).collect();
-    let mut coalesced = false;
-
-    loop {
-        let mut by_parent: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
-        for path in &current {
-            match path.parent() {
-                Some(parent) => by_parent
-                    .entry(parent.to_path_buf())
-                    .or_default()
-                    .push(path.clone()),
-                None => {
-                    by_parent.entry(path.clone()).or_default();
-                }
-            }
-        }
-
-        let mut next = BTreeSet::new();
-        let mut changed = false;
-        for (parent, children) in by_parent {
-            if children.len() >= COALESCE_AT && may_name(&parent) {
-                next.insert(parent);
-                changed = true;
-            } else {
-                next.extend(children);
-            }
-        }
-
-        coalesced |= changed;
-        if !changed {
-            // A path already covered by a directory in the set adds nothing.
-            let covered: Vec<PathBuf> = next
-                .iter()
-                .filter(|path| {
-                    next.iter()
-                        .any(|other| *other != **path && path.starts_with(other))
-                })
-                .cloned()
-                .collect();
-            for path in covered {
-                next.remove(&path);
-            }
-            return (
-                next.into_iter()
-                    .map(|path| path.display().to_string())
-                    .collect(),
-                coalesced,
-            );
-        }
-        current = next;
-    }
+/// unless the user explicitly confirmed them. On top of that choice, paths
+/// [`never_generated`] matches are left out whatever their risk; they come
+/// back alongside the profile text so the caller can name them. Callers
+/// should also offer the resource block from [`suggest_resources`] where the
+/// trace carries measured peaks.
+pub fn generate_profile(findings: &[Finding]) -> (String, Vec<String>) {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    generate_profile_under_home(findings, home.as_deref())
 }
 
-/// Whether a directory is specific enough to name in a grant.
-///
-/// The home directory and anything above it are never the answer: a grant on the
-/// home is the thing this tool exists to avoid, and arriving at one by
-/// accumulation would be the worst way to get there.
-fn may_name(dir: &Path) -> bool {
-    if dir.components().count() < 3 {
-        return false;
-    }
-    match std::env::var_os("HOME") {
-        Some(home) => !Path::new(&home).starts_with(dir),
-        None => true,
-    }
-}
-
-pub fn generate_profile(findings: &[Finding]) -> String {
+fn generate_profile_under_home(findings: &[Finding], home: Option<&Path>) -> (String, Vec<String>) {
     let mut read = BTreeSet::new();
     let mut write = BTreeSet::new();
     let mut execute = BTreeSet::new();
     let mut connect_ports = BTreeSet::new();
     let mut bind_ports = BTreeSet::new();
+    let mut withheld = Vec::new();
 
     let mut skipped_terminal = false;
     for finding in findings {
@@ -182,6 +116,14 @@ pub fn generate_profile(findings: &[Finding]) -> String {
             && path.starts_with("/dev/pts")
         {
             skipped_terminal = true;
+            continue;
+        }
+        // The never tier sits above every flag: no risk class, no include
+        // switch, and no amount of coalescing arrives at one of these.
+        if let Resource::Path(path) = &finding.resource
+            && never_generated_under_home(path, home)
+        {
+            withheld.push(display(path));
             continue;
         }
         match (&finding.kind, &finding.resource) {
@@ -219,9 +161,9 @@ pub fn generate_profile(findings: &[Finding]) -> String {
         .map(|dir| dir.display().to_string())
         .collect();
 
-    let (read, read_coalesced) = coalesce(read);
-    let (write, write_coalesced) = coalesce(write);
-    let (execute, execute_coalesced) = coalesce(execute);
+    let (read, read_coalesced) = coalesce(read, home);
+    let (write, write_coalesced) = coalesce(write, home);
+    let (execute, execute_coalesced) = coalesce(execute, home);
 
     let mut out = String::new();
     if read_coalesced || write_coalesced || execute_coalesced {
@@ -259,7 +201,186 @@ pub fn generate_profile(findings: &[Finding]) -> String {
         out.push_str(&format!("set = {{ PATH = \"{}\" }}\n", path.join(":")));
     }
 
-    out
+    (out, withheld)
+}
+
+/// How many entries a directory needs before a grant names it rather than them.
+const COALESCE_AT: usize = 3;
+
+/// Replace many paths under one directory with the directory itself.
+///
+/// A trace of a real program is thousands of files: one run of a coding agent
+/// read 1,760, of which 192 sat in a single directory of syntax definitions. A
+/// grant per file is unreadable, and a policy nobody reads gets replaced by
+/// something far wider. Bailey's grants are hierarchies, so the useful answer is
+/// the directory.
+///
+/// This grants more than was observed, which is the trade: wide enough to read,
+/// narrow enough to mean something. It stops where a directory has fewer than
+/// [`COALESCE_AT`] entries, which is what keeps it from walking up to the home.
+fn coalesce(paths: BTreeSet<String>, home: Option<&Path>) -> (BTreeSet<String>, bool) {
+    let mut current: BTreeSet<PathBuf> = paths.iter().map(PathBuf::from).collect();
+    let mut coalesced = false;
+
+    loop {
+        let mut by_parent: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
+        for path in &current {
+            match path.parent() {
+                Some(parent) => by_parent
+                    .entry(parent.to_path_buf())
+                    .or_default()
+                    .push(path.clone()),
+                None => {
+                    by_parent.entry(path.clone()).or_default();
+                }
+            }
+        }
+
+        let mut next = BTreeSet::new();
+        let mut changed = false;
+        for (parent, children) in by_parent {
+            if children.len() >= COALESCE_AT && may_name(&parent, home) {
+                next.insert(parent);
+                changed = true;
+            } else {
+                next.extend(children);
+            }
+        }
+
+        coalesced |= changed;
+        if !changed {
+            // A path already covered by a directory in the set adds nothing.
+            let covered: Vec<PathBuf> = next
+                .iter()
+                .filter(|path| {
+                    next.iter()
+                        .any(|other| *other != **path && path.starts_with(other))
+                })
+                .cloned()
+                .collect();
+            for path in covered {
+                next.remove(&path);
+            }
+            return (
+                next.into_iter()
+                    .map(|path| path.display().to_string())
+                    .collect(),
+                coalesced,
+            );
+        }
+        current = next;
+    }
+}
+
+/// Whether a directory is specific enough to name in a grant.
+///
+/// The home directory and anything above it are never the answer: a grant on the
+/// home is the thing this tool exists to avoid, and arriving at one by
+/// accumulation would be the worst way to get there. [`never_generated`] is the
+/// same rule the findings filter applies, so a direct finding and a merged one
+/// cannot disagree.
+fn may_name(dir: &Path, home: Option<&Path>) -> bool {
+    if dir.components().count() < 3 {
+        return false;
+    }
+    !never_generated_under_home(dir, home)
+}
+
+/// A MiB in bytes, the unit the suggestion speaks in.
+const MIB: u64 = 1_048_576;
+
+/// The floor under a suggested memory limit, in whole MiB.
+const MEMORY_FLOOR_MIB: u64 = 64;
+
+/// The floor under a suggested `pids_max`.
+///
+/// A peak of one or two tasks says almost nothing: the floors cover the short
+/// run whose peak would otherwise suggest a `pids_max = 2` that breaks the
+/// first shell the program spawns.
+const TASKS_FLOOR: u64 = 32;
+
+/// The resource limits the run's peaks suggest, as a block of TOML comments.
+///
+/// Memory is twice the peak with a [`MEMORY_FLOOR_MIB`] floor, rounded up to a
+/// whole MiB and written the way `parse_size` reads it; `pids_max` is twice
+/// the tasks peak with a [`TASKS_FLOOR`] floor. A limit the base policy
+/// already sets is not suggested: the generated profile supplements that
+/// policy, and doubling a limit the run already pushed against would quietly
+/// widen it.
+///
+/// Every line is a comment, headed with the measured peaks and the rule. The
+/// block applies nothing as written; uncommenting it is a choice a person
+/// makes after reading it. `None` when there is nothing to suggest, either
+/// because no peak was measured or because the base policy already limits
+/// everything that was.
+pub fn suggest_resources(usage: &Usage, base: &ResourceLimits) -> Option<String> {
+    let memory_peak = usage
+        .memory_peak_bytes
+        .filter(|_| base.memory_bytes.is_none());
+    let tasks_peak = usage.tasks_peak.filter(|_| base.pids_max.is_none());
+    if memory_peak.is_none() && tasks_peak.is_none() {
+        return None;
+    }
+
+    let memory_mib =
+        memory_peak.map(|peak| peak.saturating_mul(2).div_ceil(MIB).max(MEMORY_FLOOR_MIB));
+    let tasks = tasks_peak.map(|peak| peak.saturating_mul(2).max(TASKS_FLOOR));
+
+    let mut out = String::new();
+    out.push_str("# Resource limits, suggested from this run: one run is one sample, and a\n");
+    out.push_str("# larger input routinely needs more. The rule is twice each measured\n");
+    out.push_str("# peak, floored at 64 MiB of memory and 32 tasks. Uncomment to apply.\n");
+    match (usage.memory_peak_bytes, base.memory_bytes.is_some()) {
+        (Some(peak), true) => out.push_str(&format!(
+            "#   memory peak: {} (not suggested: the base policy sets a limit)\n",
+            mib_text(peak)
+        )),
+        (Some(peak), false) => out.push_str(&format!("#   memory peak: {}\n", mib_text(peak))),
+        (None, _) => {
+            out.push_str("#   memory peak: none recorded\n");
+            for reason in &usage.unmeasured {
+                if reason.starts_with("memory:") {
+                    out.push_str(&format!("#   {reason}\n"));
+                }
+            }
+        }
+    }
+    match (usage.tasks_peak, base.pids_max.is_some()) {
+        (Some(peak), true) => out.push_str(&format!(
+            "#   tasks peak: {peak} (not suggested: the base policy sets a limit)\n"
+        )),
+        (Some(peak), false) => out.push_str(&format!("#   tasks peak: {peak}\n")),
+        (None, _) => {
+            out.push_str("#   tasks peak: none recorded\n");
+            for reason in &usage.unmeasured {
+                if reason.starts_with("tasks:") {
+                    out.push_str(&format!("#   {reason}\n"));
+                }
+            }
+        }
+    }
+    if let Some(mib) = memory_mib {
+        out.push_str("#[resources]\n");
+        out.push_str(&format!("#memory = \"{mib}MiB\"\n"));
+    }
+    if let Some(tasks) = tasks {
+        if memory_mib.is_none() {
+            out.push_str("#[resources]\n");
+        }
+        out.push_str(&format!("#pids_max = {tasks}\n"));
+    }
+    Some(out)
+}
+
+/// A byte count as whole MiB, one decimal where it is not exact.
+fn mib_text(bytes: u64) -> String {
+    let whole = bytes / MIB;
+    let rem = bytes % MIB;
+    if rem == 0 {
+        format!("{whole} MiB")
+    } else {
+        format!("{whole}.{}", rem * 10 / MIB)
+    }
 }
 
 fn is_granted(event: &AccessEvent, policy: &Policy) -> bool {
@@ -310,17 +431,56 @@ fn is_system_path(path: &Path) -> bool {
     SYSTEM_ROOTS.iter().any(|root| path.starts_with(root))
 }
 
-fn is_credential_path(path: &Path) -> bool {
-    const SECRET_COMPONENTS: &[&str] = &[
-        ".ssh",
-        ".gnupg",
-        ".aws",
-        ".config/gcloud",
-        ".password-store",
-        ".mozilla",
-    ];
-    const SECRET_NAMES: &[&str] = &[".netrc", ".git-credentials", "id_rsa", "id_ed25519"];
+/// Credential locations the same substring rule [`is_credential_path`] and the
+/// never tier match, shared so the two cannot drift apart.
+const SECRET_COMPONENTS: &[&str] = &[
+    ".ssh",
+    ".gnupg",
+    ".aws",
+    ".config/gcloud",
+    ".password-store",
+    ".mozilla",
+];
 
+const SECRET_NAMES: &[&str] = &[".netrc", ".git-credentials", "id_rsa", "id_ed25519"];
+
+/// Whether a path is never written into a generated profile, whatever the
+/// flags say.
+///
+/// This is `/`; the home directory and every ancestor of it; every ancestor of
+/// a credential location under the home, which is where `~/.config` comes from
+/// (`is_credential_path` matches `.config/gcloud` inside it, so the directory
+/// itself never matched); and anything `is_credential_path` matches.
+///
+/// The rule holds whatever was accessed, because these are the grants a
+/// generator has no business writing: `read = ["~"]` defeats the purpose of
+/// auditing, and arriving at it by coalescing is only a slower way there. A
+/// user who really wants one writes it by hand.
+pub fn never_generated(path: &Path) -> bool {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    never_generated_under_home(path, home.as_deref())
+}
+
+fn never_generated_under_home(path: &Path, home: Option<&Path>) -> bool {
+    if path == Path::new("/") {
+        return true;
+    }
+    if is_credential_path(path) {
+        return true;
+    }
+    let Some(home) = home else {
+        return false;
+    };
+    if path == home || home.starts_with(path) {
+        return true;
+    }
+    SECRET_COMPONENTS
+        .iter()
+        .map(|component| home.join(component))
+        .any(|location| location.starts_with(path))
+}
+
+fn is_credential_path(path: &Path) -> bool {
     let text = path.to_string_lossy();
     if SECRET_COMPONENTS.iter().any(|needle| text.contains(needle)) {
         return true;
@@ -444,9 +604,10 @@ mod tests {
             risk: Risk::Low,
             unresolved: false,
         }];
-        let profile = generate_profile(&findings);
+        let (profile, withheld) = generate_profile_under_home(&findings, None);
         assert!(profile.contains("read = [\"/game/data.pak\"]"));
         assert!(!profile.contains("egress"));
+        assert!(withheld.is_empty());
     }
 
     /// A filename may hold anything but `/` and NUL. One carrying a quote and
@@ -461,7 +622,7 @@ mod tests {
             risk: Risk::Low,
             unresolved: false,
         }];
-        let profile = generate_profile(&findings);
+        let (profile, _) = generate_profile_under_home(&findings, None);
         let parsed: toml::Table =
             toml::from_str(&profile).expect("a generated profile always parses as TOML");
         let granted = parsed
@@ -471,5 +632,155 @@ mod tests {
             .expect("a read array");
         assert_eq!(granted.len(), 1, "the hostile text must stay one entry");
         assert_eq!(granted[0].as_str(), Some(hostile));
+    }
+
+    /// The never tier, passed as direct findings: `/`, the home, and the
+    /// ancestor of a credential location all stay out whatever their risk,
+    /// and the caller is told what was left out.
+    #[test]
+    fn the_root_the_home_and_its_credential_ancestors_are_never_generated() {
+        let home = Path::new("/users/tester");
+        let paths = [
+            "/",
+            "/users",
+            "/users/tester",
+            "/users/tester/.config",
+            "/users/tester/.ssh",
+            "/users/tester/.ssh/id_ed25519",
+        ];
+        let findings: Vec<Finding> = paths
+            .iter()
+            .map(|path| Finding {
+                kind: AccessKind::Read,
+                resource: Resource::Path(PathBuf::from(path)),
+                risk: Risk::Low,
+                unresolved: false,
+            })
+            .collect();
+        let (profile, withheld) = generate_profile_under_home(&findings, Some(home));
+        for path in paths {
+            assert!(
+                !profile.contains(path),
+                "{path} must never be generated: {profile}"
+            );
+        }
+        assert_eq!(withheld, paths, "every withheld path is named");
+    }
+
+    /// An ordinary path inside the target still generates, next to the never
+    /// tier: the filter is narrow, not a general suspicion of everything.
+    #[test]
+    fn an_ordinary_path_still_generates() {
+        let home = Path::new("/users/tester");
+        let findings = vec![Finding {
+            kind: AccessKind::Read,
+            resource: Resource::Path(PathBuf::from("/game/data.pak")),
+            risk: Risk::Low,
+            unresolved: false,
+        }];
+        let (profile, withheld) = generate_profile_under_home(&findings, Some(home));
+        assert!(profile.contains("/game/data.pak"));
+        assert!(withheld.is_empty());
+    }
+
+    /// Coalescing may not arrive at a never tier directory by merging its
+    /// children: three reads under `~/.config` stay three entries, and the
+    /// directory itself is never named.
+    #[test]
+    fn coalescing_never_arrives_at_a_never_generated_directory() {
+        let home = Path::new("/users/tester");
+        let findings: Vec<Finding> = ["a", "b", "c"]
+            .iter()
+            .map(|leaf| Finding {
+                kind: AccessKind::Read,
+                resource: Resource::Path(PathBuf::from(format!(
+                    "/users/tester/.config/{leaf}/one"
+                ))),
+                risk: Risk::Low,
+                unresolved: false,
+            })
+            .collect();
+        let (profile, _) = generate_profile_under_home(&findings, Some(home));
+        for leaf in ["a", "b", "c"] {
+            assert!(
+                profile.contains(&format!("/users/tester/.config/{leaf}")),
+                "each leaf stays a grant: {profile}"
+            );
+        }
+        assert!(
+            !profile.contains("\"/users/tester/.config\""),
+            "the coalesced directory must never be named: {profile}"
+        );
+    }
+
+    fn usage(memory: Option<u64>, tasks: Option<u64>) -> Usage {
+        Usage {
+            memory_peak_bytes: memory,
+            tasks_peak: tasks,
+            unmeasured: Vec::new(),
+        }
+    }
+
+    /// The rule on a real measurement: twice the peak, written commented out
+    /// with the peaks and the rule above it.
+    #[test]
+    fn a_suggestion_is_twice_the_peaks_commented_out() {
+        let base = ResourceLimits::default();
+        let block =
+            suggest_resources(&usage(Some(300 * MIB), Some(40)), &base).expect("peaks to suggest");
+        assert!(block.contains("one run is one sample"), "{block}");
+        assert!(block.contains("Uncomment to apply"), "{block}");
+        assert!(block.contains("#   memory peak: 300 MiB"), "{block}");
+        assert!(block.contains("#   tasks peak: 40"), "{block}");
+        assert!(block.contains("#[resources]"), "{block}");
+        assert!(block.contains("#memory = \"600MiB\""), "{block}");
+        assert!(block.contains("#pids_max = 80"), "{block}");
+        // Applies nothing as written: every line is a comment.
+        let parsed: toml::Table =
+            toml::from_str(&block).expect("a suggestion is valid TOML as comments");
+        assert!(parsed.get("resources").is_none());
+    }
+
+    /// A short run whose peaks say little gets the floors, not a `pids_max`
+    /// of 2 that breaks the first shell the program spawns.
+    #[test]
+    fn small_peaks_get_the_floors() {
+        let base = ResourceLimits::default();
+        let block = suggest_resources(&usage(Some(10 * MIB), Some(2)), &base).unwrap();
+        assert!(block.contains("#memory = \"64MiB\""), "{block}");
+        assert!(block.contains("#pids_max = 32"), "{block}");
+    }
+
+    /// A limit the base policy already sets is not suggested: doubling a
+    /// limit the run already pushed against would quietly widen it.
+    #[test]
+    fn a_base_limit_is_not_suggested() {
+        let base = ResourceLimits {
+            memory_bytes: Some(256 * MIB),
+            ..ResourceLimits::default()
+        };
+        let block = suggest_resources(&usage(Some(300 * MIB), Some(40)), &base).unwrap();
+        assert!(!block.contains("#memory"), "{block}");
+        assert!(
+            block.contains("the base policy sets a limit"),
+            "the header says why memory is missing: {block}"
+        );
+        assert!(block.contains("#pids_max = 80"), "{block}");
+    }
+
+    /// Twice a peak that is not a whole MiB is rounded up to one, so the
+    /// suggestion parses and rounds the way `parse_size` reads it.
+    #[test]
+    fn a_suggestion_rounds_up_to_a_whole_mib() {
+        let base = ResourceLimits::default();
+        let block = suggest_resources(&usage(Some(100 * MIB + 1), None), &base).unwrap();
+        assert!(block.contains("#memory = \"201MiB\""), "{block}");
+    }
+
+    /// No peak, no suggestion: the caller explains instead.
+    #[test]
+    fn no_peaks_gives_no_suggestion() {
+        let base = ResourceLimits::default();
+        assert!(suggest_resources(&usage(None, None), &base).is_none());
     }
 }

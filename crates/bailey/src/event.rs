@@ -79,6 +79,17 @@ fn not_applicable() -> Resolution {
     Resolution::NotApplicable
 }
 
+/// The resource peaks a run reported, where its cgroup carried the accounting.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Usage {
+    /// Highest resident memory the run reached, in bytes, from `memory.peak`.
+    pub memory_peak_bytes: Option<u64>,
+    /// Highest number of tasks the run held at once, from `pids.peak`.
+    pub tasks_peak: Option<u64>,
+    /// Why each missing peak is missing, one short sentence per peak.
+    pub unmeasured: Vec<String>,
+}
+
 /// A recorded session, with what the backend knows about its completeness.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Trace {
@@ -89,15 +100,22 @@ pub struct Trace {
     pub dropped: u64,
     /// The recorded accesses.
     pub events: Vec<AccessEvent>,
+    /// The run's resource peaks. `None` means the trace was written before
+    /// traces carried measurement, and `profile generate` says so rather than
+    /// suggesting limits from nothing.
+    #[serde(default)]
+    pub usage: Option<Usage>,
 }
 
 impl Trace {
-    /// A complete trace of `events`.
+    /// A complete trace of `events`, with no usage recorded yet. The backend
+    /// fills `usage` in from the run's cgroup where one carried it.
     pub fn new(events: Vec<AccessEvent>, dropped: u64) -> Self {
         Self {
             version: TRACE_VERSION,
             dropped,
             events,
+            usage: None,
         }
     }
 
@@ -115,5 +133,47 @@ impl Trace {
             "trace format version {} is not supported by this build, which reads version {}",
             self.version, TRACE_VERSION
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A trace written before traces carried peaks has no `usage` key, and
+    /// must still load and generate.
+    #[test]
+    fn a_version_1_trace_without_usage_loads() {
+        let text = r#"{"version":1,"dropped":0,"events":[]}"#;
+        let trace: Trace = serde_json::from_str(text).expect("an old trace still loads");
+        assert!(trace.usage.is_none());
+        assert!(trace.check_version().is_ok());
+    }
+
+    /// A trace with peaks round-trips through the format.
+    #[test]
+    fn a_trace_with_usage_round_trips() {
+        let usage = Usage {
+            memory_peak_bytes: Some(314_572_800),
+            tasks_peak: Some(40),
+            unmeasured: vec!["tasks: this kernel does not report pids.peak".into()],
+        };
+        let mut trace = Trace::new(Vec::new(), 0);
+        trace.usage = Some(usage.clone());
+        let text = serde_json::to_string(&trace).expect("a trace always serializes");
+        let loaded: Trace = serde_json::from_str(&text).expect("and reads back");
+        assert_eq!(loaded.usage, Some(usage));
+    }
+
+    /// Forward-compatibility guard, on purpose: `Trace` has no
+    /// `deny_unknown_fields`, so a build older than a trace field ignores
+    /// what it does not know instead of refusing the file. If someone adds
+    /// `deny_unknown_fields` this breaks old builds reading new traces; this
+    /// test is the reminder to think about the version instead.
+    #[test]
+    fn a_trace_with_an_unknown_top_level_key_still_loads() {
+        let text = r#"{"version":1,"dropped":0,"events":[],"net_peaks":{}}"#;
+        let trace: Trace = serde_json::from_str(text).expect("an unknown key is ignored");
+        assert!(trace.check_version().is_ok());
     }
 }

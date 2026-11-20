@@ -288,7 +288,9 @@ writes a deny-by-default profile to stdout granting the routine findings.
 | `--accept-truncated` | Generate from a trace known to be missing events |
 
 High-risk findings are excluded unless `--include-high-risk` is given, and the
-number excluded is reported on stderr.
+number excluded is reported on stderr. That flag does not include `/`, your
+home, or credential paths: they are never generated, whatever the flags, and
+are named on stderr when a trace touches them.
 
 ## Environment variables
 

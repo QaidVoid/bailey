@@ -94,6 +94,17 @@ bailey: skipped 2 access(es) whose path could not be resolved, so the profile
 does not grant them.
 ```
 
+Above every flag sits a never tier. `/`, your home directory and its ancestors,
+and credential paths (`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.config/gcloud` and
+friends) are never written into a generated profile, whatever their risk and
+whatever flags are passed. A direct finding of one is left out, and so is a
+directory that coalescing would otherwise arrive at by merging its children:
+
+```
+bailey: never generated 3 access(es): /, /home/you, /home/you/.ssh/id_ed25519. \
+Write any grant you still want by hand; no flag changes this.
+```
+
 Read the excluded list before reaching for `--include-high-risk`. A game that
 connects to a content server and a game that connects to a stranger's server look
 identical in a trace.
@@ -140,6 +151,39 @@ absolute.
 The trace records what it lost. If the kernel could not deliver an event, or the
 event cap was reached, the count reaches the trace and `profile generate` refuses
 to turn it into a profile without `--accept-truncated`.
+
+### Resource peaks
+
+Where the run's cgroup carries the accounting, the trace also records what the
+run reached: its highest memory use (`memory.peak`) and its highest task count
+(`pids.peak`). `memory.peak` needs Linux 5.19 or newer, `pids.peak` needs 6.1 or
+newer, and both need the run's cgroup to have the memory and pids controllers,
+which is what an audit asks for where the host delegates them. A peak that is
+missing from the trace is named in it, with the reason: no cgroup for the run at
+all, a delegation without the controller (`the run's cgroup has no memory
+controller`), or a kernel too old to keep the high-water mark (`this kernel does
+not report pids.peak (needs Linux 6.1)`). An unconfined run has no cgroup of its
+own and says so.
+
+`profile generate` reads the peaks and suggests a commented-out resource block:
+twice each measured peak, floored at 64 MiB of memory and 32 tasks. The block
+applies nothing as written; uncommenting it is a choice you make after reading
+it. Why twice, and why a floor at all:
+
+- One run is one sample. A larger input routinely needs more than the run you
+  happened to audit, and a limit set from one lucky run breaks the next one.
+- `memory.peak` includes page cache, so it already leans high for a program
+  that reads a lot. Doubling it errs further toward a limit that does not kill
+  the program, which is the safe direction for a number you did not measure
+  twice.
+- The floors cover a short run whose peak says almost nothing: a shell, an
+  interpreter starting, a pipeline of a few processes. `pids.peak` counts
+  threads, and so does `pids_max`, so the two numbers compare directly.
+
+A limit the policy you audited against already sets is not suggested: doubling
+a limit the run already pushed against would quietly widen it. Nothing is
+suggested for a trace recorded before peaks were measured; the generated file
+says that instead of inventing numbers.
 
 ## How observation is scoped
 

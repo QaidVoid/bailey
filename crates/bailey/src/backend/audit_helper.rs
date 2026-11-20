@@ -27,7 +27,7 @@ use bailey_common::{
 
 use crate::backend::enforce::Confined;
 use crate::backend::{BackendError, Target};
-use crate::event::{AccessEvent, AccessKind, Resolution, Resource, Trace};
+use crate::event::{AccessEvent, AccessKind, Resolution, Resource, Trace, Usage};
 
 /// Maximum number of events retained, to bound memory for chatty targets.
 const MAX_EVENTS: usize = 200_000;
@@ -133,8 +133,11 @@ impl Recorder {
 /// Run `confined` under observation and return its exit code with the trace.
 ///
 /// The target arrives stopped before exec. It is released only after the helper
-/// confirms it is watching.
-pub fn record(recorder: &mut Recorder, confined: Confined) -> Result<i32, BackendError> {
+/// confirms it is watching. The trace carries the run's peaks, read through
+/// [`Confined::wait_measured`] before the cgroup is removed, so every observer
+/// that goes through here records the same measurement; a second observer path
+/// must do the same rather than reading less.
+pub fn record(mut recorder: Recorder, confined: Confined) -> Result<(i32, Trace), BackendError> {
     let pid = confined.pid();
     let cgroup = confined.cgroup_id().unwrap_or(NO_CGROUP);
     if cgroup == NO_CGROUP {
@@ -147,7 +150,10 @@ pub fn record(recorder: &mut Recorder, confined: Confined) -> Result<i32, Backen
     wait_for_stop(pid)?;
     recorder.observe(pid, cgroup)?;
     resume(pid)?;
-    confined.wait()
+    let (code, usage) = confined.wait_measured()?;
+    let mut trace = recorder.finish();
+    trace.usage = Some(usage);
+    Ok((code, trace))
 }
 
 /// Wait for the target to reach its pre-exec stop.
@@ -347,6 +353,16 @@ pub fn run_unconfined(target: &Target) -> Result<(i32, Trace), BackendError> {
     recorder.observe(pid, NO_CGROUP)?;
     resume(pid)?;
     let status = child.wait().map_err(BackendError::Io)?;
-    let trace = recorder.finish();
+    let mut trace = recorder.finish();
+    // An unconfined run has no cgroup of its own, so there are no peaks to
+    // read, and the trace says so rather than leaving them absent silently.
+    trace.usage = Some(Usage {
+        memory_peak_bytes: None,
+        tasks_peak: None,
+        unmeasured: vec![
+            "memory: unconfined run, no cgroup".to_owned(),
+            "tasks: unconfined run, no cgroup".to_owned(),
+        ],
+    });
     Ok((status.code().unwrap_or(-1), trace))
 }

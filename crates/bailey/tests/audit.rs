@@ -335,3 +335,102 @@ fn a_short_lived_child_is_recorded_when_scoping_by_cgroup() {
         "the child's exec must be recorded, which process-tree scoping misses"
     );
 }
+
+/// Where the run's cgroup carries the measuring controllers, the trace records
+/// what the run reached: a shell that backgrounds several sleeps holds more
+/// tasks at once than its own process, and allocates something.
+#[test]
+fn peaks_are_recorded_when_the_cgroup_carries_them() {
+    let Some(helper) = helper() else {
+        common::skip("no audit helper configured");
+        return;
+    };
+    if bailey::backend::cgroup::usable_root(&["memory", "pids"]).is_none() {
+        common::skip("no cgroup carrying memory and pids to measure in");
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let trace = trace_of(
+        &helper,
+        dir.path(),
+        &["/bin/sh", "-c", "for i in 1 2 3 4; do sleep 1 & done; wait"],
+    );
+
+    let usage = &trace["usage"];
+    assert!(
+        usage.is_object(),
+        "a measured run records its peaks: {trace}"
+    );
+    let tasks = usage["tasks_peak"].as_u64().expect("a tasks peak");
+    assert!(
+        tasks >= 4,
+        "four backgrounded sleeps plus the shell must hold at least 5 tasks, got {tasks}"
+    );
+    let memory = usage["memory_peak_bytes"].as_u64().expect("a memory peak");
+    assert!(memory > 0, "the run allocated something: {memory}");
+    assert!(
+        usage["unmeasured"]
+            .as_array()
+            .is_none_or(|reasons| reasons.is_empty()),
+        "measured peaks leave nothing to explain: {usage}"
+    );
+}
+
+/// A run with no cgroup at all records both peaks as unmeasured, and each
+/// reason says what was lost rather than leaving the fields absent.
+#[test]
+fn an_unmeasured_peak_says_why() {
+    let Some(helper) = helper() else {
+        common::skip("no audit helper configured");
+        return;
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("trace.json");
+    let override_path = "/nonexistent";
+    let output = Command::new(bailey())
+        .args([
+            "audit",
+            "--save-trace",
+            path.to_str().unwrap(),
+            "/bin/sh",
+            "-c",
+            "true",
+        ])
+        .env("BAILEY_BPF_HELPER", helper)
+        .env("BAILEY_CGROUP_ROOT", override_path)
+        .output()
+        .unwrap();
+    assert!(
+        path.exists(),
+        "audit did not produce a trace: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let trace: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+
+    let usage = &trace["usage"];
+    assert!(
+        usage.is_object(),
+        "the run explains its missing peaks: {trace}"
+    );
+    assert!(
+        usage["memory_peak_bytes"].is_null(),
+        "no cgroup, no memory peak: {usage}"
+    );
+    assert!(
+        usage["tasks_peak"].is_null(),
+        "no cgroup, no tasks peak: {usage}"
+    );
+    let reasons: Vec<String> = usage["unmeasured"]
+        .as_array()
+        .expect("unmeasured peaks are listed")
+        .iter()
+        .map(|reason| reason.as_str().expect("a string reason").to_owned())
+        .collect();
+    assert_eq!(reasons.len(), 2, "both peaks are named: {reasons:?}");
+    assert!(
+        reasons.iter().all(|reason| reason.contains("no cgroup")),
+        "each reason names the missing cgroup: {reasons:?}"
+    );
+}

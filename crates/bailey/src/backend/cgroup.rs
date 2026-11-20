@@ -66,6 +66,94 @@ pub fn needed_controllers(limits: &ResourceLimits) -> Vec<&'static str> {
     needed
 }
 
+/// The controllers a set of limits needs, plus the ones measuring a run's
+/// peaks needs.
+///
+/// `memory` and `pids` are what `memory.peak` and `pids.peak` live behind, so
+/// an audit asks for them even when the limits name neither. Duplicated names
+/// would be harmless, but the order below keeps the list readable.
+pub fn measuring_controllers(needed: &[&'static str]) -> Vec<&'static str> {
+    let mut wanted: Vec<&'static str> = needed.to_vec();
+    for controller in ["memory", "pids"] {
+        if !wanted.contains(&controller) {
+            wanted.push(controller);
+        }
+    }
+    wanted
+}
+
+/// The controller lists a run's cgroup search tries, best first.
+///
+/// The measuring controllers come first, so the peaks are kept wherever the
+/// delegation carries them. A run that enforces nothing through its cgroup,
+/// an audit, tries the limits' controllers alone as a second step: the
+/// scoping is kept and the peaks are explained, rather than the scoping
+/// being lost with them. An enforcing run has one list, since what it wants
+/// is what it needs.
+pub(crate) fn controller_searches(
+    even_without_limits: bool,
+    wanted: &[&'static str],
+    needed: &[&'static str],
+) -> Vec<Vec<&'static str>> {
+    let mut lists = vec![wanted.to_vec()];
+    if even_without_limits && wanted != needed {
+        lists.push(needed.to_vec());
+    }
+    lists
+}
+
+/// The run's resource peaks, read from a cgroup before it is removed.
+///
+/// Each peak is read only where the cgroup carries its controller, and every
+/// missing peak says why: no cgroup at all, a delegation without the
+/// controller, or a kernel too old to keep the high-water mark.
+pub(crate) fn read_peaks(dir: &Path) -> crate::event::Usage {
+    let controllers = fs::read_to_string(dir.join("cgroup.controllers"))
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+
+    let memory_peak_bytes = if !controllers.iter().any(|c| c == "memory") {
+        None
+    } else {
+        match fs::read_to_string(dir.join("memory.peak")) {
+            Ok(text) => text.trim().parse::<u64>().ok(),
+            Err(_) => None,
+        }
+    };
+    let tasks_peak = if !controllers.iter().any(|c| c == "pids") {
+        None
+    } else {
+        match fs::read_to_string(dir.join("pids.peak")) {
+            Ok(text) => text.trim().parse::<u64>().ok(),
+            Err(_) => None,
+        }
+    };
+
+    let mut unmeasured = Vec::new();
+    if memory_peak_bytes.is_none() {
+        unmeasured.push(if controllers.iter().any(|c| c == "memory") {
+            "memory: this kernel does not report memory.peak (needs Linux 5.19)".to_owned()
+        } else {
+            "memory: the run's cgroup has no memory controller".to_owned()
+        });
+    }
+    if tasks_peak.is_none() {
+        unmeasured.push(if controllers.iter().any(|c| c == "pids") {
+            "tasks: this kernel does not report pids.peak (needs Linux 6.1)".to_owned()
+        } else {
+            "tasks: the run's cgroup has no pids controller".to_owned()
+        });
+    }
+
+    crate::event::Usage {
+        memory_peak_bytes,
+        tasks_peak,
+        unmeasured,
+    }
+}
+
 /// The cgroup bailey itself is in.
 pub fn own() -> Option<PathBuf> {
     let content = fs::read_to_string("/proc/self/cgroup").ok()?;
@@ -563,5 +651,99 @@ mod tests {
             "0::/user.slice/user-1000.slice/user@1000.service/bailey-42-abcdef0123456789.scope/supervisor",
             unit
         ));
+    }
+
+    /// Lay out a directory as a cgroup leaf: its controller list and, where a
+    /// controller is delegated, a peak file.
+    fn fake_cgroup(dir: &Path, controllers: &[&str], peaks: &[(&str, u64)]) {
+        fs::write(dir.join("cgroup.controllers"), controllers.join(" ")).unwrap();
+        for (name, value) in peaks {
+            fs::write(dir.join(name), value.to_string()).unwrap();
+        }
+    }
+
+    /// Both peaks read where the cgroup carries both controllers.
+    #[test]
+    fn both_peaks_read_where_the_cgroup_carries_them() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_cgroup(
+            dir.path(),
+            &["memory", "pids"],
+            &[("memory.peak", 314_572_800), ("pids.peak", 40)],
+        );
+        let usage = read_peaks(dir.path());
+        assert_eq!(usage.memory_peak_bytes, Some(314_572_800));
+        assert_eq!(usage.tasks_peak, Some(40));
+        assert!(usage.unmeasured.is_empty());
+    }
+
+    /// A delegation without the memory controller is the reason, not a
+    /// kernel complaint: the controller file decides what is missing and why.
+    #[test]
+    fn a_missing_controller_says_the_delegation_lacks_it() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_cgroup(dir.path(), &["pids"], &[("pids.peak", 3)]);
+        let usage = read_peaks(dir.path());
+        assert_eq!(usage.memory_peak_bytes, None);
+        assert_eq!(usage.tasks_peak, Some(3));
+        assert_eq!(
+            usage.unmeasured,
+            vec!["memory: the run's cgroup has no memory controller"]
+        );
+    }
+
+    /// Where the controller is delegated but the peak file is absent, the
+    /// kernel is too old to have kept the high-water mark.
+    #[test]
+    fn a_missing_peak_file_names_the_kernel() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_cgroup(dir.path(), &["memory", "pids"], &[]);
+        let usage = read_peaks(dir.path());
+        assert_eq!(usage.memory_peak_bytes, None);
+        assert_eq!(usage.tasks_peak, None);
+        assert_eq!(
+            usage.unmeasured,
+            vec![
+                "memory: this kernel does not report memory.peak (needs Linux 5.19)",
+                "tasks: this kernel does not report pids.peak (needs Linux 6.1)",
+            ]
+        );
+    }
+
+    /// An audit asks for the limits' controllers plus the measuring ones,
+    /// without duplicating a controller the limits already need.
+    #[test]
+    fn measuring_controllers_extend_the_limits_ones() {
+        assert_eq!(measuring_controllers(&[]), vec!["memory", "pids"]);
+        assert_eq!(measuring_controllers(&["memory"]), vec!["memory", "pids"]);
+        assert_eq!(
+            measuring_controllers(&["memory", "pids", "cpu"]),
+            vec!["memory", "pids", "cpu"]
+        );
+    }
+
+    /// A delegation without the memory controller cannot host the measuring
+    /// list, but still hosts the limits' list, which for a limit-free audit
+    /// run is empty: the scoping cgroup is there, and only the peaks go.
+    #[test]
+    fn a_partial_delegation_hosts_the_limits_list_but_not_the_measuring_one() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_cgroup(dir.path(), &["pids"], &[]);
+        assert!(!can_host_runs(dir.path(), &["memory", "pids"]));
+        assert!(can_host_runs(dir.path(), &[]));
+    }
+
+    /// An audit's search falls back to the limits' controllers, and an
+    /// enforcing run's search does not widen past its own list.
+    #[test]
+    fn an_audit_run_falls_back_to_the_limits_controllers() {
+        assert_eq!(
+            controller_searches(true, &["memory", "pids"], &[]),
+            vec![vec!["memory", "pids"], vec![]]
+        );
+        assert_eq!(
+            controller_searches(false, &["memory"], &["memory"]),
+            vec![vec!["memory"]]
+        );
     }
 }
