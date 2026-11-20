@@ -262,14 +262,18 @@ pub fn environment(policy: &Policy, world: &World, network: Option<&str>) -> Vec
 
     // Display and audio variables follow the grants they depend on: the variable
     // without the socket is useless, and the socket without the variable is a
-    // program that cannot find its display.
+    // program that cannot find its display. A `connect` entry beneath one of
+    // the service directories carries the same weight: the run was given a
+    // socket there, so the variables that point programs at it must follow.
     let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
     if let Some(dir) = &runtime_dir
-        && covered_by_grant(policy, dir)
+        && (covered_by_grant(policy, dir) || connect_beneath(policy, dir))
     {
         insert_from_caller(&mut env, RUNTIME_DIR_VARS);
     }
-    if covered_by_grant(policy, Path::new("/tmp/.X11-unix")) {
+    if covered_by_grant(policy, Path::new("/tmp/.X11-unix"))
+        || connect_beneath(policy, Path::new("/tmp/.X11-unix"))
+    {
         insert_from_caller(&mut env, X11_VARS);
     }
 
@@ -384,6 +388,17 @@ fn covered_by_grant(policy: &Policy, path: &Path) -> bool {
         .flatten()
         .chain(policy.devices.iter().map(|rule| rule.path.as_path()))
         .any(|granted| path.starts_with(granted))
+}
+
+/// Whether a `connect` entry names a socket beneath `dir`.
+///
+/// A connect entry is not a grant on the directory itself: it names a socket,
+/// and only the variables that point programs at sockets in `dir` follow from
+/// it.
+fn connect_beneath(policy: &Policy, dir: &Path) -> bool {
+    policy.filesystem.iter().any(|rule| {
+        rule.access.contains(crate::policy::Access::CONNECT) && rule.path.starts_with(dir)
+    })
 }
 
 /// The user's home directory, when there is one a sandbox can use.

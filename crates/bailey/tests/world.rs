@@ -413,3 +413,98 @@ fn a_grant_relocated_out_of_tmp_keeps_the_private_tmp() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// A `connect` entry beneath the session runtime directory carries the
+/// variables that point programs at sockets there, even though the directory
+/// itself stays ungranted.
+#[test]
+fn a_connect_entry_beneath_the_runtime_dir_passes_its_variables() {
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    let config = dir.path().join("bailey.toml");
+    fs::write(
+        &config,
+        format!(
+            "[filesystem]\nconnect = [\"{}/pulse/native\"]\n",
+            runtime.path().display()
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(bailey())
+        .args(["run", "--config", config.to_str().unwrap(), "/usr/bin/env"])
+        .env("XDG_DATA_HOME", dir.path())
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .env("WAYLAND_DISPLAY", "wayland-1")
+        .output()
+        .unwrap();
+
+    let env = stdout_of(&output);
+    assert!(
+        env.contains(&format!("XDG_RUNTIME_DIR={}", runtime.path().display())),
+        "the runtime directory variable must follow a connect entry beneath it:\n{env}"
+    );
+    assert!(
+        env.contains("WAYLAND_DISPLAY=wayland-1"),
+        "the display variable must follow a connect entry beneath the runtime dir:\n{env}"
+    );
+}
+
+#[test]
+fn a_connect_entry_beneath_the_x11_dir_passes_display() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("bailey.toml");
+    fs::write(&config, "[filesystem]\nconnect = [\"/tmp/.X11-unix/X0\"]\n").unwrap();
+
+    let output = Command::new(bailey())
+        .args(["run", "--config", config.to_str().unwrap(), "/usr/bin/env"])
+        .env("XDG_DATA_HOME", dir.path())
+        .env("DISPLAY", ":99")
+        .output()
+        .unwrap();
+
+    let env = stdout_of(&output);
+    assert!(
+        env.contains("DISPLAY=:99"),
+        "the display variable must follow a connect entry on the X11 socket dir:\n{env}"
+    );
+}
+
+/// An unrelated connect entry carries no variables: the run was given a
+/// socket, not a session.
+#[test]
+fn an_unrelated_connect_entry_passes_no_session_variables() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("bailey.toml");
+    fs::write(
+        &config,
+        format!(
+            "[filesystem]\nconnect = [\"{}/srv.sock\"]\n",
+            dir.path().display()
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(bailey())
+        .args(["run", "--config", config.to_str().unwrap(), "/usr/bin/env"])
+        .env("XDG_DATA_HOME", dir.path())
+        .env("XDG_RUNTIME_DIR", dir.path().join("runtime"))
+        .env("WAYLAND_DISPLAY", "wayland-1")
+        .env("DISPLAY", ":99")
+        .output()
+        .unwrap();
+
+    let env = stdout_of(&output);
+    assert!(
+        !env.contains("WAYLAND_DISPLAY"),
+        "an unrelated connect entry must not pass the wayland variable:\n{env}"
+    );
+    assert!(
+        !env.contains("DISPLAY="),
+        "an unrelated connect entry must not pass the display variable:\n{env}"
+    );
+    assert!(
+        !env.contains("XDG_RUNTIME_DIR="),
+        "an unrelated connect entry must not pass the runtime directory:\n{env}"
+    );
+}

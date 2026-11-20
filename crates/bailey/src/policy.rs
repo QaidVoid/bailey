@@ -20,6 +20,15 @@ bitflags! {
         const WRITE = 0b010;
         /// Permission to execute.
         const EXECUTE = 0b100;
+        /// Permission to connect to a pathname UNIX socket.
+        ///
+        /// It is its own grant, never implied by `READ` or `WRITE`: a
+        /// pathname socket is a door into another program, and reaching a
+        /// directory is not the same as being allowed to knock on every door
+        /// in it. Nothing grants it except a `connect` entry, a relay bailey
+        /// sets up, or a literal directory entry naming a directory of
+        /// sockets.
+        const CONNECT = 0b1000;
     }
 }
 

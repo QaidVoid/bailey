@@ -31,9 +31,10 @@ that, it has to be granted.
 
 Additive over the floor, for a native Linux game. Fonts, icons, and the Vulkan
 and GLVND data; write access to your own session runtime directory, which is
-where the compositor and audio sockets live; the render nodes under `/dev/dri`
-and the NVIDIA device nodes for the proprietary driver; `/dev/snd`; and
-`/dev/input` for controllers.
+where the compositor and audio sockets live; the compositor and audio sockets
+themselves, named in the profile's `connect` list; the render nodes under
+`/dev/dri` and the NVIDIA device nodes for the proprietary driver; `/dev/snd`;
+and `/dev/input` for controllers.
 
 ```sh
 bailey profile show native-game
@@ -58,6 +59,13 @@ you can identify it.
 Display, audio, fonts, icons, and your session's runtime directory, with no
 controllers and no direct GPU nodes beyond rendering. The right base for an
 ordinary graphical application.
+
+The compositor and audio sockets are named one by one in the profile's
+`connect` list, since on a kernel with Landlock ABI 9 a directory grant no
+longer connects to the sockets in it. The session bus is deliberately absent:
+through it a program can ask `systemd --user` to start a process outside any
+sandbox. The profile's comment carries the one line that adds it back, for a
+program that cannot work without the bus.
 
 ## `ai-agent`
 

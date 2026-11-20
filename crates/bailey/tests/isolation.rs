@@ -946,3 +946,124 @@ fn mounting_stays_refused_without_self_fuse() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// A connect entry places exactly one socket in the reconstructed root: the
+/// listed one is connectable, and the runtime directory around it carries
+/// nothing else. This is the placement the desktop profiles depend on.
+#[test]
+fn a_connect_entry_binds_its_socket_and_nothing_else() {
+    if !isolation_active() {
+        common::skip("isolation unavailable on this host");
+        return;
+    }
+    if !bailey::backend::probe::landlock_abi().is_some_and(|abi| abi >= 9) {
+        common::skip("socket connect control needs Landlock ABI 9");
+        return;
+    }
+    if !Path::new("/usr/bin/python3").exists() && !Path::new("/bin/python3").exists() {
+        common::skip("python3 unavailable");
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    let listed = runtime.path().join("pulse/native");
+    let unlisted = runtime.path().join("bus");
+    for socket in [&listed, &unlisted] {
+        if let Some(parent) = socket.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+    }
+    let mut listeners = Vec::new();
+    let listener_program = |socket: &Path| {
+        format!(
+            "import socket\n\
+             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n\
+             s.bind('{path}')\n\
+             s.listen(8)\n\
+             print('ready', flush=True)\n\
+             while True:\n\
+             \x20   try:\n\
+             \x20       conn, _ = s.accept()\n\
+             \x20       conn.sendall(b'pong')\n\
+             \x20   except OSError:\n\
+             \x20       pass\n",
+            path = socket.display()
+        )
+    };
+    for socket in [&listed, &unlisted] {
+        let mut child = Command::new("/usr/bin/python3")
+            .arg("-c")
+            .arg(listener_program(socket))
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::BufRead;
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        listeners.push(child);
+    }
+
+    let config = dir.path().join("bailey.toml");
+    fs::write(
+        &config,
+        format!(
+            "[filesystem]\nconnect = [\"{listed}\"]\n",
+            listed = listed.display()
+        ),
+    )
+    .unwrap();
+
+    let probe = format!(
+        "import os, socket\n\
+         for name in ['pulse/native', 'bus']:\n\
+         \x20   try:\n\
+         \x20       c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n\
+         \x20       c.connect(os.path.join({rt:?}, name))\n\
+         \x20       c.recv(4)\n\
+         \x20       print(name, 'ok')\n\
+         \x20   except OSError:\n\
+         \x20       print(name, 'no')\n\
+         print('listed-exists:', os.path.exists({rt:?} + '/pulse/native'))\n\
+         print('bus-exists:', os.path.exists({rt:?} + '/bus'))\n",
+        rt = runtime.path()
+    );
+    let output = Command::new(bailey())
+        .args(["run", "-c"])
+        .arg(&config)
+        .current_dir(dir.path())
+        .env("XDG_RUNTIME_DIR", runtime.path())
+        .arg("/usr/bin/python3")
+        .arg("-c")
+        .arg(&probe)
+        .output()
+        .unwrap();
+    for mut child in listeners.drain(..) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("pulse/native ok"),
+        "the listed socket must be connectable: {stdout}"
+    );
+    assert!(
+        stdout.contains("bus no"),
+        "the unlisted socket must be refused: {stdout}"
+    );
+    assert!(
+        stdout.contains("listed-exists: True"),
+        "the listed socket must be the only thing placed in the runtime directory: {stdout}"
+    );
+    assert!(
+        stdout.contains("bus-exists: False"),
+        "the unlisted socket must not be visible in the runtime directory: {stdout}"
+    );
+}

@@ -54,6 +54,18 @@ use crate::strings::quoted as json_string;
 /// change how a policy's grants are interpreted.
 const TARGET_ABI: ABI = ABI::V6;
 
+/// The Landlock ABI that carries the socket connect right, newer than
+/// everything else the policy uses.
+pub(crate) const ABI_SOCKET_CONNECT: u32 = 9;
+
+/// Why socket connect control is skipped, on a kernel older than ABI 9.
+///
+/// The run summary and `bailey doctor` say the same thing, so the wording is
+/// one constant: what the kernel lacks, and what that means for every policy
+/// written for the connect list.
+pub(crate) const CONNECT_SKIP_REASON: &str = "needs Landlock ABI 9 (Linux 7.1); any socket the target can reach by path \
+     can be connected to";
+
 /// Prefix of the host-visible directory a reconstructed root is staged in.
 const STAGING_PREFIX: &str = ".bailey-root.";
 
@@ -328,6 +340,24 @@ impl EnforceBackend {
                 "self_fuse keeps the mount power a Landlock domain would remove",
             ),
             None => report.skipped("landlock", "the kernel does not provide Landlock"),
+        }
+        // Named with a count so a run that lists three sockets reads
+        // differently from one that lists none: the count is what tells a
+        // broken config (zero where the display should be) from an enforcing
+        // one.
+        let listed_connect = policy
+            .filesystem
+            .iter()
+            .filter(|rule| rule.access.contains(policy::Access::CONNECT))
+            .count();
+        let socket_connect_abi =
+            crate::backend::probe::landlock_abi().is_some_and(|abi| abi >= ABI_SOCKET_CONNECT);
+        if listed_connect > 0 {
+            if socket_connect_abi {
+                report.applied(&format!("unix socket connect ({listed_connect} listed)"));
+            } else {
+                report.skipped("socket connect control", CONNECT_SKIP_REASON);
+            }
         }
         report.applied("seccomp");
         if policy.self_fuse {
@@ -865,7 +895,13 @@ fn policy_with_relays(policy: &Policy, relays: &[relay::Relay]) -> Policy {
         .filesystem
         .extend(relays.iter().map(|relay| FsRule {
             path: relay.listener_path.clone(),
-            access: policy::Access::READ | policy::Access::WRITE | policy::Access::EXECUTE,
+            // Connecting to the relay is what the relay exists for, and the
+            // socket connect right is its own grant on a Landlock ABI 9
+            // kernel, so read and write alone would refuse the handshake.
+            access: policy::Access::READ
+                | policy::Access::WRITE
+                | policy::Access::EXECUTE
+                | policy::Access::CONNECT,
             at: Some(relay.at.clone()),
         }));
     extended
@@ -975,6 +1011,9 @@ fn open_grant(path: &Path) -> io::Result<OwnedFd> {
 struct LandlockPlan {
     filesystem: Vec<(PathBuf, BitFlags<AccessFs>)>,
     handle_connect: bool,
+    /// Whether any rule grants the socket-connect right, which decides
+    /// whether the ruleset handles it at all.
+    socket_connect: bool,
     handle_bind: bool,
     connect_ports: Vec<u16>,
     bind_ports: Vec<u16>,
@@ -991,7 +1030,9 @@ impl LandlockPlan {
     /// own, which decides whether a bound port can be connected to.
     fn build(policy: &Policy, relocates: bool, isolates_network: bool) -> Self {
         let mut filesystem = Vec::new();
+        let mut socket_connect = false;
         for rule in &policy.filesystem {
+            socket_connect |= rule.access.contains(policy::Access::CONNECT);
             if let Some(bits) = fs_access_bits(rule.access) {
                 // The path as the target sees it. Landlock is applied after the
                 // pivot, so a relocated hierarchy must be named where it ended
@@ -1036,6 +1077,7 @@ impl LandlockPlan {
         Self {
             filesystem,
             handle_connect,
+            socket_connect,
             handle_bind,
             connect_ports,
             bind_ports: policy.network.bind_ports.clone(),
@@ -1082,6 +1124,15 @@ impl LandlockPlan {
         let mut ruleset = Ruleset::default()
             .set_compatibility(CompatLevel::BestEffort)
             .handle_access(AccessFs::from_all(TARGET_ABI))
+            .map_err(landlock_err)?;
+        // The socket connect right arrived in ABI v9, after everything else
+        // the policy uses, so it is handled beside the rest: without it the
+        // kernel restricts no pathname socket at all, and an unlisted socket
+        // would be reachable through any granted directory. On a kernel
+        // without the right, best-effort drops it, and the warning below says
+        // so rather than letting a connect list quietly turn decorative.
+        ruleset = ruleset
+            .handle_access(AccessFs::ResolveUnix)
             .map_err(landlock_err)?;
         if !net.is_empty() {
             ruleset = ruleset.handle_access(net).map_err(landlock_err)?;
@@ -1142,6 +1193,19 @@ impl LandlockPlan {
                 "bailey: warning: this kernel speaks Landlock ABI {current}, and the policy is \
                  written for {}, so the rights added after it are not enforced",
                 TARGET_ABI as u32
+            );
+        }
+        // Socket connect is newer than everything else the policy asks for, so
+        // a kernel between ABI 6 and 8 enforces the rest of the policy exactly
+        // while every connect listed is allowed. Saying so is the difference
+        // between a degraded run and a silently open one.
+        if self.socket_connect
+            && crate::backend::probe::landlock_abi().is_some_and(|abi| abi < ABI_SOCKET_CONNECT)
+        {
+            eprintln!(
+                "bailey: warning: connecting to UNIX sockets is not restricted on this \
+                 kernel: the socket connect right needs Landlock ABI 9, so every entry \
+                 in the connect list is allowed"
             );
         }
         Ok(())
@@ -1676,6 +1740,12 @@ fn fs_access_bits(access: policy::Access) -> Option<BitFlags<AccessFs>> {
     if access.contains(policy::Access::EXECUTE) {
         bits |= AccessFs::Execute;
     }
+    // Socket connect is the ABI v9 right, so naming it here is what keeps a
+    // `connect` grant from being folded into a read or write grant, which
+    // would hand every socket in the hierarchy to any granted path.
+    if access.contains(policy::Access::CONNECT) {
+        bits |= AccessFs::ResolveUnix;
+    }
     if bits.is_empty() { None } else { Some(bits) }
 }
 
@@ -1756,6 +1826,47 @@ fn report_degradation(policy: &Policy) {
         eprintln!(
             "bailey: warning: host-based egress rules are not enforced by Landlock; \
                  outbound access is limited by TCP port only"
+        );
+    }
+    note_runtime_dir_grant(policy);
+}
+
+/// The note for a policy that grants the session runtime directory without
+/// listing any socket in it.
+///
+/// Before socket connect had its own right, a read grant on the runtime
+/// directory was how a target reached the compositor and audio. On a kernel
+/// with Landlock ABI 9 that grant no longer connects, so a policy written the
+/// old way silently loses the display. One line says what changed and what to
+/// write instead, on a kernel where it applies.
+fn note_runtime_dir_grant(policy: &Policy) {
+    let Some(abi) = crate::backend::probe::landlock_abi() else {
+        return;
+    };
+    if abi < ABI_SOCKET_CONNECT {
+        return;
+    }
+    let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") else {
+        return;
+    };
+    let runtime = PathBuf::from(runtime);
+    if !runtime.is_absolute() {
+        return;
+    }
+    let covered = policy.filesystem.iter().any(|rule| {
+        rule.access
+            .intersects(policy::Access::READ | policy::Access::WRITE)
+            && runtime.starts_with(&rule.path)
+    });
+    let listed = policy.filesystem.iter().any(|rule| {
+        rule.access.contains(policy::Access::CONNECT) && rule.path.starts_with(&runtime)
+    });
+    if covered && !listed {
+        eprintln!(
+            "bailey: note: the runtime directory {} is granted, and on this kernel \
+             its service sockets need a `connect` entry to be connectable; none \
+             beneath it is listed",
+            runtime.display()
         );
     }
 }
@@ -2433,6 +2544,21 @@ mod tests {
     use std::collections::BTreeSet;
     use std::io::Write as _;
 
+    /// The skip reason is the one place a user learns what an older kernel
+    /// costs a connect-list policy, so it must say both the requirement and
+    /// the consequence.
+    #[test]
+    fn the_connect_skip_reason_names_the_kernel_and_the_cost() {
+        assert!(
+            CONNECT_SKIP_REASON.contains("ABI 9"),
+            "the reason must name the ABI: {CONNECT_SKIP_REASON}"
+        );
+        assert!(
+            CONNECT_SKIP_REASON.contains("can be connected to"),
+            "the reason must say what the policy loses: {CONNECT_SKIP_REASON}"
+        );
+    }
+
     /// Report a unit test as skipped and record the skip where CI asks for
     /// it, mirroring `tests/common/mod.rs`: the same printed line, the same
     /// log line, with the thread's module path as the test's name.
@@ -2549,6 +2675,77 @@ mod tests {
         assert!(!exec.contains(AccessFs::ReadFile));
 
         assert!(fs_access_bits(Access::empty()).is_none());
+    }
+
+    /// Walking every combination of access bits, the socket connect right
+    /// appears exactly where `Access::CONNECT` is set. Read or write on a
+    /// hierarchy must never read as the right to connect to the sockets in
+    /// it, and connect must never arrive unasked.
+    #[test]
+    fn the_connect_right_appears_only_where_connect_is_set() {
+        let bits = [
+            Access::READ,
+            Access::WRITE,
+            Access::EXECUTE,
+            Access::CONNECT,
+        ];
+        for mask in 0..(1 << bits.len()) {
+            let access = bits
+                .iter()
+                .enumerate()
+                .filter(|(position, _)| mask & (1 << position) != 0)
+                .map(|(_, bit)| *bit)
+                .fold(Access::empty(), |acc, bit| acc | bit);
+            let mapped = fs_access_bits(access);
+            match (access.contains(Access::CONNECT), mapped) {
+                (true, Some(mapped)) => {
+                    assert!(
+                        mapped.contains(AccessFs::ResolveUnix),
+                        "`{access:?}` must carry the socket connect right"
+                    );
+                    let without = mapped & !AccessFs::ResolveUnix;
+                    // Everything else the entry grants must survive the
+                    // mapping: connect adds a bit, it does not replace any.
+                    // A connect-only entry maps to the connect right alone.
+                    let expected = fs_access_bits(access - Access::CONNECT).unwrap_or_default();
+                    assert_eq!(
+                        without, expected,
+                        "`{access:?}` must map to its other rights plus connect, nothing else"
+                    );
+                }
+                (true, None) => {
+                    panic!("a connect-only grant must map to the connect right");
+                }
+                (false, Some(mapped)) => {
+                    assert!(
+                        !mapped.contains(AccessFs::ResolveUnix),
+                        "`{access:?}` must not carry the socket connect right"
+                    );
+                }
+                (false, None) => {}
+            }
+        }
+
+        // The areas the sandbox provides on its own behalf are never
+        // connectable: nothing the target talks to through them is a socket
+        // bailey did not put there itself, and the relays carry their own
+        // connect grant.
+        let world = World::derive(Path::new("/bin/true"), &Policy::default(), false);
+        let mut plan = LandlockPlan {
+            filesystem: Vec::new(),
+            handle_connect: false,
+            socket_connect: false,
+            handle_bind: false,
+            connect_ports: Vec::new(),
+            bind_ports: Vec::new(),
+        };
+        plan.add_world_grants(&world);
+        assert!(
+            plan.filesystem
+                .iter()
+                .all(|(_, access)| !access.contains(AccessFs::ResolveUnix)),
+            "world grants must never carry the socket connect right"
+        );
     }
 
     /// The areas the sandbox provides are granted for reading and writing,
@@ -2866,7 +3063,7 @@ mod tests {
                 }
                 // `pthread_t` is a pointer on musl and an integer on glibc, so
                 // it is zeroed rather than assigned a number.
-                let mut tid: libc::pthread_t = unsafe { std::mem::zeroed() };
+                let mut tid: libc::pthread_t = std::mem::zeroed();
                 if libc::pthread_create(
                     &mut tid,
                     std::ptr::null(),

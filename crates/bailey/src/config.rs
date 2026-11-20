@@ -309,6 +309,11 @@ struct RawFs {
     write: Vec<RawGrant>,
     #[serde(default)]
     execute: Vec<RawGrant>,
+    /// Pathname UNIX sockets, or literal directories of them, the target may
+    /// connect to. Expanded more strictly than the other grants, because a
+    /// widened result here is a door into another program.
+    #[serde(default)]
+    connect: Vec<String>,
     #[serde(default)]
     deny: Vec<String>,
     #[serde(default)]
@@ -539,6 +544,20 @@ fn apply_layer(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> 
                 relocated.insert(at, path.clone());
             }
             *granted.entry(path).or_insert(Access::empty()) |= access;
+        }
+    }
+    for raw in &fs.connect {
+        match expand_connect_entry(raw, &layer.base) {
+            Ok(path) => {
+                *granted.entry(path).or_insert(Access::empty()) |= Access::CONNECT;
+            }
+            Err(reason) => {
+                // A dropped entry is a warning rather than an error: a
+                // missing display variable, common under ssh or on a TTY
+                // login, must not turn a profile that does not need the
+                // display for its work into a refused run.
+                eprintln!("bailey: warning: dropping `connect` entry `{raw}`: {reason}");
+            }
         }
     }
     for raw in &fs.deny {
@@ -995,16 +1014,16 @@ fn finalize(mut acc: Accumulator) -> Result<Resolved, ConfigError> {
     // nothing for it to stand in for, and it would never apply on any host,
     // so a config carrying one is a mistake to name rather than a key to
     // ignore.
-    if let Some(source) = &acc.address_space_source {
-        if acc.resources.memory_bytes.is_none() {
-            return Err(ConfigError::Invalid {
-                path: source.clone(),
-                reason: "`address_space` is a fallback for `memory`, and no \
-                         layer sets `memory`, so it could never apply. Set \
-                         `memory`, or drop `address_space`"
-                    .to_owned(),
-            });
-        }
+    if let Some(source) = &acc.address_space_source
+        && acc.resources.memory_bytes.is_none()
+    {
+        return Err(ConfigError::Invalid {
+            path: source.clone(),
+            reason: "`address_space` is a fallback for `memory`, and no \
+                     layer sets `memory`, so it could never apply. Set \
+                     `memory`, or drop `address_space`"
+                .to_owned(),
+        });
     }
 
     let relocated = acc.relocated;
@@ -1089,6 +1108,100 @@ fn build_egress(network: &RawNetwork, path: &Path) -> Result<Egress, ConfigError
     } else {
         Ok(Egress::DenyAll)
     }
+}
+
+/// Resolve one `connect` entry, under the stricter rules a socket grant needs.
+///
+/// A widened `connect` entry is a door into another program, so this is
+/// deliberately narrower than [`resolve_path`]:
+/// - A variable that is unset, or set to the empty string, is an error rather
+///   than a path that matches nothing.
+/// - A variable whose value is absolute replaces everything to its left, the
+///   way joining an absolute component does. Wayland defines an absolute
+///   `WAYLAND_DISPLAY`, so the profile templates stay correct for a
+///   compositor that sets one.
+/// - An entry that used a variable and resolves to an existing directory is
+///   an error: the variable was meant to name a socket, and a directory there
+///   would make every socket beneath it connectable.
+/// - An entry that resolves to the session runtime directory, to an ancestor
+///   of it, or to `/` is an error whether or not it used a variable. Those
+///   are the directories whose sockets the connect list exists to separate.
+///
+/// A literal directory entry is fine and covers every socket beneath it, and
+/// a path that does not exist yet is kept, to be skipped at enforcement like
+/// any missing grant. The directory check is a `stat` against the host now.
+pub(crate) fn expand_connect_entry(raw: &str, base: &Path) -> Result<PathBuf, String> {
+    let mut out = String::new();
+    let mut rest = raw;
+    let mut used_variable = false;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            out.push_str(&rest[start..]);
+            break;
+        };
+        let name = &after[..end];
+        let value = match std::env::var_os(name) {
+            Some(value) => value.to_string_lossy().into_owned(),
+            // `${PWD}` names the directory the run was launched from, for the
+            // same reason resolve_path falls back to asking the kernel.
+            None if name == "PWD" => match std::env::current_dir() {
+                Ok(cwd) => cwd.to_string_lossy().into_owned(),
+                Err(_) => {
+                    return Err(format!("variable `${{{name}}}` is not set"));
+                }
+            },
+            None => {
+                return Err(format!(
+                    "variable `${{{name}}}` is not set, and a connect entry \
+                     must name a socket"
+                ));
+            }
+        };
+        if value.is_empty() {
+            return Err(format!(
+                "variable `${{{name}}}` is empty, and a connect entry must \
+                 name a socket"
+            ));
+        }
+        used_variable = true;
+        if value.starts_with('/') {
+            out.clear();
+        }
+        out.push_str(&value);
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    if out.trim().is_empty() {
+        return Err("expands to nothing".to_owned());
+    }
+    let expanded = expand_tilde(&out);
+    let joined = if expanded.is_absolute() {
+        expanded
+    } else {
+        base.join(expanded)
+    };
+    let path = normalize_lexical(&joined);
+    if used_variable && path.is_dir() {
+        return Err(format!(
+            "resolves to the directory {}, and a variable there is meant to \
+             name a socket; a directory would make every socket beneath it \
+             connectable",
+            path.display()
+        ));
+    }
+    if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR")
+        && Path::new(&runtime).is_absolute()
+        && Path::new(&runtime).starts_with(&path)
+    {
+        return Err(
+            "would make the session runtime directory, or an ancestor of it, \
+             connectable; connect there is granted socket by socket"
+                .to_owned(),
+        );
+    }
+    Ok(path)
 }
 
 fn parse_layer(label: &str, text: &str, base: &Path) -> Result<Layer, ConfigError> {
@@ -1623,6 +1736,168 @@ mod tests {
         let resolved = merge(&layers).unwrap();
         assert!(resolved.policy.filesystem.is_empty());
         assert_eq!(resolved.policy.denied, vec![PathBuf::from("/a")]);
+    }
+
+    /// A `connect` entry is its own grant: read on a directory never reads as
+    /// the right to talk to the sockets in it.
+    #[test]
+    fn a_connect_entry_grants_the_connect_right_alone() {
+        let layers = [layer(
+            "/base",
+            "[filesystem]\nconnect = [\"/tmp/srv.sock\"]",
+        )];
+        let resolved = merge(&layers).unwrap();
+        assert_eq!(resolved.policy.filesystem.len(), 1);
+        assert_eq!(
+            resolved.policy.filesystem[0].path,
+            PathBuf::from("/tmp/srv.sock")
+        );
+        assert_eq!(resolved.policy.filesystem[0].access, Access::CONNECT);
+    }
+
+    #[test]
+    fn a_path_written_and_connectable_carries_both_bits() {
+        let layers = [layer(
+            "/base",
+            "[filesystem]\nwrite = [\"/x\"]\nconnect = [\"/x\"]",
+        )];
+        let resolved = merge(&layers).unwrap();
+        assert_eq!(resolved.policy.filesystem.len(), 1);
+        assert_eq!(
+            resolved.policy.filesystem[0].access,
+            Access::WRITE | Access::CONNECT
+        );
+    }
+
+    #[test]
+    fn an_exact_deny_retracts_a_connect_grant() {
+        let layers = [
+            layer("/base", "[filesystem]\nconnect = [\"/s\"]"),
+            layer("/base", "[filesystem]\ndeny = [\"/s\"]"),
+        ];
+        let resolved = merge(&layers).unwrap();
+        assert!(resolved.policy.filesystem.is_empty());
+    }
+
+    #[test]
+    fn a_reset_clears_connect_grants() {
+        let layers = [
+            layer("/base", "[filesystem]\nconnect = [\"/s\"]"),
+            layer("/base", "[filesystem]\nreset = true\nread = [\"/keep\"]"),
+        ];
+        let resolved = merge(&layers).unwrap();
+        assert_eq!(
+            resolved
+                .policy
+                .filesystem
+                .iter()
+                .map(|rule| rule.path.clone())
+                .collect::<Vec<_>>(),
+            vec![PathBuf::from("/keep")]
+        );
+    }
+
+    #[test]
+    fn a_connect_entry_on_a_relative_path_resolves_against_the_layer() {
+        let layers = [layer("/base", "[filesystem]\nconnect = [\"run.sock\"]")];
+        let resolved = merge(&layers).unwrap();
+        assert_eq!(
+            resolved.policy.filesystem[0].path,
+            PathBuf::from("/base/run.sock")
+        );
+    }
+
+    #[test]
+    fn a_connect_entry_in_the_same_layer_as_its_deny_is_refused() {
+        let layers = [layer(
+            "/base",
+            "[filesystem]\nconnect = [\"/s\"]\ndeny = [\"/s\"]",
+        )];
+        assert!(merge(&layers).is_err());
+    }
+
+    /// The Wayland template is the entry every shared profile will carry, so
+    /// every shape the compositor's environment can give it must end in a
+    /// grant that names the socket, never the runtime directory or anything
+    /// above it. An unset or empty variable, an absolute value, and a name
+    /// that turns out to be a directory are all shapes a real session has.
+    #[test]
+    fn the_wayland_template_never_grants_above_the_socket() {
+        let runtime = tempfile::tempdir().unwrap();
+        let rt = runtime.path();
+        fs::create_dir(rt.join("sub")).unwrap();
+        // SAFETY: test-only process-global state; no other test in this
+        // binary reads these two names.
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", rt) };
+
+        let cases: [(&str, Option<&str>); 5] = [
+            ("unset", None),
+            ("empty", Some("")),
+            ("a socket name", Some("wayland-1")),
+            ("an absolute path", Some("/elsewhere/absolute-wayland-1")),
+            ("a directory name", Some("sub")),
+        ];
+        for (what, display) in cases {
+            match display {
+                Some(value) => unsafe { std::env::set_var("WAYLAND_DISPLAY", value) },
+                None => unsafe { std::env::remove_var("WAYLAND_DISPLAY") },
+            }
+            let layers = [layer(
+                "/base",
+                "[filesystem]\nconnect = [\"${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}\"]",
+            )];
+            let resolved = merge(&layers).unwrap();
+
+            // Whatever the entry became, the runtime directory itself and
+            // every directory above it are never among the grants. The socket
+            // sits inside the runtime directory, so grants beneath it are the
+            // point.
+            for rule in &resolved.policy.filesystem {
+                assert_ne!(
+                    rule.path, rt,
+                    "{what}: the runtime directory itself must not be connectable"
+                );
+                assert!(
+                    !rt.starts_with(&rule.path),
+                    "{what}: a grant reached above the socket: {}",
+                    rule.path.display()
+                );
+                assert_ne!(
+                    rule.path,
+                    rt.join("sub"),
+                    "{what}: the variable named a directory and a grant was made on it"
+                );
+            }
+            match display {
+                // A dropped entry grants nothing: the run proceeds without the
+                // display rather than with everything around it.
+                None | Some("") | Some("sub") => {
+                    assert!(
+                        resolved.policy.filesystem.is_empty(),
+                        "{what}: the entry must be dropped, not widened: {:?}",
+                        resolved.policy.filesystem
+                    );
+                }
+                Some("wayland-1") => {
+                    assert_eq!(
+                        resolved.policy.filesystem[0].path,
+                        rt.join("wayland-1"),
+                        "{what}: the socket path is what gets the grant"
+                    );
+                    assert_eq!(resolved.policy.filesystem[0].access, Access::CONNECT);
+                }
+                Some("/elsewhere/absolute-wayland-1") => {
+                    assert_eq!(
+                        resolved.policy.filesystem[0].path,
+                        PathBuf::from("/elsewhere/absolute-wayland-1"),
+                        "{what}: an absolute value replaces the runtime prefix"
+                    );
+                }
+                other => unreachable!("unhandled case {other:?}"),
+            }
+        }
+        unsafe { std::env::remove_var("WAYLAND_DISPLAY") };
+        unsafe { std::env::remove_var("XDG_RUNTIME_DIR") };
     }
 
     #[test]

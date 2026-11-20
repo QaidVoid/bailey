@@ -20,6 +20,19 @@ read = [
     "/usr/share/mime",
     "/usr/share/applications",
 ]
+connect = [
+    # Display and audio. On a kernel with Landlock ABI 9 a directory grant
+    # alone no longer connects, so the sockets a desktop program talks to are
+    # listed here, one by one.
+    "${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}",
+    "${XDG_RUNTIME_DIR}/pulse/native",
+    "${XDG_RUNTIME_DIR}/pipewire-0",
+    # The session bus is deliberately absent: through it a target can ask
+    # systemd --user to start a process outside any sandbox. A program that
+    # needs the bus gets exactly that back by adding one line, and accepts
+    # what it costs:
+    # "${XDG_RUNTIME_DIR}/bus",
+]
 
 [[device]]
 path = "/dev/dri"

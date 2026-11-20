@@ -1295,3 +1295,394 @@ fn proxy_net_occupied_publication_fails_before_hooks_or_target() {
         "failed publication left the free port accepting connections"
     );
 }
+
+/// The host process that listens on the pathname socket a connect test aims
+/// at. It must live outside the run: a socket the target's own domain created
+/// is reachable by construction, so the listener proves the grant is what
+/// opened the door.
+fn spawn_listener(socket: &Path) -> std::process::Child {
+    use std::io::{BufRead, BufReader};
+    let program = format!(
+        "import socket\n\
+         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n\
+         s.bind('{path}')\n\
+         s.listen(8)\n\
+         print('ready', flush=True)\n\
+         while True:\n\
+         \x20   try:\n\
+         \x20       conn, _ = s.accept()\n\
+         \x20       conn.sendall(b'pong')\n\
+         \x20   except OSError:\n\
+         \x20       pass\n",
+        path = socket.display()
+    );
+    let mut child = Command::new(python().unwrap())
+        .arg("-c")
+        .arg(&program)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut line = String::new();
+    BufReader::new(stdout)
+        .read_line(&mut line)
+        .expect("the listener must announce itself");
+    assert_eq!(line.trim(), "ready", "the listener must be ready");
+    child
+}
+
+/// The socket connect right arrived in Landlock ABI 9; below it the kernel
+/// enforces no pathname socket restriction and the policy cannot hold.
+fn connect_enforced() -> bool {
+    bailey::backend::probe::landlock_abi().is_some_and(|abi| abi >= 9)
+}
+
+#[test]
+fn an_unlisted_socket_in_a_writable_grant_is_refused() {
+    if python().is_none() {
+        common::skip("needs python3");
+        return;
+    }
+    if !connect_enforced() {
+        common::skip("socket connect control needs Landlock ABI 9");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("srv.sock");
+    let mut listener = spawn_listener(&socket);
+    let program = format!(
+        "import socket\n\
+         try:\n\
+         \x20   c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n\
+         \x20   c.connect('{path}')\n\
+         \x20   print(c.recv(4))\n\
+         except OSError:\n\
+         \x20   print('refused')\n",
+        path = socket.display()
+    );
+    let output = run_python(
+        &format!("[filesystem]\nwrite = [\"{}\"]\n", dir.path().display()),
+        &program,
+    );
+    listener.kill().unwrap();
+    listener.wait().unwrap();
+    assert_eq!(
+        stdout_of(&output),
+        "refused",
+        "write on the directory must not read as the right to connect to the socket in it"
+    );
+}
+
+#[test]
+fn a_listed_socket_connects() {
+    if python().is_none() {
+        common::skip("needs python3");
+        return;
+    }
+    if !connect_enforced() {
+        common::skip("socket connect control needs Landlock ABI 9");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("srv.sock");
+    let mut listener = spawn_listener(&socket);
+    let program = format!(
+        "import socket\n\
+         try:\n\
+         \x20   c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n\
+         \x20   c.connect('{path}')\n\
+         \x20   print(c.recv(4))\n\
+         except OSError:\n\
+         \x20   print('refused')\n",
+        path = socket.display()
+    );
+    let output = run_python(
+        &format!(
+            "[filesystem]\nwrite = [\"{dir}\"]\nconnect = [\"{sock}\"]\n",
+            dir = dir.path().display(),
+            sock = socket.display()
+        ),
+        &program,
+    );
+    listener.kill().unwrap();
+    listener.wait().unwrap();
+    assert_eq!(
+        stdout_of(&output),
+        "b'pong'",
+        "a listed socket must be connectable through the grant"
+    );
+}
+
+#[test]
+fn an_unlisted_socket_is_refused_without_isolation_too() {
+    if python().is_none() {
+        common::skip("needs python3");
+        return;
+    }
+    if !connect_enforced() {
+        common::skip("socket connect control needs Landlock ABI 9");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("srv.sock");
+    let mut listener = spawn_listener(&socket);
+    let program = format!(
+        "import socket\n\
+         try:\n\
+         \x20   c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n\
+         \x20   c.connect('{path}')\n\
+         \x20   print('connected')\n\
+         except OSError:\n\
+         \x20   print('refused')\n",
+        path = socket.display()
+    );
+    let output = run_python_with_args(
+        &format!("[filesystem]\nwrite = [\"{}\"]\n", dir.path().display()),
+        &program,
+        &["--no-isolate"],
+    );
+    listener.kill().unwrap();
+    listener.wait().unwrap();
+    assert_eq!(
+        stdout_of(&output),
+        "refused",
+        "the connect list must hold with Landlock alone, no namespaces needed"
+    );
+}
+
+#[test]
+fn a_datagram_to_an_unlisted_socket_is_refused() {
+    if python().is_none() {
+        common::skip("needs python3");
+        return;
+    }
+    if !connect_enforced() {
+        common::skip("socket connect control needs Landlock ABI 9");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("srv.sock");
+    let mut listener = spawn_listener(&socket);
+    let program = format!(
+        "import socket\n\
+         s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)\n\
+         try:\n\
+         \x20   s.sendto(b'x', '{path}')\n\
+         \x20   print('sent')\n\
+         except OSError:\n\
+         \x20   print('refused')\n",
+        path = socket.display()
+    );
+    let output = run_python(
+        &format!("[filesystem]\nwrite = [\"{}\"]\n", dir.path().display()),
+        &program,
+    );
+    listener.kill().unwrap();
+    listener.wait().unwrap();
+    assert_eq!(
+        stdout_of(&output),
+        "refused",
+        "an explicit-recipient datagram is a connect, and must obey the connect list"
+    );
+}
+
+#[test]
+fn a_socket_reached_through_proc_self_root_is_still_refused() {
+    if python().is_none() {
+        common::skip("needs python3");
+        return;
+    }
+    if !connect_enforced() {
+        common::skip("socket connect control needs Landlock ABI 9");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("srv.sock");
+    let mut listener = spawn_listener(&socket);
+    // A read grant on `/proc/self/root` covers the whole visible hierarchy,
+    // because that is what the path resolves to. If the connect right were
+    // folded into read, this would connect.
+    let program = format!(
+        "import socket\n\
+         try:\n\
+         \x20   c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n\
+         \x20   c.connect('{path}')\n\
+         \x20   print('connected')\n\
+         except OSError:\n\
+         \x20   print('refused')\n",
+        path = socket.display()
+    );
+    let output = run_python_with_args(
+        "[filesystem]\nread = [\"/proc/self/root\"]\n",
+        &program,
+        &["--no-isolate"],
+    );
+    listener.kill().unwrap();
+    listener.wait().unwrap();
+    assert_eq!(
+        stdout_of(&output),
+        "refused",
+        "read on the hierarchy must not grant connecting to the socket in it"
+    );
+}
+
+/// A server the target starts itself stays reachable from its own children:
+/// the kernel exempts sockets created inside the Landlock domain, which is
+/// what keeps a compositor able to reach the helpers it started.
+#[test]
+fn a_server_the_target_starts_is_reachable_from_its_child() {
+    if python().is_none() || !netns_available() {
+        common::skip("needs python3 and user namespaces");
+        return;
+    }
+    if !connect_enforced() {
+        common::skip("socket connect control needs Landlock ABI 9");
+        return;
+    }
+    let program = "import os, socket, subprocess, sys\n\
+         if os.path.exists('/tmp/srv-test.sock'):\n\
+         \x20   os.unlink('/tmp/srv-test.sock')\n\
+         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n\
+         s.bind('/tmp/srv-test.sock')\n\
+         s.listen(1)\n\
+         code = \"import socket\\nc = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\\nc.connect('/tmp/srv-test.sock')\\nc.sendall(b'ok')\\n\"\n\
+         r = subprocess.run([sys.executable, '-c', code], capture_output=True)\n\
+         if r.returncode != 0:\n\
+         \x20   print(r.stderr.decode().strip())\n\
+         else:\n\
+         \x20   conn, _ = s.accept()\n\
+         \x20   print(conn.recv(2).decode())\n";
+    let output = run_python("[filesystem]\nwrite = [\"/tmp\"]\n", program);
+    assert_eq!(
+        stdout_of(&output),
+        "ok",
+        "a socket the target's own domain created must stay connectable inside it"
+    );
+}
+
+/// `socketpair` has no pathname, so the connect list has nothing to say
+/// about it.
+#[test]
+fn a_socketpair_works() {
+    if python().is_none() {
+        common::skip("needs python3");
+        return;
+    }
+    let output = run_python(
+        "",
+        "import socket\n\
+         a, b = socket.socketpair()\n\
+         b.sendall(b'hi')\n\
+         print(a.recv(2))\n",
+    );
+    assert_eq!(stdout_of(&output), "b'hi'", "socketpair must be untouched");
+}
+
+/// The listeners a matrix run holds, so every profile sees the same sockets.
+/// Killed whenever the guard drops, panic or not.
+struct Listeners(Vec<std::process::Child>);
+
+impl Drop for Listeners {
+    fn drop(&mut self) {
+        for mut child in self.0.drain(..) {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// The bundled profiles against a fake session: which of the runtime
+/// directory's sockets each profile may connect to is the contract, recorded
+/// here so a profile edit that widens it fails loudly. `bus`, `pipewire-0-manager`
+/// and `ssh-agent.socket` are the sockets the profiles deliberately leave out.
+#[test]
+fn the_bundled_profiles_connect_exactly_to_their_listed_sockets() {
+    if python().is_none() {
+        common::skip("needs python3");
+        return;
+    }
+    if !connect_enforced() {
+        common::skip("the contract needs Landlock ABI 9 to observe");
+        return;
+    }
+    let sockets = [
+        "wayland-1",
+        "pulse/native",
+        "pipewire-0",
+        "pipewire-0-manager",
+        "bus",
+        "ssh-agent.socket",
+    ];
+    let runtime = tempfile::tempdir().unwrap();
+    let mut listeners = Listeners(Vec::new());
+    for socket in sockets {
+        let path = runtime.path().join(socket);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        listeners.0.push(spawn_listener(&path));
+    }
+
+    // What each profile may connect to, as the profile's connect list says.
+    // Everything else in the fake runtime directory must be refused, in a
+    // private namespace and with Landlock alone.
+    let matrix: [(&str, &[&str]); 5] = [
+        ("untrusted", &[]),
+        ("network-client", &[]),
+        ("ai-agent", &[]),
+        ("desktop-app", &["wayland-1", "pulse/native", "pipewire-0"]),
+        ("native-game", &["wayland-1", "pulse/native", "pipewire-0"]),
+    ];
+
+    for (profile, allowed) in matrix {
+        for isolate in [true, false] {
+            let probe = sockets
+                .iter()
+                .map(|socket| format!("probe('{socket}')\n"))
+                .collect::<String>();
+            let program = format!(
+                "import socket\n\
+                 def probe(name):\n\
+                 \x20   try:\n\
+                 \x20       c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n\
+                 \x20       c.connect('{rt}/' + name)\n\
+                 \x20       if c.recv(4) == b'pong':\n\
+                 \x20           print(name, 'ok')\n\
+                 \x20       else:\n\
+                 \x20           print(name, 'no')\n\
+                 \x20   except OSError:\n\
+                 \x20       print(name, 'no')\n\
+                 {probe}",
+                rt = runtime.path().display()
+            );
+            let mut command = isolated_command(runtime.path());
+            command.env("XDG_RUNTIME_DIR", runtime.path());
+            command.arg("run").arg("--profile").arg(profile);
+            if !isolate {
+                command.arg("--no-isolate");
+            }
+            let output = command
+                .args([python().unwrap(), "-c", &program])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{profile} (isolate: {isolate}) must run its probe: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let seen = stdout_of(&output);
+            for socket in sockets {
+                let expected = if allowed.contains(&socket) {
+                    "ok"
+                } else {
+                    "no"
+                };
+                assert!(
+                    seen.contains(&format!("{socket} {expected}")),
+                    "{profile} (isolate: {isolate}) must connect to `{socket}` only when its \
+                     connect list names it: {seen}"
+                );
+            }
+        }
+    }
+}

@@ -29,23 +29,27 @@ A full `egress = "deny"`, which is the default, has neither problem: the target
 gets its own network namespace with no route off the host and no access to your
 loopback, so every protocol fails.
 
-### UNIX sockets are not part of the egress policy
+### Pathname UNIX sockets are granted one connection at a time
 
-The ruleset is written against Landlock ABI 6. A right the ruleset does not
-handle is not restricted at all, so the rights added after that ABI are invisible
-to a run however new the kernel is. The one that matters here is the check on
-connecting to a pathname UNIX socket, which arrived in ABI 9.
+Connecting to a pathname UNIX socket has its own grant: a `connect` entry
+naming the socket. Read or write on a directory does not carry it, and never
+did carry it usefully, since a pathname socket is a door into another program.
 
-So "egress denied" is about TCP. A socket in a directory the policy grants for
-writing can still be connected to, and the profiles that need a session bus
-grant the whole of `${XDG_RUNTIME_DIR}`, which is where the session bus,
-`ssh-agent`, `gpg-agent` and PipeWire all keep theirs. Raising the ABI alone
-would start refusing those connects and break the profiles that rely on them:
-what the grant is really saying is "let this program create its own socket
-here", and separating that from "let it connect to every socket already here"
-needs a policy of its own rather than a wider right.
+The control is enforced by Landlock ABI 9 (Linux 7.1) and later. On an older
+kernel the run says so in its summary, and there the old rules apply in full: a
+read grant on a directory was enough to connect to any socket in it, and under
+`--no-isolate` no grant at all was needed for a socket the target could reach
+by path. Socket connects are also not part of the egress policy, and `bailey
+audit` does not yet record them.
 
-Where that matters, grant a narrower directory than the whole runtime directory.
+What is enforced is per connection, not per service identity. A socket a run
+lists is connectable until the run ends, and if the service behind it restarts
+on a different socket, the listed path now leads to whatever keeps that name.
+Grant the socket, not the service: an entry under a name an attacker can create
+is a door they can stand behind. A socket the target's own domain created, such
+as one of its own servers, stays connectable without an entry; the kernel
+exempts sockets created inside the run, which is what keeps a compositor able
+to reach the helpers it started.
 
 ### A bound port is reachable only from inside the sandbox
 

@@ -152,3 +152,95 @@ fn trusting_from_inside_a_sandbox_is_refused() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// An inner run adds its own Landlock layer, and a socket the outer target
+/// created counts as outside the inner domain: it is connectable only when
+/// the inner policy lists it.
+#[test]
+fn an_inner_run_needs_its_own_connect_entry_for_an_outer_socket() {
+    if !isolation_active() {
+        common::skip("isolation unavailable on this host");
+        return;
+    }
+    if !Path::new("/usr/bin/python3").exists() {
+        common::skip("/usr/bin/python3 unavailable");
+        return;
+    }
+    let store = tempfile::tempdir().unwrap();
+    let (_root, dir) = project(store.path());
+    // The second config adds the connect entry the first leaves out.
+    fs::write(
+        dir.join("listed.toml"),
+        "[filesystem]\nread = [\".\"]\nconnect = [\"./inner.sock\"]\n",
+    )
+    .unwrap();
+
+    let probe = "'import socket\n\
+         try:\n\
+         \x20   c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n\
+         \x20   c.connect(\"./inner.sock\")\n\
+         \x20   print(\"CONNECTED\")\n\
+         except OSError:\n\
+         \x20   print(\"REFUSED\")\n'";
+    let script = format!(
+        "/usr/bin/python3 -c 'import socket\n\
+         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n\
+         s.bind(\"./inner.sock\")\n\
+         s.listen(8)\n\
+         import time\n\
+         time.sleep(30)\n' &\n\
+         sleep 0.5\n\
+         ./bailey-bin run -c bailey.toml --no-isolate /usr/bin/python3 -c {probe}\n\
+         ./bailey-bin run -c listed.toml --no-isolate /usr/bin/python3 -c {probe}\n"
+    );
+    let output = outer(store.path(), &dir, &script);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    let refused = stdout.matches("REFUSED").count();
+    let connected = stdout.matches("CONNECTED").count();
+    assert_eq!(
+        (refused, connected),
+        (1, 1),
+        "the inner run without the entry must be refused and the one with it \
+         must connect: {stdout} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Processes a confined shell starts are in the shell's own domain, so a
+/// socket one of them created is connectable by the others with no entry at
+/// all. That is what keeps a shell's own services working.
+#[test]
+fn a_shell_process_reaches_a_socket_its_own_child_created() {
+    if !isolation_active() {
+        common::skip("isolation unavailable on this host");
+        return;
+    }
+    if !Path::new("/usr/bin/python3").exists() {
+        common::skip("/usr/bin/python3 unavailable");
+        return;
+    }
+    let store = tempfile::tempdir().unwrap();
+    let (_root, dir) = project(store.path());
+
+    let script = "\
+         /usr/bin/python3 -c 'import socket, time\n\
+         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n\
+         s.bind(\"./shell.sock\")\n\
+         s.listen(8)\n\
+         time.sleep(20)\n' &\n\
+         sleep 0.5\n\
+         /usr/bin/python3 -c 'import socket\n\
+         c = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n\
+         c.connect(\"./shell.sock\")\n\
+         print(\"CONNECTED\")\n'\n";
+    let output = outer(store.path(), &dir, script);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        stdout.contains("CONNECTED"),
+        "a socket the shell's own child created must be reachable from a sibling: \
+         {stdout} {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

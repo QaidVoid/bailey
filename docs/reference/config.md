@@ -29,6 +29,7 @@ path you typed. Only the discovered files in layer 4 are gated.
 | `read` | list of paths | Grant read on each path hierarchy |
 | `write` | list of paths | Grant write on each path hierarchy |
 | `execute` | list of paths | Grant execute on each path hierarchy |
+| `connect` | list of paths | Permit connecting to a pathname UNIX socket at each path |
 | `deny` | list of paths | Retract a grant of the same path and record the path as denied |
 | `read_only` | list of paths | Make a path read-only inside a writable grant. Needs the isolation layer |
 | `reset` | bool | Clear all filesystem grants from lower layers before applying this one |
@@ -45,6 +46,50 @@ deny = ["~/.config/app/token"]
 ```
 
 Granting and denying the same path within one layer is an error.
+
+### Connecting to a UNIX socket
+
+`connect` names pathname UNIX sockets the target may talk to. It is its own
+grant: read or write on a directory never carries the right to connect to the
+sockets in it, because a pathname socket is a door into another program, and
+reaching a directory is not the same as being allowed to knock on every door in
+it.
+
+```toml
+[filesystem]
+connect = [
+    "${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}",
+    "${XDG_RUNTIME_DIR}/pulse/native",
+]
+```
+
+A plain path names one socket. A literal directory names every socket beneath
+it, whatever this run and future runs add there, so prefer naming sockets one
+by one. `at` is not available for a connect entry: a socket is reached where
+the host keeps it.
+
+The entries expand the way other paths do, with stricter rules, because a
+widened result here is a door into another program:
+
+- A variable that is unset, or set to the empty string, drops the entry with a
+  warning rather than granting nothing. A profile that needs the display only
+  when there is a display keeps working under ssh or on a TTY login.
+- A variable whose value is absolute replaces everything to its left. Wayland
+  defines an absolute `WAYLAND_DISPLAY`, so the template above is correct for
+  a compositor that sets one.
+- An entry that used a variable and resolves to an existing directory is
+  dropped with a warning: the variable was meant to name a socket.
+- An entry that resolves to the session runtime directory, to an ancestor of
+  it, or to `/` is dropped whether or not it used a variable. Those are the
+  directories whose sockets the connect list exists to separate.
+
+A path that does not exist yet is kept, and skipped at enforcement like any
+other missing grant.
+
+Connecting is enforced by Landlock on kernels with ABI 9 (Linux 7.1) and later.
+On older kernels the run summary says so, and any socket the target can reach
+by path can be connected to. Under `--no-isolate` the same control holds; the
+connect list does not need the isolation layer.
 
 ### Placing a grant somewhere else
 

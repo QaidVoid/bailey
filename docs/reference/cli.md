@@ -33,6 +33,7 @@ exit status.
 | `--allow-exec <PATH>` | Grant execute access to a path. Repeatable |
 | `--read-only <PATH>` | Keep a path read-only inside an allowed writable parent. Repeatable |
 | `--deny <PATH>` | Deny a path outright, retracting any grant. Repeatable |
+| `--allow-connect <PATH>` | Allow connecting to a UNIX socket at this path, reading and writing it. Repeatable. Unset or empty variables refuse the flag, and the session runtime directory is off limits |
 | `--allow-net <PORT>` | Allow outbound TCP to this port, on any host. Repeatable |
 | `-p, --profile <NAME>` | Profile used as the base, bundled or your own. Defaults to one that claims the target, else `untrusted` |
 | `--proxy-net` | Ask for the private network namespace outright; the run is refused where the host cannot provide it |
@@ -100,6 +101,7 @@ the same policy without being invoked through bailey.
 | `--allow-exec <PATH>` | Grant execute access to a path. Repeatable |
 | `--read-only <PATH>` | Keep a path read-only inside an allowed writable parent. Repeatable |
 | `--deny <PATH>` | Deny a path outright, retracting any grant. Repeatable |
+| `--allow-connect <PATH>` | Allow connecting to a UNIX socket at this path, reading and writing it. Repeatable. Unset or empty variables refuse the flag, and the session runtime directory is off limits |
 | `--allow-net <PORT>` | Allow outbound TCP to this port, on any host. Repeatable |
 | `-p, --profile <NAME>` | Profile used as the base |
 | `--proxy-net` | Ask for the private network namespace outright; the run is refused where the host cannot provide it |
@@ -126,6 +128,10 @@ The quick-grant flags describe the highest config layer there is, above
 same standing an explicit config has. A relative path resolves against the
 working directory, so `--allow-write .` means where you are. An unset variable
 in a flag path is an error rather than a grant that quietly matches nothing.
+`--allow-connect` is stricter still, because a socket is a door into another
+program: an unset or empty variable, a variable that lands on a directory, or
+an entry that lands on the session runtime directory refuses the flag instead
+of granting nothing.
 
 What was enforced is printed before the shell takes the terminal, rather than on
 exit as `run` does. Exits with the shell's status. See

@@ -706,3 +706,82 @@ fn a_skip_is_logged_where_ci_reads_it() {
         "the skip must be logged under the crate and test the expectation files name"
     );
 }
+
+/// A policy that lists sockets says so, with how many: the count is what tells
+/// a config where the display entry went missing from an enforcing one.
+#[test]
+fn a_run_with_connect_entries_reports_the_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("srv.sock");
+    let (output, _) = run_with_config(
+        &format!("[filesystem]\nconnect = [\"{}\"]\n", socket.display()),
+        &[],
+        &[],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary = String::from_utf8_lossy(&output.stderr);
+    if bailey::backend::probe::landlock_abi().is_some_and(|abi| abi >= 9) {
+        assert!(
+            summary.contains("unix socket connect (1 listed)"),
+            "the summary must name the connect control with its count: {summary}"
+        );
+    } else {
+        assert!(
+            summary.contains("socket connect control"),
+            "below ABI 9 the control is reported as skipped: {summary}"
+        );
+    }
+}
+
+/// A run that keeps the old shape (runtime directory granted, nothing listed)
+/// is told what changed, on a kernel where the change bites.
+#[test]
+fn a_granted_runtime_dir_with_no_connect_entry_prints_the_note() {
+    if !bailey::backend::probe::landlock_abi().is_some_and(|abi| abi >= 9) {
+        common::skip("the note is about kernels where socket connect is controlled");
+        return;
+    }
+    let _dir = tempfile::tempdir().unwrap();
+    let runtime = tempfile::tempdir().unwrap();
+    let (output, _) = run_with_config(
+        &format!("[filesystem]\nread = [\"{}\"]\n", runtime.path().display()),
+        &[],
+        &[("XDG_RUNTIME_DIR", runtime.path())],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        summary.contains("service sockets need a `connect` entry"),
+        "a policy shaped like the old way must be told the rule changed: {summary}"
+    );
+
+    // The same policy with an entry beneath the directory says nothing.
+    let socket = runtime.path().join("pulse/native");
+    let (output, _) = run_with_config(
+        &format!(
+            "[filesystem]\nread = [\"{rt}\"]\nconnect = [\"{sock}\"]\n",
+            rt = runtime.path().display(),
+            sock = socket.display()
+        ),
+        &[],
+        &[("XDG_RUNTIME_DIR", runtime.path())],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let summary = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !summary.contains("service sockets need a `connect` entry"),
+        "a policy that lists a socket beneath the grant must not be nagged: {summary}"
+    );
+}

@@ -7,6 +7,32 @@ there, ssh-agent and gpg-agent among them. Bailey offers a narrower road for
 each of these: it carries the one socket in itself and leaves the directory
 behind.
 
+## Migrating from a directory grant
+
+Connecting to a pathname UNIX socket is its own grant on a modern kernel: a
+`connect` entry naming the socket. A read or write grant on a directory no
+longer carries it, so a config that reached the compositor or the bus through a
+grant of `${XDG_RUNTIME_DIR}` stops connecting on kernels with Landlock ABI 9
+(Linux 7.1) and later. A run that sees this shape prints one note saying so.
+
+The fix is one line per socket the program really talks to:
+
+```toml
+[filesystem]
+connect = [
+    "${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY}",
+    "${XDG_RUNTIME_DIR}/bus",
+]
+```
+
+`bailey show` lists what resolved, with the connect bit shown as `c`. An entry
+for a variable that is unset, or that lands on the runtime directory itself, is
+dropped with a warning rather than widened.
+
+For a program whose only need is one service, a `[[socket]]` relay stays the
+tighter choice: it carries the connection itself and leaves even the listed
+socket out of the target's view.
+
 ## Relaying a service socket
 
 ```toml

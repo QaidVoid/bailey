@@ -63,8 +63,9 @@ does not silently widen every sandbox you already configured.
 ## Display and audio variables follow their grants
 
 `WAYLAND_DISPLAY`, `XDG_RUNTIME_DIR`, `PULSE_SERVER`, and `XDG_SESSION_TYPE` are
-passed only when the policy grants your session's runtime directory. `DISPLAY`
-and `XAUTHORITY` are passed only when `/tmp/.X11-unix` is granted.
+passed when the policy grants your session's runtime directory, or when a
+`connect` entry names a socket beneath it. `DISPLAY` and `XAUTHORITY` are passed
+when `/tmp/.X11-unix` is granted, or when a `connect` entry names a socket in it.
 
 The variable without the socket is useless, and the socket without the variable
 is a program that cannot find its display, so bailey derives one from the other.

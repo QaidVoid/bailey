@@ -93,6 +93,11 @@ pub struct QuickGrants {
     /// isolation to hold.
     #[arg(long, value_name = "PATH")]
     pub deny: Vec<String>,
+    /// Allow connecting to a Unix socket at this path, reading from it and
+    /// writing to it. Unset or empty variables refuse the flag rather than
+    /// dropping the entry, and the session runtime directory is off limits.
+    #[arg(long, value_name = "PATH")]
+    pub allow_connect: Vec<String>,
     /// Allow outbound TCP to this port, on any host. Enforcement matches the
     /// port only; a config layer's egress choice is replaced.
     #[arg(long, value_name = "PORT", value_parser = clap::value_parser!(u16).range(1..))]
@@ -107,6 +112,7 @@ impl QuickGrants {
             && self.allow_exec.is_empty()
             && self.read_only.is_empty()
             && self.deny.is_empty()
+            && self.allow_connect.is_empty()
             && self.allow_net.is_empty()
     }
 
@@ -130,6 +136,17 @@ impl QuickGrants {
         let execute = resolve_all(&self.allow_exec)?;
         let read_only = resolve_all(&self.read_only)?;
         let deny = resolve_all(&self.deny)?;
+        // Socket grants are refused, not dropped: a `--allow-connect` flag
+        // is a deliberate, one-off ask, so a variable the run cannot see
+        // must fail loudly instead of silently granting nothing.
+        let connect = self
+            .allow_connect
+            .iter()
+            .map(|raw| {
+                config::expand_connect_entry(raw, &std::env::current_dir()?)
+                    .map_err(|err| anyhow::anyhow!("--allow-connect {raw}: {err}"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
 
         let mut granted = std::collections::BTreeSet::new();
         for path in read.iter().chain(&write).chain(&execute) {
@@ -168,6 +185,9 @@ impl QuickGrants {
         }
         if !deny.is_empty() {
             fs_keys.push(format!("deny = [{}]", list(&deny)));
+        }
+        if !connect.is_empty() {
+            fs_keys.push(format!("connect = [{}]", list(&connect)));
         }
         if !fs_keys.is_empty() {
             out.push_str("[filesystem]\n");
@@ -495,6 +515,13 @@ fn cmd_doctor() -> anyhow::Result<i32> {
                 degraded = true;
                 println!(
                     "    abstract sockets and signals are NOT scoped (needs ABI 6, Linux 6.12)"
+                );
+            }
+            if abi < crate::backend::enforce::ABI_SOCKET_CONNECT {
+                degraded = true;
+                println!(
+                    "    socket connect control is NOT enforced: {}",
+                    crate::backend::enforce::CONNECT_SKIP_REASON
                 );
             }
         }
@@ -2338,7 +2365,7 @@ fn print_policy_to(
             } else {
                 ""
             };
-            writeln!(out, "  r-- {}{note}", path.display()).expect("writing the policy report");
+            writeln!(out, "  r--- {}{note}", path.display()).expect("writing the policy report");
         }
     }
 
@@ -2351,7 +2378,7 @@ fn print_policy_to(
             } else {
                 ""
             };
-            writeln!(out, "  --- {}{note}", path.display()).expect("writing the policy report");
+            writeln!(out, "  ---- {}{note}", path.display()).expect("writing the policy report");
         }
     }
 
@@ -2547,6 +2574,14 @@ fn access_flags(access: Access) -> String {
     });
     flags.push(if access.contains(Access::EXECUTE) {
         'x'
+    } else {
+        '-'
+    });
+    // Socket connect is its own grant, so it carries its own letter: a run
+    // with read on a directory of sockets must not read as able to talk to
+    // them.
+    flags.push(if access.contains(Access::CONNECT) {
+        'c'
     } else {
         '-'
     });

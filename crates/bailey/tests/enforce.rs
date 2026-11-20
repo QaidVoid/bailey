@@ -387,11 +387,10 @@ fn an_open_file_limit_refuses_the_next_open() {
         common::skip("Landlock unavailable");
         return;
     }
-    let Some(python) = (|| {
-        ["/usr/bin/python3", "/bin/python3"]
-            .into_iter()
-            .find(|path| Path::new(path).exists())
-    })() else {
+    let python = ["/usr/bin/python3", "/bin/python3"]
+        .into_iter()
+        .find(|path| Path::new(path).exists());
+    let Some(python) = python else {
         common::skip("no python3 for the descriptor loop");
         return;
     };

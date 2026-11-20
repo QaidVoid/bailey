@@ -50,6 +50,7 @@ sandbox helps.
 | Cannot see or signal host processes | PID namespace | Enforced unless `--no-isolate` |
 | Cannot open ungranted TCP connections | Landlock network rules, plus the seccomp refusal of MPTCP and SMC sockets | Enforced on Linux 6.7+; the seccomp part needs seccomp filters |
 | Cannot reach host abstract UNIX sockets | Landlock scoping, network namespace | Enforced on Linux 6.12+ |
+| Cannot connect to a pathname UNIX socket the policy does not list | Landlock socket connect right, `connect` entries | Enforced on Linux 7.1+; on older kernels a read grant on the socket's directory is enough, and under `--no-isolate` no grant is needed |
 | Cannot signal processes outside the sandbox | Landlock scoping, PID namespace | Enforced on Linux 6.12+ |
 | Cannot send UDP, QUIC, or DNS | Network namespace | Enforced when egress is denied |
 | Cannot load kernel modules, trace processes, or create namespaces | seccomp, capability drop, kernel limit | Enforced: `unshare`, `setns`, and `clone` with a `CLONE_NEW*` flag are refused, `clone3` is refused with the error libcs fall back from, and on any run that builds a user namespace a kernel limit leaves nothing beneath it for the target |
