@@ -1253,7 +1253,7 @@ fn ipv6_global_present(if_inet6: &str) -> bool {
     })
 }
 
-/// Refuse to confine anything while running as root.
+/// Refuse to confine anything while running as root or a root-backed mapping.
 ///
 /// The user namespace maps the caller to itself, so as uid 0 the target is uid
 /// 0 on the host: its files are root-owned and ordinary permissions stop being
@@ -1263,47 +1263,58 @@ fn refuse_root() -> anyhow::Result<()> {
     if unsafe { libc::geteuid() } != 0 {
         return Ok(());
     }
-    // Being uid 0 is not the same as being real root. Inside a user namespace
-    // the caller is often mapped to 0 while owning nothing on the host: pasta
-    // does exactly that for the inner run. What matters is who 0 stands for
-    // and how far the mapping reaches, which the kernel's map says. Nothing
-    // from the environment is consulted, because a caller can set any of it:
-    // a guard that trusts its own marker has a door built in.
-    let map = std::fs::read_to_string("/proc/self/uid_map").unwrap_or_default();
-    let Some((host_uid, range)) = host_uid_of_root(&map) else {
-        anyhow::bail!(
-            "bailey confines an unprivileged process, but /proc/self/uid_map \
-             cannot be read to tell real root from a mapped one; the run is \
-             refused"
-        );
-    };
-    // 0 mapped to 0 across the whole uid range happens in exactly one way: a
-    // namespace the host's root seeded, the initial one directly or a nested
-    // one granted the full range. A nested 0 that maps less is someone else's
-    // mapped root, and the namespace that produced it was subject to this
-    // guard when it ran unconfined.
-    if host_uid == 0 && range == u32::MAX {
-        anyhow::bail!(
-            "bailey confines an unprivileged process and is running as real root; \
-             a target would be root on the host too. Run it as the user it is for"
-        );
+    // Nothing from the environment is consulted, because a caller can set any
+    // of it: a guard that trusts its own marker has a door built in.
+    if let Some(reason) = root_refusal(
+        std::fs::read_to_string("/proc/self/uid_map")
+            .ok()
+            .as_deref(),
+    ) {
+        anyhow::bail!("{reason}");
     }
     Ok(())
+}
+
+/// The refusal a root-backed or unreadable uid map earns; `None` allows.
+///
+/// A mapping of uid 0 from the parent namespace's uid 0 is refused whatever
+/// width it carries, because the parent-relative map cannot say what the
+/// parent's 0 stands for. The one shape covers the initial namespace, a
+/// root's `unshare --map-root-user`, and the limited identity maps a root
+/// service's `PrivateUsers` writes, and a nested namespace produced from an
+/// ordinary user's mapping can carry the same lines, so no width separates
+/// host root from a nested mapped root. Refusing the family costs a nested
+/// run a clear message; misjudging it would confine a target under the
+/// host's root.
+fn root_refusal(map: Option<&str>) -> Option<&'static str> {
+    match map.and_then(host_uid_of_root) {
+        None => Some(
+            "bailey confines an unprivileged process, but /proc/self/uid_map \
+             cannot be read to tell real root from a mapped one; the run is \
+             refused",
+        ),
+        Some(0) => Some(
+            "bailey confines an unprivileged process and uid 0 in this \
+             namespace comes from the parent namespace's uid 0, which may be \
+             the host's root; a target would run as that root too. Run \
+             bailey as the user it is for",
+        ),
+        Some(_) => None,
+    }
 }
 
 /// Who uid 0 stands for outside this user namespace, read from a `uid_map`.
 ///
 /// A line is `<inside> <outside> <count>`. The entry whose range covers 0
-/// answers with the outside uid and the width of the mapped range; `None`
-/// when nothing covers 0.
-fn host_uid_of_root(map: &str) -> Option<(u32, u32)> {
+/// answers with the outside uid; `None` when nothing covers 0.
+fn host_uid_of_root(map: &str) -> Option<u32> {
     for line in map.lines() {
         let mut parts = line.split_whitespace();
         let inside: u32 = parts.next()?.parse().ok()?;
         let outside: u32 = parts.next()?.parse().ok()?;
         let count: u32 = parts.next()?.parse().ok()?;
         if inside == 0 && count >= 1 {
-            return Some((outside, count));
+            return Some(outside);
         }
     }
     None
@@ -3222,25 +3233,51 @@ fe80000000000000869e56fffe032b71 04 40 20 80    wlan0
 
 #[cfg(test)]
 mod root_guard_tests {
-    use super::host_uid_of_root;
+    use super::{host_uid_of_root, root_refusal};
 
     #[test]
     fn a_mapped_root_is_not_real_root() {
-        // 0 mapped to 0 across the whole range: the initial namespace, or a
-        // nested one the host's root seeded. Both are the caller the guard
-        // refuses.
-        assert_eq!(
-            host_uid_of_root("         0          0 4294967295\n"),
-            Some((0, u32::MAX))
-        );
         // What pasta gives the inner run: 0 stands for the caller.
         assert_eq!(
             host_uid_of_root("         0       1000          1\n"),
-            Some((1000, 1))
+            Some(1000)
         );
         // A map that does not cover 0 at all.
         assert_eq!(host_uid_of_root("      1000       1000          1\n"), None);
         assert_eq!(host_uid_of_root(""), None);
+    }
+
+    #[test]
+    fn the_guard_refuses_every_root_backed_mapping() {
+        // The initial namespace, real root outright.
+        assert!(root_refusal(Some("         0          0 4294967295\n")).is_some());
+        // `unshare --user --map-root-user` from real root.
+        assert!(root_refusal(Some("         0          0          1\n")).is_some());
+        // The limited identity map a root service's PrivateUsers writes.
+        assert!(root_refusal(Some("         0          0      65536\n")).is_some());
+    }
+
+    #[test]
+    fn the_guard_allows_mappings_a_plain_user_can_write() {
+        // `unshare --user --map-root-user` from uid 1000.
+        assert_eq!(
+            root_refusal(Some("         0       1000          1\n")),
+            None
+        );
+        // A rootless container mapping 0 into the user's id range.
+        assert_eq!(
+            root_refusal(Some("         0       1000      65536\n")),
+            None
+        );
+    }
+
+    #[test]
+    fn the_guard_fails_closed_on_an_unreadable_or_odd_map() {
+        // The map could not be read.
+        assert!(root_refusal(None).is_some());
+        // A readable map that covers no uid 0 cannot happen with euid 0,
+        // and the guard refuses it anyway.
+        assert!(root_refusal(Some("      1000       1000          1\n")).is_some());
     }
 }
 
