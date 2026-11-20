@@ -202,15 +202,36 @@ This is best-effort throughout. Without such a cgroup, limits are skipped and th
 run's summary says so rather than failing the run. `bailey doctor` answers the
 same question before you start.
 
+Two of them hold without any cgroup, because they are rlimits. `file_max` is
+`RLIMIT_FSIZE`: one file's size, on every host, with or without a cgroup.
+`open_files` is `RLIMIT_NOFILE`: the largest descriptor number a process may
+newly open. It is inherited by every process the target starts, a target that
+cannot live within it fails with `EMFILE` at whatever it was doing, and where
+the policy asks for more than the caller already has, the caller's lower limits
+stand, because an unprivileged run cannot grant what the caller did not have.
+
 One of them has a fallback. Where no cgroup was delegated, `pids_max` is applied
 as `RLIMIT_NPROC` instead, and the summary reports a `process limit`. The count
 behind that rlimit is kept per user within a user namespace, so it only means the
 policy's number on a run that makes one of its own, which is every run under
 `--isolate` and every run whose policy denies egress. A run that stays in the
 caller's namespace would be counting the caller's own processes, so the fallback
-is not applied there and the limit is reported skipped as before. `memory` and
-`cpu_percent` have no equivalent: `RLIMIT_AS` bounds address space rather than
-resident memory, and `RLIMIT_CPU` bounds total CPU seconds rather than a share.
+is not applied there and the limit is reported skipped as before.
+
+`memory` has a narrower one, offered for the same reason and named for exactly
+what it is. A policy may set `address_space`, which is applied as `RLIMIT_AS`
+only where `memory` is set and no cgroup could carry it, and reported as
+`per-process address space` while the memory limit is still reported as skipped.
+`RLIMIT_AS` bounds address space rather than resident memory: it counts
+reservations, misses tmpfs pages once unmapped, and never sees page cache or
+kernel memory, and it bounds one process rather than the run. That is why it is
+opt-in with its own number and never derived from `memory`: runtimes reserve
+address ranges far beyond what they touch, so the same number for both would
+make every JVM fail where `memory = "4GiB"` meant to allow a 4 GiB heap. Set it
+well above the target's largest reservation, and treat it as the better-than-
+nothing bound for the runaway case, not as the memory limit it is not.
+`cpu_percent` has no equivalent: `RLIMIT_CPU` bounds total CPU seconds rather
+than a share.
 
 ## Order of application
 
@@ -221,7 +242,9 @@ Inside the forked child, before exec:
    reachable.
 3. Namespaces and the reconstructed root, if `--isolate` is on.
 4. Landlock ruleset, applied against the world the program will see.
-5. seccomp filter, last, so it does not block the setup it would otherwise
+5. The target's own rlimits, `open_files` and the address-space fallback where
+   it applies, after the setup steps that open descriptors and map memory.
+6. seccomp filter, last, so it does not block the setup it would otherwise
    prevent.
 
 Then exec. Every layer is in place before the program's first instruction.

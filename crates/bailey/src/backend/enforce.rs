@@ -599,9 +599,14 @@ impl EnforceBackend {
         // holds with or without a delegated cgroup and is reported on its own.
         // Folding it in here would report it skipped on a host with no cgroup,
         // when it is the one limit that still applied. A process limit met by
-        // the rlimit above is taken out for the same reason.
+        // the rlimit above is taken out for the same reason, as are the other
+        // two rlimits: the open-file limit holds on every host, and the
+        // address-space fallback is what answers a memory limit no cgroup
+        // could carry.
         let mut via_cgroup = ResourceLimits {
             file_bytes: None,
+            open_files: None,
+            address_space_bytes: None,
             ..policy.resources.clone()
         };
         if pids_via_rlimit.is_some() {
@@ -625,6 +630,13 @@ impl EnforceBackend {
         }
         if pids_via_rlimit.is_some() {
             report.applied("process limit");
+        }
+        if policy.resources.open_files.is_some() {
+            report.applied("open file limit");
+        }
+        let address_space_via_rlimit = address_space_fallback(&policy.resources, procs.is_some());
+        if address_space_via_rlimit.is_some() {
+            report.applied("per-process address space");
         }
 
         let mut command = Command::new(&target.program);
@@ -654,6 +666,7 @@ impl EnforceBackend {
         let stop_before_exec = self.stop_before_exec;
         let create_guard = creates_guard(self.guard_in_place);
         let file_bytes = policy.resources.file_bytes;
+        let open_files = policy.resources.open_files;
         // The child end's descriptor number, valid in the forked child where
         // fd numbers are preserved. Sending goes from the child end; the
         // announce end below is the one the parent reads.
@@ -736,6 +749,21 @@ impl EnforceBackend {
                 // restrictions the target could take down.
                 if !keep_mount {
                     plan.apply()?;
+                }
+                // Both rlimits land after the setup steps that open
+                // descriptors or map memory (the namespace and root
+                // reconstruction, the forward listeners, the Landlock
+                // ruleset), so the target's numbers bound the target's tree
+                // rather than the run's own scaffolding. Seccomp and the
+                // capability drop after them need neither new descriptors nor
+                // meaningful address space. The PID 1 supervisor that spawns
+                // the target under isolation comes after and is bounded,
+                // which is correct: it is part of the target's tree.
+                if let Some(count) = open_files {
+                    set_open_files_limit(count)?;
+                }
+                if let Some(bytes) = address_space_via_rlimit {
+                    set_address_space_limit(bytes)?;
                 }
                 seccompiler::apply_filter(&seccomp)
                     .map_err(|err| io::Error::other(format!("seccomp: {err}")))?;
@@ -1880,6 +1908,62 @@ fn set_file_size_limit(bytes: u64) -> io::Result<()> {
     Ok(())
 }
 
+/// Lower the caller's own rlimit to the policy's ceiling, never raise it.
+///
+/// An unprivileged process cannot raise a hard limit, so a policy asking for
+/// more than the caller has would fail in the child and refuse the run for
+/// nothing. Taking the minimum of the two means the target is always bounded
+/// by at most the policy's number, and never granted anything the caller
+/// could not already do. The soft limit stays where it was when that was
+/// already lower, rather than being lifted to the policy's number, which
+/// keeps programs using `select()` from being handed descriptors above 1024
+/// they never asked for.
+macro_rules! lower_rlimit {
+    ($resource:expr, $ceiling:expr) => {{
+        let ceiling = $ceiling as libc::rlim_t;
+        let mut current = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if unsafe { libc::getrlimit($resource, &mut current) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let limit = libc::rlimit {
+            rlim_cur: current.rlim_cur.min(ceiling),
+            rlim_max: current.rlim_max.min(ceiling),
+        };
+        if unsafe { libc::setrlimit($resource, &limit) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }};
+}
+
+/// `RLIMIT_NOFILE`: the largest descriptor number a process may newly open.
+/// Inherited descriptors above it stay open, which is how the kernel defines
+/// the limit, not something bailey chooses.
+fn set_open_files_limit(count: u64) -> io::Result<()> {
+    lower_rlimit!(libc::RLIMIT_NOFILE, count)
+}
+
+/// `RLIMIT_AS`: what a process may map, which is not what it may keep
+/// resident. Applied only as the opt-in stand-in for a memory limit no cgroup
+/// could carry, and reported as exactly that.
+fn set_address_space_limit(bytes: u64) -> io::Result<()> {
+    lower_rlimit!(libc::RLIMIT_AS, bytes)
+}
+
+/// The per-process address-space fallback is a stand-in for `memory` where no
+/// cgroup could carry it, so it applies only when a memory limit is set and
+/// the run got no cgroup. A cgroup's `memory.max` is the sound answer where
+/// one exists, and layering an address-space bound on top would only add the
+/// large-reservation breakage.
+fn address_space_fallback(resources: &ResourceLimits, cgroup: bool) -> Option<u64> {
+    resources
+        .address_space_bytes
+        .filter(|_| resources.memory_bytes.is_some() && !cgroup)
+}
+
 /// `kexec_file_load`, which libc does not name on every target it exists on.
 ///
 /// The syscall is present on aarch64, but the musl bindings have no constant for
@@ -2345,7 +2429,7 @@ fn try_create_cgroup(limits: &ResourceLimits) -> io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::{Access, DeviceRule, Egress, FsRule, PortForward};
+    use crate::policy::{Access, DeviceRule, Egress, FsRule, PortForward, ResourceLimits};
     use std::collections::BTreeSet;
     use std::io::Write as _;
 
@@ -2367,6 +2451,47 @@ mod tests {
         let name = std::thread::current();
         let test = name.name().unwrap_or("unknown");
         let _ = writeln!(log, "{}::{}\t{}", env!("CARGO_CRATE_NAME"), test, reason);
+    }
+
+    /// The fallback is opt-in twice over: it needs both `address_space` set
+    /// and `memory` set, and a run that got a cgroup never layers it on. If
+    /// this ever applies without those, an opt-in has become a default.
+    #[test]
+    fn the_address_space_fallback_applies_only_where_it_was_asked_for() {
+        let resources = ResourceLimits {
+            memory_bytes: Some(2_000_000_000),
+            address_space_bytes: Some(8_000_000_000),
+            ..ResourceLimits::default()
+        };
+        assert_eq!(
+            address_space_fallback(&resources, false),
+            Some(8_000_000_000),
+            "a cgroup-less run with both keys set applies the fallback"
+        );
+        assert_eq!(
+            address_space_fallback(&resources, true),
+            None,
+            "a cgroup carries the memory limit, so the fallback must stay off"
+        );
+        let memory_only = ResourceLimits {
+            memory_bytes: Some(2_000_000_000),
+            ..ResourceLimits::default()
+        };
+        assert_eq!(
+            address_space_fallback(&memory_only, false),
+            None,
+            "memory alone must not imply the fallback"
+        );
+        let fallback_only = ResourceLimits {
+            address_space_bytes: Some(8_000_000_000),
+            ..ResourceLimits::default()
+        };
+        assert_eq!(
+            address_space_fallback(&fallback_only, false),
+            None,
+            "resolution refuses a fallback without memory, and the decision \
+             must agree with it"
+        );
     }
 
     /// Builds a plan for a test and removes the staging directory it created,
@@ -2739,7 +2864,9 @@ mod tests {
                 extern "C" fn thread_body(_arg: *mut libc::c_void) -> *mut libc::c_void {
                     std::ptr::null_mut()
                 }
-                let mut tid: libc::pthread_t = 0;
+                // `pthread_t` is a pointer on musl and an integer on glibc, so
+                // it is zeroed rather than assigned a number.
+                let mut tid: libc::pthread_t = unsafe { std::mem::zeroed() };
                 if libc::pthread_create(
                     &mut tid,
                     std::ptr::null(),

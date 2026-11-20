@@ -349,7 +349,9 @@ struct RawDevice {
 #[serde(deny_unknown_fields)]
 struct RawResources {
     memory: Option<String>,
+    address_space: Option<String>,
     pids_max: Option<u64>,
+    open_files: Option<u64>,
     cpu_percent: Option<u32>,
     file_max: Option<String>,
     tmp_size: Option<String>,
@@ -393,6 +395,10 @@ struct Accumulator {
     publish_ports: Vec<u16>,
     devices: BTreeMap<PathBuf, Access>,
     resources: ResourceLimits,
+    /// The layer that set the address-space fallback, so the error that
+    /// refuses a fallback without a memory limit can name where the key came
+    /// from.
+    address_space_source: Option<PathBuf>,
     hooks: Hooks,
     env: EnvPolicy,
     home: Option<PathBuf>,
@@ -706,6 +712,22 @@ fn apply_layer(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> 
         if let Some(pids) = resources.pids_max {
             acc.resources.pids_max = Some(pids);
         }
+        if let Some(open_files) = resources.open_files {
+            if open_files == 0 {
+                return Err(ConfigError::Invalid {
+                    path: layer.path.clone(),
+                    reason: "`open_files = 0` would refuse the target's first \
+                             open; name a count the target can live with, or \
+                             remove the key"
+                        .to_owned(),
+                });
+            }
+            acc.resources.open_files = Some(open_files);
+        }
+        if let Some(spec) = &resources.address_space {
+            acc.resources.address_space_bytes = Some(size_value(spec, &layer.path)?);
+            acc.address_space_source = Some(layer.path.clone());
+        }
         if let Some(cpu) = resources.cpu_percent {
             acc.resources.cpu_percent = Some(cpu);
         }
@@ -966,6 +988,23 @@ fn finalize(mut acc: Accumulator) -> Result<Resolved, ConfigError> {
         acc.devices
             .entry(PathBuf::from("/dev/fuse"))
             .or_insert(Access::READ | Access::WRITE);
+    }
+
+    // The address-space fallback exists to stand in for `memory` where no
+    // cgroup can carry it. Without a memory limit in the policy there is
+    // nothing for it to stand in for, and it would never apply on any host,
+    // so a config carrying one is a mistake to name rather than a key to
+    // ignore.
+    if let Some(source) = &acc.address_space_source {
+        if acc.resources.memory_bytes.is_none() {
+            return Err(ConfigError::Invalid {
+                path: source.clone(),
+                reason: "`address_space` is a fallback for `memory`, and no \
+                         layer sets `memory`, so it could never apply. Set \
+                         `memory`, or drop `address_space`"
+                    .to_owned(),
+            });
+        }
     }
 
     let relocated = acc.relocated;
@@ -1406,6 +1445,68 @@ mod tests {
             .map(|rule| rule.path.clone())
             .collect();
         assert_eq!(paths, vec![PathBuf::from("/a"), PathBuf::from("/b")]);
+    }
+
+    /// Resource keys follow the nearest layer that sets them, exactly as the
+    /// other per-key merges do.
+    #[test]
+    fn an_open_file_limit_follows_the_nearest_layer() {
+        let on_then_off = [
+            layer("/base", "[resources]\nopen_files = 256"),
+            layer("/base", "[resources]\nopen_files = 1024"),
+        ];
+        let resolved = merge(&on_then_off).unwrap();
+        assert_eq!(resolved.policy.resources.open_files, Some(1024));
+    }
+
+    #[test]
+    fn a_zero_open_file_limit_is_refused() {
+        let layers = [layer("/base", "[resources]\nopen_files = 0")];
+        let error = merge(&layers).unwrap_err();
+        assert!(
+            error.to_string().contains("open_files"),
+            "the refusal must name the key: {error}"
+        );
+        assert!(
+            error.to_string().contains("/base"),
+            "the refusal must name the layer: {error}"
+        );
+    }
+
+    #[test]
+    fn an_address_space_fallback_without_memory_is_refused() {
+        let layers = [layer("/base", "[resources]\naddress_space = \"8GiB\"")];
+        let error = merge(&layers).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("address_space"),
+            "the refusal must name the key: {message}"
+        );
+        assert!(
+            message.contains("fallback for `memory`"),
+            "the refusal must say what the key stands in for: {message}"
+        );
+        assert!(
+            message.contains("/base"),
+            "the refusal must name the layer that set it: {message}"
+        );
+    }
+
+    #[test]
+    fn a_fallback_and_memory_from_different_layers_carry_both() {
+        let layers = [
+            layer("/global", "[resources]\nmemory = \"2GiB\""),
+            layer("/project", "[resources]\naddress_space = \"8GiB\""),
+        ];
+        let resolved = merge(&layers).unwrap();
+        assert_eq!(
+            resolved.policy.resources.memory_bytes,
+            Some(2 * 1024 * 1024 * 1024)
+        );
+        assert_eq!(
+            resolved.policy.resources.address_space_bytes,
+            Some(8 * 1024 * 1024 * 1024)
+        );
     }
 
     /// `host_port` defaults to the sandbox port, which is what nearly every

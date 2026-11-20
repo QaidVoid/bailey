@@ -314,6 +314,317 @@ fn the_file_limit_is_reported_as_enforced() {
     );
 }
 
+/// The open-file limit is an rlimit like the file size one, so it holds on a
+/// host with no delegated cgroup at all: `/nonexistent` names one bailey can
+/// never find, whatever this host delegates. The limit is lower-only, so a
+/// caller whose own limits sit below the policy's number passes the caller's
+/// lower ones on, and the test accepts both shapes.
+#[test]
+fn an_open_file_limit_holds_without_a_cgroup() {
+    if !landlock_available() {
+        common::skip("Landlock unavailable");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("bailey.toml");
+    fs::write(&config, "[resources]\nopen_files = 64\n").unwrap();
+
+    let output = Command::new(bailey())
+        .args(["run", "-c"])
+        .arg(&config)
+        .args(["/bin/cat", "/proc/self/limits"])
+        .env("BAILEY_CGROUP_ROOT", "/nonexistent")
+        .output()
+        .unwrap();
+
+    let limits = String::from_utf8_lossy(&output.stdout);
+    let line = limits
+        .lines()
+        .find(|line| line.starts_with("Max open files"))
+        .unwrap_or_default();
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    assert!(
+        fields.len() >= 5,
+        "the target must report its own limits: {line:?}; {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (soft, hard) = (fields[3].parse::<u64>(), fields[4].parse::<u64>());
+    match (soft, hard) {
+        (Ok(soft), Ok(hard)) => assert!(
+            soft <= 64 && hard <= 64 && soft <= hard,
+            "the target must be bounded by at most the policy's number: {line}"
+        ),
+        _ => assert!(
+            line.contains("unlimited"),
+            "an unparsable limit must be an unlimited one, never a raised \
+             one: {line}"
+        ),
+    }
+    let summary = String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .find(|line| line.starts_with("bailey: enforced:"))
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        summary.contains("open file limit"),
+        "the open-file limit must be reported as enforced: {summary}"
+    );
+    assert!(
+        !summary.contains("resource limits"),
+        "with only the open-file limit set there is no cgroup limit to talk \
+         about: {summary}"
+    );
+}
+
+/// An open-file limit is a bound on new descriptors, so a target that opens
+/// until the kernel refuses must be refused at or before the policy's number,
+/// with the kernel's own error, and anything it starts must carry the same
+/// bound. Both run shapes matter: the limit sits in the pre-exec child either
+/// way.
+#[test]
+fn an_open_file_limit_refuses_the_next_open() {
+    if !landlock_available() {
+        common::skip("Landlock unavailable");
+        return;
+    }
+    let Some(python) = (|| {
+        ["/usr/bin/python3", "/bin/python3"]
+            .into_iter()
+            .find(|path| Path::new(path).exists())
+    })() else {
+        common::skip("no python3 for the descriptor loop");
+        return;
+    };
+    let program = "\
+import os, subprocess
+fds = []
+try:
+    while True:
+        fds.append(os.open('/dev/null', os.O_RDONLY))
+except OSError as error:
+    assert error.errno == 24, f'expected EMFILE, got {error}'
+print(f'opened={len(fds)}', flush=True)
+assert len(fds) <= 32, f'opened {len(fds)} past the policy number'
+# The child spawn itself needs a few descriptors for its pipes, so hand the
+# bound back a little before proving the child inherited it.
+for fd in fds[:8]:
+    os.close(fd)
+out = subprocess.run(['/bin/cat', '/proc/self/limits'], capture_output=True, text=True).stdout
+for line in out.splitlines():
+    if line.startswith('Max open files'):
+        print('child:', line, flush=True)
+        fields = line.split()
+        soft, hard = int(fields[3]), int(fields[4])
+        assert soft <= 32 and hard <= 32, f'child unbounded: {line}'
+";
+    for isolate in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("bailey.toml");
+        let mut config_text = String::from("[resources]\nopen_files = 32\n");
+        if isolate {
+            config_text.push_str(
+                "[filesystem]\n\
+                 read = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\", \"/etc\"]\n\
+                 execute = [\"/usr\", \"/bin\", \"/lib\", \"/lib64\"]\n",
+            );
+        }
+        fs::write(&config, config_text).unwrap();
+
+        let mut command = Command::new(bailey());
+        command.args(["run", "-c"]).arg(&config);
+        if isolate {
+            command.arg("--isolate");
+        }
+        let output = command
+            .args(["/usr/bin/env", python, "-c", program])
+            .env("BAILEY_CGROUP_ROOT", "/nonexistent")
+            .output()
+            .unwrap();
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "the run shape {isolate} must refuse the open, not fail: {} {}",
+            stdout,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let opened = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("opened="))
+            .and_then(|count| count.parse::<usize>().ok())
+            .unwrap_or_else(|| panic!("the target must report its count: {stdout}"));
+        assert!(
+            opened <= 32,
+            "the open must fail at or before 32, not after {opened}"
+        );
+        assert!(
+            opened > 0,
+            "some descriptors must succeed before the refusal: {stdout}"
+        );
+        let child_line = stdout
+            .lines()
+            .find(|line| line.starts_with("child: Max open files"))
+            .unwrap_or_else(|| panic!("the child must report its limits: {stdout}"));
+        let fields: Vec<&str> = child_line.split_whitespace().collect();
+        let soft: u64 = fields[4].parse().expect("child soft limit");
+        let hard: u64 = fields[5].parse().expect("child hard limit");
+        assert!(
+            soft <= 32 && hard <= 32,
+            "the child must carry the same bound: {child_line}"
+        );
+    }
+}
+
+/// The address-space fallback exists for the run where `memory` is set and no
+/// cgroup could carry it. Where a cgroup does carry the memory limit the
+/// fallback must stay off, and the memory limit must still be reported as
+/// skipped: the fallback is not the memory limit and never stands in for it
+/// in the reporting.
+#[test]
+fn an_address_space_fallback_applies_only_without_a_cgroup() {
+    if !landlock_available() {
+        common::skip("Landlock unavailable");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("bailey.toml");
+    fs::write(
+        &config,
+        "[resources]\nmemory = \"2GiB\"\naddress_space = \"128MiB\"\n",
+    )
+    .unwrap();
+    let fallback_bytes = 128 * 1024 * 1024;
+
+    let output = Command::new(bailey())
+        .args(["run", "-c"])
+        .arg(&config)
+        .args(["/bin/cat", "/proc/self/limits"])
+        .env("BAILEY_CGROUP_ROOT", "/nonexistent")
+        .output()
+        .unwrap();
+
+    let limits = String::from_utf8_lossy(&output.stdout);
+    let line = limits
+        .lines()
+        .find(|line| line.starts_with("Max address space"))
+        .unwrap_or_default();
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    assert!(
+        fields.len() >= 5,
+        "the target must report its own limits: {line:?}; {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let soft: u64 = fields[3].parse().expect("address space soft limit");
+    let hard: u64 = fields[4].parse().expect("address space hard limit");
+    // Lower-only semantics: the target is bounded by at most the fallback's
+    // number, so a caller who arrived already bounded below it is not lifted.
+    assert!(
+        soft <= fallback_bytes && hard <= fallback_bytes,
+        "the target must be bounded by at most the fallback: {line}"
+    );
+
+    let summary = String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .find(|line| line.starts_with("bailey: enforced:"))
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        summary.contains("per-process address space"),
+        "the fallback must be reported under its own name: {summary}"
+    );
+    let reported = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        reported.contains("not enforced, resource limits"),
+        "the memory limit stays reported as skipped: {reported}"
+    );
+
+    let json = Command::new(bailey())
+        .args(["run", "--json", "-c"])
+        .arg(&config)
+        .arg("/bin/true")
+        .env("BAILEY_CGROUP_ROOT", "/nonexistent")
+        .output()
+        .unwrap();
+    let parsed: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&json.stdout).trim())
+            .expect("--json must emit valid JSON");
+    let applied = parsed["applied"].as_array().expect("applied is an array");
+    assert!(
+        applied
+            .iter()
+            .any(|layer| layer == "per-process address space"),
+        "the JSON must carry the fallback: {}",
+        String::from_utf8_lossy(&json.stdout)
+    );
+    assert!(
+        !applied.iter().any(|layer| layer == "resource limits"),
+        "the fallback must never be reported as the memory limit: {parsed}"
+    );
+}
+
+/// Where a cgroup carries the memory limit, the fallback must not apply: the
+/// cgroup's `memory.max` is the sound answer, and an address-space bound
+/// would only add breakage. Whatever address-space bound bailey itself
+/// inherited is what the target must keep.
+#[test]
+fn the_address_space_fallback_stays_off_where_a_cgroup_carries_memory() {
+    if !landlock_available() {
+        common::skip("Landlock unavailable");
+        return;
+    }
+    if bailey::backend::cgroup::usable_root(&["memory"]).is_none() {
+        common::skip("no delegated cgroup carries memory here");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("bailey.toml");
+    fs::write(
+        &config,
+        "[resources]\nmemory = \"2GiB\"\naddress_space = \"128MiB\"\n",
+    )
+    .unwrap();
+
+    let own = fs::read_to_string("/proc/self/limits").unwrap();
+    let own_line = own
+        .lines()
+        .find(|line| line.starts_with("Max address space"))
+        .expect("this test process reports its own limits")
+        .to_owned();
+
+    let output = Command::new(bailey())
+        .args(["run", "-c"])
+        .arg(&config)
+        .args(["/bin/cat", "/proc/self/limits"])
+        .output()
+        .unwrap();
+
+    let limits = String::from_utf8_lossy(&output.stdout);
+    let line = limits
+        .lines()
+        .find(|line| line.starts_with("Max address space"))
+        .unwrap_or_default();
+    assert_eq!(
+        line.split_whitespace().collect::<Vec<_>>(),
+        own_line.split_whitespace().collect::<Vec<_>>(),
+        "the target must keep the address-space bound bailey inherited, not \
+         the fallback's: target {line:?} own {own_line:?}"
+    );
+    let summary = String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .find(|line| line.starts_with("bailey: enforced:"))
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        !summary.contains("per-process address space"),
+        "the fallback must not be claimed where a cgroup carries memory: \
+         {summary}"
+    );
+    assert!(
+        summary.contains("resource limits"),
+        "the cgroup limits must be reported as applied: {summary}"
+    );
+}
+
 /// A `[[fuse]]` entry is mounted by bailey before the target starts and
 /// appears at its `at` inside the sandbox. The mount command here fills the
 /// mountpoint by hand, which stands in for a real FUSE filesystem: what the

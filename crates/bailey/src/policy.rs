@@ -161,8 +161,23 @@ pub struct DeviceRule {
 pub struct ResourceLimits {
     /// Maximum resident memory in bytes.
     pub memory_bytes: Option<u64>,
+    /// Per-process address space in bytes, the explicit fallback for
+    /// `memory_bytes` on a run where no cgroup could carry the memory limit.
+    ///
+    /// This bounds what a process may map, not what it may keep resident, and
+    /// it bounds one process rather than the run. Runtimes that reserve large
+    /// ranges (the JVM, node) need a number well above their resident size,
+    /// which is why the policy must set it by name and a cgroup, where one
+    /// exists, remains the memory bound.
+    pub address_space_bytes: Option<u64>,
     /// Maximum number of processes and threads.
     pub pids_max: Option<u64>,
+    /// Largest descriptor number a process may newly open.
+    ///
+    /// Applied as `RLIMIT_NOFILE` and holds without a cgroup. Descriptors the
+    /// process inherited above the number stay open; new ones are refused
+    /// once the numbers below it are spent.
+    pub open_files: Option<u64>,
     /// CPU quota as a percentage of a single core (100 = one full core).
     pub cpu_percent: Option<u32>,
     /// Largest single file the target may create, in bytes.

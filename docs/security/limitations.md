@@ -282,6 +282,26 @@ limits unenforceable: they are skipped and the run's summary says so, rather tha
 failing the run. `bailey doctor` reports it, and `BAILEY_CGROUP_ROOT` names one
 explicitly. See [enforcement layers](/guide/enforcement).
 
+`open_files` and `file_max` still hold, since they are rlimits, and so does the
+`RLIMIT_NPROC` stand-in for `pids_max` on the runs that make a user namespace of
+their own.
+
+### The address-space fallback bounds each process, not the run
+
+Where `memory` is set and no cgroup could carry it, an explicit `address_space`
+key bounds each process with `RLIMIT_AS` rather than leave the memory limit as
+the only skipped one. Three properties keep it from being a memory limit. It is
+per process, so a tree of N processes may hold N times the number between them
+(the product bound only holds where the process-limit fallback is also in
+force). It counts address ranges, so tmpfs pages leave the count once unmapped,
+and page cache and kernel memory never enter it. And runtimes that reserve
+large ranges fail to start under a small one: the JVM, node and other V8
+embedders, browsers, and sanitizer builds all need a number well above their
+resident size, measured on one host at about 4 GiB for node and 16 GiB for the
+JVM on a 30 GiB machine, because the JVM's reservation tracks physical RAM.
+Set it well above the target's largest reservation, and read it as the bound
+for the common runaway case, which is what the run's summary calls it.
+
 ## Audit
 
 ### A short-lived child can be missed without a cgroup

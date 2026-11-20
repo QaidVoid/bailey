@@ -311,7 +311,9 @@ concurrent connections. See [desktop services and mounts](/guide/desktop).
 | Key | Type | Description |
 | --- | --- | --- |
 | `memory` | string | Maximum memory. Bytes, or a suffix |
+| `address_space` | string | Per-process address space, the fallback for `memory` where no cgroup carries it |
 | `pids_max` | integer | Maximum processes and threads |
+| `open_files` | integer | Largest descriptor number a process may newly open |
 | `cpu_percent` | integer | CPU quota as a percentage of one core |
 | `file_max` | string | Largest single file the target may create |
 | `tmp_size` | string | Size of the private `/tmp`. Default 64MiB |
@@ -325,6 +327,7 @@ Accepted size suffixes, case-insensitive: `b`, `k`/`kb` (1000), `kib` (1024),
 memory = "2GiB"
 pids_max = 512
 cpu_percent = 150
+open_files = 512
 file_max = "1GiB"
 ```
 
@@ -341,6 +344,42 @@ It bounds one file rather than total usage. Linux has no rootless way to cap
 what a process tree writes in aggregate, because cgroups have no disk controller
 and a sized filesystem needs a mount. What this stops is the runaway log or dump
 that fills a disk, not a target that writes many small files.
+
+`open_files` is an `RLIMIT_NOFILE`, so like `file_max` it holds on any host and
+is inherited by every process the target starts. It bounds the descriptor
+numbers a process may newly open: once the numbers below it are spent, further
+opens fail with `EMFILE`, visibly, at whatever the target was doing. Zero is
+refused at resolution, since it would refuse the target's first open. Two
+properties of the kernel limit are worth knowing. Descriptors the process
+inherited above the number stay open; the limit binds new opens, not old ones,
+and bailey's own descriptors are close-on-exec. And the limit is lower-only:
+where the policy's number is above the caller's own, the caller's limit stands,
+because an unprivileged run cannot grant what the caller did not have. A value
+too small for the target's own startup fails that startup visibly with
+`EMFILE`; measured from the bottom, an isolated `/bin/true` survives 4 and dies
+at 3, where the dynamic loader can no longer open `libc.so.6`, and
+`python3 -c 0` starts under a limit of 8. There is no enforced floor beyond
+zero.
+
+`address_space` is an `RLIMIT_AS`, and it is not a memory limit. It bounds the
+address ranges one process may map, which counts reservations rather than
+resident pages: memory in tmpfs leaves the count once unmapped, and page cache
+and kernel memory never enter it. It is the opt-in fallback for `memory` on the
+hosts where `memory` cannot be enforced, the ones with no writable delegated
+cgroup: bailey applies it only on a run where `memory` is set and no cgroup
+could carry it, and where a cgroup carries `memory` the fallback is not applied
+at all, because the cgroup's `memory.max` is the sound bound and stacking an
+address-space cap on top would only add breakage. Resolution refuses
+`address_space` without `memory`, since it would never act. Set it by name,
+never derived from `memory`: the right address-space number for a program is
+not its resident-memory number, because runtimes reserve address ranges far
+beyond what they touch. Measured on one 30 GiB host: `python3 -c 0` and
+`go version` start under 1 GiB, and `node -e 0` dies with SIGTRAP at 1 GiB and
+starts under 4 GiB, both through bailey. The JVM's default heap reservation is
+a fraction of physical RAM, so the number it needs grows with the machine:
+measured with `prlimit`, `java -version` fails at 4 GiB and starts at 16 GiB
+on this host. Set it well above the largest reservation the target's runtime
+makes.
 
 ## `[env]`
 

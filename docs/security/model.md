@@ -53,7 +53,7 @@ sandbox helps.
 | Cannot signal processes outside the sandbox | Landlock scoping, PID namespace | Enforced on Linux 6.12+ |
 | Cannot send UDP, QUIC, or DNS | Network namespace | Enforced when egress is denied |
 | Cannot load kernel modules, trace processes, or create namespaces | seccomp, capability drop, kernel limit | Enforced: `unshare`, `setns`, and `clone` with a `CLONE_NEW*` flag are refused, `clone3` is refused with the error libcs fall back from, and on any run that builds a user namespace a kernel limit leaves nothing beneath it for the target |
-| Cannot exceed memory, process, or CPU limits | cgroup v2 | Best-effort, and see the caveat below |
+| Cannot exceed memory, process, or CPU limits | cgroup v2 | Best-effort, and see the caveat below. Without a cgroup, `open_files` and `file_max` still hold as rlimits, and `address_space` bounds each process where `memory` cannot be carried |
 | Cannot read your environment variables | Built environment | Enforced; only named variables cross |
 | Cannot supply its own policy | Trust store | Enforced; a discovered config applies only once accepted |
 
