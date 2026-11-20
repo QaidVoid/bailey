@@ -1,0 +1,28 @@
+audit::a_short_lived_child_is_recorded_when_scoping_by_cgroup # no audit helper configured
+audit::an_audit_of_a_network_mode_it_cannot_honour_names_the_gap # no audit helper configured
+audit::an_ungranted_egress_attempt_is_refused_during_an_audit # no audit helper configured
+audit::execution_of_a_child_program_is_recorded # no audit helper configured
+audit::startup_access_is_recorded # no audit helper configured
+audit::the_target_is_confined_during_an_audit # no audit helper configured
+audit::unconfined_is_an_explicit_opt_in # no audit helper configured
+enforce::a_file_cannot_grow_past_the_limit # Landlock unavailable
+enforce::a_fuse_mount_is_performed_and_placed # Landlock unavailable
+enforce::a_process_limit_holds_without_a_cgroup # Landlock unavailable
+enforce::a_socket_relay_carries_a_service_into_the_sandbox # Landlock unavailable
+enforce::an_address_space_fallback_applies_only_without_a_cgroup # Landlock unavailable
+enforce::an_open_file_limit_holds_without_a_cgroup # Landlock unavailable
+enforce::an_open_file_limit_refuses_the_next_open # Landlock unavailable
+enforce::denied_syscall_is_blocked # Landlock unavailable
+enforce::granted_path_is_readable_and_program_runs # Landlock unavailable
+enforce::the_address_space_fallback_stays_off_where_a_cgroup_carries_memory # Landlock unavailable
+enforce::the_file_limit_is_reported_as_enforced # Landlock unavailable
+enforce::the_url_broker_refuses_non_web_schemes_through_a_run # Landlock unavailable
+enforce::ungranted_path_is_denied # Landlock unavailable
+generate::a_recorded_run_produces_a_policy_that_run_accepts # no audit helper with capabilities on this host
+network::auto_mode_uses_the_private_namespace # the host's address is the sandbox's own (QEMU slirp)
+network::every_stream_protocol_respects_port_rules # landlock does not enforce port rules before ABI 4
+shell::a_command_in_the_shell_is_confined # no Landlock on this kernel
+shell::a_config_layer_can_retract_the_implicit_grant # no Landlock on this kernel
+shell::a_grandchild_process_is_confined # no Landlock on this kernel
+skip_log::the_skip_log_receives_distinct_variant_keys[first] # the canary runs, so both keys are expected
+skip_log::the_skip_log_receives_distinct_variant_keys[second] # the canary runs, so both keys are expected

@@ -1,0 +1,12 @@
+kernel:
+  landlock: ABI 6
+  user namespaces: yes
+  nested namespaces: refused (kernel limit, seccomp)
+  private network: available
+    runs that allow egress use the private network namespace by default
+  cgroup delegation: no
+    resource limits will be skipped
+    a run needs a cgroup it may create children in, with the memory, pids
+    and cpu controllers delegated; set BAILEY_CGROUP_ROOT to name one
+audit:
+  kernel BTF: yes

@@ -1,0 +1,46 @@
+{
+  "kernel": [
+    {
+      "id": "5.15",
+      "version": "v5.15.225",
+      "append": "lsm=landlock,yama",
+      "session": true
+    },
+    {
+      "id": "6.1",
+      "version": "v6.1.192",
+      "append": "lsm=landlock,yama",
+      "session": true
+    },
+    {
+      "id": "6.12",
+      "version": "v6.12.118",
+      "append": "lsm=landlock,yama",
+      "session": true
+    },
+    {
+      "id": "6.12-nolandlock",
+      "version": "v6.12.118",
+      "append": "lsm=capability,yama,lockdown",
+      "session": true
+    },
+    {
+      "id": "6.12-nocgroup",
+      "version": "v6.12.118",
+      "append": "lsm=landlock,yama",
+      "cgroup": false
+    },
+    {
+      "id": "6.12-cgroup-nojoin",
+      "version": "v6.12.118",
+      "append": "lsm=landlock,yama",
+      "cgroup": true
+    },
+    {
+      "id": "mainline",
+      "version": "v6.19.14",
+      "append": "lsm=landlock,yama",
+      "session": true
+    }
+  ]
+}

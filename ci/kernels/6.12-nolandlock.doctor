@@ -1,0 +1,10 @@
+kernel:
+  landlock: unavailable
+    filesystem and network policy will NOT be enforced
+  user namespaces: yes
+  nested namespaces: refused (kernel limit, seccomp)
+  private network: available
+    runs that allow egress use the private network namespace by default
+  cgroup delegation: memory, pids, cpu
+audit:
+  kernel BTF: yes

@@ -1,0 +1,12 @@
+audit::a_short_lived_child_is_recorded_when_scoping_by_cgroup # no audit helper configured
+audit::an_audit_of_a_network_mode_it_cannot_honour_names_the_gap # no audit helper configured
+audit::an_ungranted_egress_attempt_is_refused_during_an_audit # no audit helper configured
+audit::execution_of_a_child_program_is_recorded # no audit helper configured
+audit::startup_access_is_recorded # no audit helper configured
+audit::the_target_is_confined_during_an_audit # no audit helper configured
+audit::unconfined_is_an_explicit_opt_in # no audit helper configured
+enforce::a_process_limit_holds_without_a_cgroup # a delegated cgroup takes the limit here
+generate::a_recorded_run_produces_a_policy_that_run_accepts # no audit helper with capabilities on this host
+network::auto_mode_uses_the_private_namespace # the host's address is the sandbox's own (QEMU slirp)
+skip_log::the_skip_log_receives_distinct_variant_keys[first] # the canary runs, so both keys are expected
+skip_log::the_skip_log_receives_distinct_variant_keys[second] # the canary runs, so both keys are expected
