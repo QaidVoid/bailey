@@ -5,6 +5,7 @@
 //! and `trust` subcommands.
 
 use std::io;
+use std::net::ToSocketAddrs;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -749,6 +750,59 @@ fn permit_egress_port(policy: &mut crate::policy::Policy, port: u16) {
     }
 }
 
+/// A hostname an egress rule names, with the addresses it resolved to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pin {
+    /// The hostname as the policy wrote it.
+    pub name: String,
+    /// Every address the resolver answered with, in answer order.
+    pub addresses: Vec<std::net::IpAddr>,
+}
+
+/// Resolve every hostname the policy's egress rules name.
+///
+/// Runs on the host, before the namespace exists and the target starts. The
+/// addresses feed the netfilter sets and the generated `/etc/hosts`, so the
+/// destinations the namespace enforces and the ones a client dials are the
+/// same addresses. A name that does not resolve refuses the run: a rule
+/// naming it could otherwise only ever be a silent no-op.
+fn pin_destinations(policy: &crate::policy::Policy) -> anyhow::Result<Vec<Pin>> {
+    use crate::policy::{Destination, Egress};
+    let mut names: Vec<String> = Vec::new();
+    let mut wanted = |host: &Destination| {
+        if let Destination::Name(name) = host {
+            if !names.contains(name) {
+                names.push(name.clone());
+            }
+        }
+    };
+    if let Egress::Allow(rules) = &policy.network.egress {
+        for rule in rules {
+            wanted(&rule.host);
+        }
+    }
+    for rule in &policy.network.deny {
+        wanted(&rule.host);
+    }
+    let mut pins = Vec::with_capacity(names.len());
+    for name in names {
+        let addrs = (name.as_str(), 0u16)
+            .to_socket_addrs()
+            .map_err(|err| {
+                anyhow::anyhow!(
+                    "an egress rule names `{name}`, which does not resolve \n                     ({err}); the run is refused. Name an address or CIDR \n                     block instead, or fix the name"
+                )
+            })?
+            .map(|addr| addr.ip())
+            .collect::<Vec<_>>();
+        pins.push(Pin {
+            name,
+            addresses: addrs,
+        });
+    }
+    Ok(pins)
+}
+
 /// Lock this run's own namespace to the broker, refusing setup on nft failure.
 fn lock_egress_to_broker(addr: std::net::Ipv4Addr, port: u16) -> anyhow::Result<()> {
     // A dedicated table, so it is this rule that is added and removed and never
@@ -1081,6 +1135,7 @@ fn run_nft(ruleset: &str) -> anyhow::Result<()> {
 /// the host's. Egress is still gated by the policy's ports, since Landlock
 /// applies inside the namespace as it does outside.
 /// Which side of the private namespace this process ended up on.
+#[derive(Debug)]
 enum Wrapped {
     /// The parent: the run happened in the child, and this is its status.
     Parent(i32),
@@ -1433,7 +1488,12 @@ fn prepare_network(
     args: &NetworkArgs,
     no_isolate: bool,
     announce: bool,
-) -> anyhow::Result<(Wrapped, bool, Option<network::NetworkDecision>)> {
+) -> anyhow::Result<(
+    Wrapped,
+    bool,
+    Option<network::NetworkDecision>,
+    Vec<Pin>,
+)> {
     apply_network_flags(policy, args)?;
     // --no-isolate promises a run of Landlock and seccomp alone, so automatic
     // mode does not hand back a namespace with it. A policy or flag that asks
@@ -1448,7 +1508,24 @@ fn prepare_network(
     // correctly.
     let publishes = collect_publish_ports(policy, args, no_isolate)?;
     let forwards = collect_forwards(policy, no_isolate)?;
+    // `/etc/hosts` can only be replaced where bailey builds the root, so a
+    // hostname rule without the isolation layer would resolve into a rule
+    // nothing pins and nothing enforces. Address and CIDR rules need only the
+    // namespace, so they are not asked for here. This runs ahead of the
+    // contradiction checks because it is the specific reason: with
+    // `--no-isolate` there is no root to pin into under any mode.
+    if no_isolate && policy.network.needs_pinning() {
+        anyhow::bail!(
+            "--no-isolate provides no root to pin `/etc/hosts` into, so the \
+             policy's hostname rules cannot be honoured; name addresses or \
+             CIDR blocks instead, or run with isolation"
+        );
+    }
     check_network_contradictions(policy, &forwards, &publishes)?;
+    // Resolved on the host before anything forks, so the creator and the run
+    // see the same addresses and an unresolvable name refuses the run before
+    // a namespace is built.
+    let pins = pin_destinations(policy)?;
     let decision = network_decision(policy, &forwards, &publishes)?;
 
     // The proxy namespace doubles as the run's guard user namespace. With the
@@ -1466,7 +1543,7 @@ fn prepare_network(
                 guard_limit,
             )? {
                 Wrapped::Parent(code) => {
-                    return Ok((Wrapped::Parent(code), false, Some(decision)));
+                    return Ok((Wrapped::Parent(code), false, Some(decision), pins));
                 }
                 Wrapped::Creator => true,
                 Wrapped::Unwrapped => false,
@@ -1546,6 +1623,7 @@ fn prepare_network(
         },
         made_the_namespace,
         Some(decision),
+        pins,
     ))
 }
 
@@ -1562,7 +1640,7 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
     report_untrusted(&program, args.config.as_deref());
     warn_if_target_denied(&resolved.policy, &program);
 
-    let (wrapped, guard_in_place, decision) = prepare_network(
+    let (wrapped, guard_in_place, decision, pins) = prepare_network(
         &mut resolved.policy,
         &args.network,
         args.no_isolate,
@@ -1596,6 +1674,7 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
         network: decision,
         guard_in_place,
         audit_listener: None,
+        pins,
     };
     let code = backend.run(&resolved.policy, &target)?;
     if let Err(err) = resolved.hooks.run_post_exit(code) {
@@ -1643,7 +1722,7 @@ fn cmd_shell(args: ShellArgs) -> anyhow::Result<i32> {
         .set
         .insert("BAILEY_SANDBOX_DIR".into(), dir.display().to_string());
 
-    let (wrapped, guard_in_place, decision) =
+    let (wrapped, guard_in_place, decision, pins) =
         prepare_network(&mut resolved.policy, &args.network, args.no_isolate, true)?;
     if let Wrapped::Parent(code) = wrapped {
         return Ok(code);
@@ -1668,6 +1747,7 @@ fn cmd_shell(args: ShellArgs) -> anyhow::Result<i32> {
         network: decision,
         guard_in_place,
         audit_listener: None,
+        pins,
     };
     let code = backend.run(&resolved.policy, &target)?;
     if let Err(err) = resolved.hooks.run_post_exit(code) {
@@ -3108,7 +3188,7 @@ mod tests {
         check_network_contradictions(&denied, &forwards, &[]).unwrap();
     }
 
-    /// `--no-proxy-net` downgrades the mode to host after resolution, so the
+    /// `--no-isolate` downgrades the mode to host after resolution, so the
     /// destination rules a profile or project config set would arrive in a
     /// namespace nothing enforces them in. That downgrade is refused, and the
     /// message names what to drop.
@@ -3128,6 +3208,48 @@ mod tests {
             .to_string();
         assert!(err.contains("host mode"), "{err}");
         assert!(err.contains("--no-proxy-net"), "{err}");
+    }
+
+    /// `/etc/hosts` can only be replaced where bailey builds the root, so a
+    /// hostname rule beside `--no-isolate` is refused before any namespace is
+    /// built.
+    #[test]
+    fn no_isolate_refuses_a_hostname_rule() {
+        use crate::policy::{Destination, EgressRule, Protocol};
+        let mut policy = Policy::default();
+        policy.network.egress = Egress::Allow(vec![EgressRule {
+            host: Destination::Name("api.example.com".to_owned()),
+            protocol: Protocol::Tcp,
+            port: Some(443),
+        }]);
+        let err = prepare_network(&mut policy, &NetworkArgs::default(), true, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--no-isolate"), "{err}");
+        assert!(err.contains("/etc/hosts"), "{err}");
+    }
+
+    /// The resolver is libc's, asked on the host before anything forks, so a
+    /// name that only the host's `/etc/hosts` answers is pinned all the same.
+    #[test]
+    fn pinning_resolves_localhost_to_a_loopback_address() {
+        use crate::policy::{Destination, EgressRule, Protocol};
+        let mut policy = Policy::default();
+        policy.network.egress = Egress::Allow(vec![EgressRule {
+            host: Destination::Name("localhost".to_owned()),
+            protocol: Protocol::Tcp,
+            port: Some(8080),
+        }]);
+        let pins = pin_destinations(&policy).unwrap();
+        assert_eq!(pins.len(), 1);
+        assert_eq!(pins[0].name, "localhost");
+        assert!(
+            pins[0]
+                .addresses
+                .contains(&std::net::IpAddr::from([127, 0, 0, 1])),
+            "loopback is among the pinned addresses: {:?}",
+            pins[0].addresses
+        );
     }
 
     /// Each flag overrides each config value, as the highest layer.

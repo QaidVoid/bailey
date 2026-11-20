@@ -27,9 +27,8 @@ use serde::Deserialize;
 
 use crate::hooks::Hooks;
 use crate::policy::{
-    Access, DenyRule, Destination, DeviceRule, DnsSetting, Egress, EgressRule, EnvPolicy, FsRule,
-    FuseMount, NetworkMode, NetworkPolicy, Policy, PortForward, Protocol, ResourceLimits,
-    SocketRelay,
+    Access, DenyRule, Destination, DeviceRule, Egress, EgressRule, EnvPolicy, FsRule, FuseMount,
+    NetworkPolicy, Policy, PortForward, ResourceLimits, SocketRelay,
 };
 use crate::trust::{Rejected, Store};
 
@@ -1766,7 +1765,7 @@ fn global_config_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::NetworkMode;
+    use crate::policy::{DnsSetting, NetworkMode, Protocol};
 
     fn layer(base: &str, toml_src: &str) -> Layer {
         Layer {

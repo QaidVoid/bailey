@@ -104,6 +104,28 @@ fn denied_egress_blocks_name_resolution() {
     assert_eq!(stdout_of(&output), "blocked");
 }
 
+/// A policy naming a host that does not resolve is refused before any
+/// namespace is built, with the name in the message: a rule that could never
+/// match must not read as a restriction the run made.
+#[test]
+fn an_unresolvable_hostname_refuses_the_run() {
+    if python().is_none() {
+        common::skip("needs python3");
+        return;
+    }
+    let output = run_python(
+        "[network]\negress_allow = [{ host = \"does-not-exist.invalid\", port = 443 }]",
+        "print('started')\n",
+    );
+    assert!(!output.status.success(), "the run must be refused");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("does-not-exist.invalid"), "{stderr}");
+    assert!(
+        !stdout_of(&output).contains("started"),
+        "the target must not have started"
+    );
+}
+
 #[test]
 fn loopback_works_inside_the_sandbox() {
     if python().is_none() || !netns_available() {

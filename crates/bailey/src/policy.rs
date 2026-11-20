@@ -330,6 +330,22 @@ impl NetworkPolicy {
             Egress::DenyAll | Egress::AllowAll => false,
         }
     }
+
+    /// Whether any rule names a hostname, which resolution must turn into
+    /// pinned addresses and a generated `/etc/hosts`.
+    pub fn needs_pinning(&self) -> bool {
+        let allow_names = match &self.egress {
+            Egress::Allow(rules) => rules
+                .iter()
+                .any(|rule| matches!(rule.host, Destination::Name(_))),
+            Egress::DenyAll | Egress::AllowAll => false,
+        };
+        allow_names
+            || self
+                .deny
+                .iter()
+                .any(|rule| matches!(rule.host, Destination::Name(_)))
+    }
 }
 
 /// A device access grant, typically a node under `/dev`.

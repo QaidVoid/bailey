@@ -135,6 +135,7 @@ impl AuditBackend {
             network: None,
             guard_in_place: false,
             audit_listener: None,
+            pins: Vec::new(),
         };
         let confined = backend.spawn(envelope, target)?;
         // `record` is the only funnel for a confined eBPF audit: it waits
@@ -168,6 +169,7 @@ impl AuditBackend {
             network: None,
             guard_in_place: false,
             audit_listener: Some(handover_child.as_raw_fd()),
+            pins: Vec::new(),
         };
         let confined = match backend.spawn(envelope, target) {
             Ok(confined) => {
