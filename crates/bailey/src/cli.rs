@@ -13,12 +13,12 @@ use clap::{Parser, Subcommand};
 
 use crate::backend::world::{self, World};
 use crate::backend::{
-    Backend, Target, audit::AuditBackend, enforce::EnforceBackend, enforce::Summary, forward,
-    isolation, network,
+    Backend, Target, audit::AuditBackend, audit::ObserverChoice, enforce::EnforceBackend,
+    enforce::Summary, forward, isolation, network,
 };
 use crate::backend::{cgroup, probe};
 use crate::config::{self, Resolved};
-use crate::event::Trace;
+use crate::event::{Observer, Trace};
 use crate::hook::{self, Shell};
 use crate::hooks::{self, Hooks};
 use crate::policy::{Access, Egress, Policy, PortForward};
@@ -314,6 +314,11 @@ struct AuditArgs {
     /// authority for the duration of the audit.
     #[arg(long)]
     unconfined: bool,
+    /// Which observer records the trace. `auto` prefers the eBPF helper and
+    /// falls back to seccomp notification when it cannot run; `seccomp` is
+    /// the fallback alone, which needs Linux 5.5 or newer and records less.
+    #[arg(long, value_enum, default_value_t = ObserverChoice::default())]
+    observer: ObserverChoice,
     /// The target executable, followed by its own arguments.
     #[arg(required = true, num_args = 1.., trailing_var_arg = true, allow_hyphen_values = true)]
     command: Vec<String>,
@@ -640,10 +645,22 @@ fn cmd_doctor() -> anyhow::Result<i32> {
     }
 
     println!("audit:");
+    let fallback = probe::fallback_status();
+    match fallback.reason() {
+        None => println!("  fallback observer: available"),
+        Some(reason) => println!("  fallback observer: unavailable ({reason})"),
+    }
     println!("  kernel BTF: {}", yes_no(caps.btf));
     if !caps.btf {
-        degraded = true;
-        println!("    `bailey audit` needs it to load the eBPF programs");
+        if fallback.is_available() {
+            println!(
+                "    the eBPF observer needs it to load the programs; audit will \
+                 use the fallback observer"
+            );
+        } else {
+            degraded = true;
+            println!("    `bailey audit` needs it to load the eBPF programs");
+        }
     }
     match &caps.helper {
         probe::HelperStatus::Ready(path) => {
@@ -657,11 +674,24 @@ fn cmd_doctor() -> anyhow::Result<i32> {
                 path.display()
             );
         }
-        probe::HelperStatus::Missing => {
-            degraded = true;
-            println!("  helper: not found");
-            println!("    `bailey audit` will not run; build it with -p bailey-bpf-helper");
-        }
+        probe::HelperStatus::Missing => match fallback.reason() {
+            None => {
+                println!("  helper: not found");
+                println!(
+                    "    audit will use the fallback observer; recording is less \
+                         complete than eBPF"
+                );
+            }
+            Some(reason) => {
+                degraded = true;
+                println!("  helper: not found");
+                println!(
+                    "    `bailey audit` will not run: neither observer is \
+                         available ({reason}); build the helper with -p \
+                         bailey-bpf-helper"
+                );
+            }
+        },
     }
 
     if !degraded {
@@ -1557,6 +1587,7 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
         implicit_write: Vec::new(),
         network: decision,
         guard_in_place,
+        audit_listener: None,
     };
     let code = backend.run(&resolved.policy, &target)?;
     if let Err(err) = resolved.hooks.run_post_exit(code) {
@@ -1628,6 +1659,7 @@ fn cmd_shell(args: ShellArgs) -> anyhow::Result<i32> {
         implicit_write: vec![dir.clone()],
         network: decision,
         guard_in_place,
+        audit_listener: None,
     };
     let code = backend.run(&resolved.policy, &target)?;
     if let Err(err) = resolved.hooks.run_post_exit(code) {
@@ -1789,6 +1821,7 @@ fn cmd_audit(args: AuditArgs) -> anyhow::Result<i32> {
         unconfined: args.unconfined,
         // Not defaulted on, unlike `run`: see the check above.
         isolate: false,
+        observer: args.observer,
     };
     let (code, trace) = backend.run_and_record(&resolved.policy, &target)?;
     if let Err(err) = resolved.hooks.run_post_exit(code) {
@@ -1800,6 +1833,9 @@ fn cmd_audit(args: AuditArgs) -> anyhow::Result<i32> {
             "bailey: warning: {} access(es) could not be recorded; this trace is incomplete",
             trace.dropped
         );
+    }
+    if let Some(reason) = &trace.loss {
+        eprintln!("bailey: note: {reason}");
     }
 
     if let Some(path) = &args.save_trace {
@@ -1827,6 +1863,15 @@ fn cmd_audit(args: AuditArgs) -> anyhow::Result<i32> {
     let effective = policy_with_own_storage(&resolved.policy, &target.program);
     let findings = reconcile::reconcile(&trace.events, &effective, &target_dir);
     print_findings(&findings, code);
+    if trace.observer == Observer::Seccomp {
+        eprintln!(
+            "bailey: note: recorded with the seccomp fallback observer, which is less \
+             complete than eBPF: it does not see the opens the kernel makes on the \
+             target's behalf (the ELF and script interpreters), a racing writer can \
+             skew what was recorded, and every observed open, exec and connect waits \
+             for bailey"
+        );
+    }
     Ok(code)
 }
 
@@ -2070,6 +2115,22 @@ fn cmd_profile_generate(args: GenerateArgs) -> anyhow::Result<i32> {
         println!(
             "# Generated from an incomplete trace: {} access(es) were not recorded.",
             trace.dropped
+        );
+    }
+    if let Some(reason) = &trace.loss {
+        println!("# {reason}.");
+    }
+    if trace.observer == Observer::Seccomp {
+        println!(
+            "# Recorded with the seccomp fallback observer, which is less complete than \
+             eBPF: kernel-internal opens (the ELF and script interpreters) are not \
+             seen, a racing writer can skew the trace, and every observed open, exec \
+             and connect waits for bailey."
+        );
+        eprintln!(
+            "bailey: note: this trace was recorded with the seccomp fallback observer, \
+             which is less complete than eBPF; the generated profile carries the same \
+             note"
         );
     }
     // What this grants is the difference between the trace and the policy it was

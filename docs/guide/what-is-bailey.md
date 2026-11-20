@@ -42,11 +42,12 @@ only once you have accepted it, because the file that decides how far to open a
 sandbox should not arrive with the thing being sandboxed.
 
 **Observes.** Audit mode runs a program while recording what it opens and connects
-to, using eBPF loaded by a small privileged helper. The trace is diffed against
-your current policy, and the difference is what you were missing. High-risk
-findings, such as network egress and credential reads, are separated from routine
-ones so that "generate a profile from this trace" cannot quietly bless a program's
-call home.
+to, with eBPF loaded by a small privileged helper, or, on hosts without the
+helper, with an unprivileged seccomp fallback that sees less and says so. The
+trace is diffed against your current policy, and the difference is what you
+were missing. High-risk findings, such as network egress and credential reads,
+are separated from routine ones so that "generate a profile from this trace"
+cannot quietly bless a program's call home.
 
 ## What bailey is not
 

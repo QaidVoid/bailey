@@ -331,6 +331,68 @@ captured and its `exec` is not.
 The run warns when it is on the fallback, and `bailey doctor` reports whether
 this host can provide a cgroup.
 
+### A fallback trace is not a subset of an eBPF trace
+
+When the privileged helper is unavailable, audit records with the seccomp
+notification observer, which sees less and sees it differently:
+
+- It records the opens it is notified of: `open`, `openat`, `openat2` and
+  `execve`. The opens the kernel performs on the target's behalf, such as
+  loading the ELF interpreter and a script's interpreter, never pass through
+  the target's syscalls and are not seen.
+- Its view of a path depends on memory reads that can lose a race. A writer
+  that replaces a string between the syscall and bailey's read can skew what
+  was recorded. Rare, but a hostile target can try to cause it.
+- A trace recorded with it says so: the run prints a note after its findings
+  and `profile generate` writes the same note into any profile it generates.
+
+An eBPF trace records events as the kernel streams them, with none of this.
+
+### The fallback observer adds latency the eBPF observer does not
+
+Every syscall the filter notifies stops the target until bailey has read what
+it needs from the target's memory and answered. Measured at about 7.5
+microseconds per observed open, exec and connect, paid once per syscall. A
+workload that opens tens of thousands of files pays it on every one.
+
+### A descendant left behind by a fallback audit loses its syscalls
+
+A fallback audit observes while the audited target lives. The seccomp filters
+it installs are inherited by every process the target creates, and inherited
+filters cannot be removed. When the target exits, bailey stops answering, and
+a descendant still running keeps filters that notify a listener that is gone.
+Its next open, exec or connect fails with `ENOSYS` ("Function not
+implemented"). The run ends when the target exits and does not wait for the
+descendant. The eBPF observer has no such tail: it watches from outside the
+target.
+
+### The fallback target cannot install a listener of its own
+
+seccomp user notification allows one listener per filter. During a fallback
+audit the slot is bailey's, so the target cannot install its own notification
+listener while it is being audited, whatever else the policy allows it. This
+closes a hole, not an opening: a target that could install its own listener
+would answer its own notifications.
+
+### A failed memory read is recorded as lost, not guessed
+
+To resolve a relative path or read a string argument, the fallback reads the
+target's memory through `/proc/<pid>/mem`, and a read that takes too long is
+abandoned. The event is counted in the trace's lost events, with the reason,
+and `profile generate` refuses such a trace without `--accept-truncated`. The
+run itself continues: the notification is answered and the syscall proceeds
+unrecorded.
+
+### The fallback does not weaken confinement
+
+The observer and the confinement share a mechanism and do not weaken each
+other. The filter a fallback audit installs lets only the audit-relevant
+syscalls reach bailey's listener; everything else proceeds under the same
+Landlock domain, mount namespace and capability drop as any other run. What
+the listener controls is the answer to those syscalls, which during an audit
+is always "continue". The target is never granted a right, an fd, or a path by
+being audited.
+
 ### A trace shows one run
 
 A program that behaves while it thinks it is being watched, or that only

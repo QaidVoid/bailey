@@ -21,7 +21,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
@@ -34,6 +34,7 @@ use landlock::{
     RulesetAttr, RulesetCreatedAttr, RulesetStatus, Scope,
 };
 
+use crate::backend::audit_notify;
 use crate::backend::cgroup;
 use crate::backend::forward;
 use crate::backend::fuse;
@@ -42,6 +43,11 @@ use crate::backend::network::{self, NetworkMode};
 use crate::backend::relay;
 use crate::backend::world::{self, World};
 use crate::backend::{Backend, BackendError, Target, random_suffix};
+
+/// The environment marker a fallback audit arms for its target, so an inner
+/// bailey can tell an inherited listener from plain filters and refuse to
+/// stack a second one.
+const AUDIT_LISTENER_MARKER: &str = "BAILEY_AUDIT_LISTENER";
 use crate::event::Usage;
 use crate::policy::{self, Egress, FsRule, Policy, PortForward, ResourceLimits};
 use crate::strings::quoted as json_string;
@@ -249,6 +255,10 @@ pub struct EnforceBackend {
     /// the guard, and creating a second one would spend its only slot before
     /// the run's own namespace asked for it.
     pub guard_in_place: bool,
+    /// The child end of the socketpair the seccomp fallback observer hands
+    /// its listener over through. `Some` only for a fallback audit; the run
+    /// paths never set it, and it refuses to combine with `isolate`.
+    pub audit_listener: Option<RawFd>,
 }
 
 /// How a run reports what it enforced.
@@ -285,6 +295,14 @@ impl EnforceBackend {
     /// it needs the target's PID, and needs the target held, before letting it
     /// run.
     pub fn spawn(&self, policy: &Policy, target: &Target) -> Result<Confined, BackendError> {
+        if self.audit_listener.is_some() && self.isolate {
+            return Err(BackendError::Command(
+                "the fallback observer cannot run under namespace isolation: the \
+                 recorded paths would name the reconstructed root's view of the \
+                 filesystem, which reconciliation cannot place"
+                    .into(),
+            ));
+        }
         report_degradation(policy);
         // Publication is arranged by the proxy network setup above this
         // backend. A policy that still asks for it here was never set up, and
@@ -699,8 +717,17 @@ impl EnforceBackend {
         };
         let stop_before_exec = self.stop_before_exec;
         let create_guard = creates_guard(self.guard_in_place);
+        let audit_listener = self.audit_listener;
         let file_bytes = policy.resources.file_bytes;
         let open_files = policy.resources.open_files;
+        // The marker tells an inner bailey that this run armed a listener: a
+        // stack holds exactly one, so a fallback audit the target starts must
+        // refuse. No kernel interface asks whether the inherited stack carries
+        // a listener rather than plain filters, so the built environment
+        // carries the answer instead.
+        if audit_listener.is_some() {
+            command.env(AUDIT_LISTENER_MARKER, "1");
+        }
         // The child end's descriptor number, valid in the forked child where
         // fd numbers are preserved. Sending goes from the child end; the
         // announce end below is the one the parent reads.
@@ -719,11 +746,13 @@ impl EnforceBackend {
             })
             .collect();
 
-        // Safety: the closure runs in the forked child before exec. Bailey is
-        // single-threaded at this point, so the usual fork-safety hazard of
-        // touching another thread's locks does not apply. Namespaces and the
-        // reconstructed root are set up first, then Landlock is applied against
-        // the new root, then seccomp closes the syscall surface last.
+        // Safety: the closure runs in the forked child before exec. Bailey
+        // may be multi-threaded at this point: the forward relay thread and
+        // the audit supervisor thread both exist, and both block in `recvmsg`
+        // at the fork, so neither holds a lock the child could inherit and
+        // then wait on. Namespaces and the reconstructed root are set up
+        // first, then Landlock is applied against the new root, then seccomp
+        // closes the syscall surface last.
         unsafe {
             command.pre_exec(move || {
                 set_no_new_privs()?;
@@ -808,6 +837,45 @@ impl EnforceBackend {
                 // outright; `unshare` and `setns` are denied for the same
                 // reason.
                 drop_capabilities(keep_mount)?;
+                // The fallback audit's observer, armed last of all: nothing
+                // bailey does in the child after this point is notified
+                // except the final exec, and the listener crosses to the
+                // supervisor before the target can name anything. The child
+                // end of the handover socket is close-on-exec, so it does not
+                // survive into the target either.
+                if let Some(handover) = audit_listener {
+                    // An inherited listener means this audit is nested
+                    // inside another fallback audit, and a stack holds
+                    // exactly one. The outer run arms the marker with its
+                    // target's environment, so the marker is what refuses
+                    // cleanly. Mainstream kernels answer the second install
+                    // with EBUSY (EINVAL where the arming task is a fork of
+                    // an observed process), which covers a listener nobody
+                    // marked; some kernels let the install stand and fail
+                    // the exec instead, and the errno mapping below is what
+                    // names those.
+                    if std::env::var_os(AUDIT_LISTENER_MARKER).is_some() {
+                        return Err(io::Error::other(
+                            "a seccomp listener already observes this \
+                             process, and a fallback audit cannot run \
+                             nested",
+                        ));
+                    }
+                    audit_notify::arm(handover).map_err(|err| {
+                        if err
+                            .raw_os_error()
+                            .is_some_and(|errno| errno == libc::EBUSY || errno == libc::EINVAL)
+                        {
+                            io::Error::other(
+                                "a seccomp listener already observes this \
+                                 process, and a fallback audit cannot run \
+                                 nested",
+                            )
+                        } else {
+                            err
+                        }
+                    })?;
+                }
                 // This process is PID 1 of the sandbox. Exec'ing the target
                 // here would make the target the namespace's init, and the
                 // kernel reaps nothing for an init: every orphan the target
@@ -2284,9 +2352,9 @@ fn build_seccomp_filter(self_fuse: bool) -> anyhow::Result<seccompiler::BpfProgr
 /// reports it in `seccomp_data.arch`, and every rule's syscall number is only
 /// meaningful for this one.
 #[cfg(target_arch = "x86_64")]
-const NATIVE_AUDIT_ARCH: u32 = 0xc000_003e;
+pub(crate) const NATIVE_AUDIT_ARCH: u32 = 0xc000_003e;
 #[cfg(target_arch = "aarch64")]
-const NATIVE_AUDIT_ARCH: u32 = 0xc000_00b7;
+pub(crate) const NATIVE_AUDIT_ARCH: u32 = 0xc000_00b7;
 
 /// Builds the guard instructions that precede every generated filter.
 ///
@@ -2616,6 +2684,28 @@ fn limits_skip_reason(failure: Option<&str>, scope_failure: Option<&str>) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A listener handover cannot be combined with namespace isolation. The
+    /// guard runs before any setup, so the refusal costs nothing and leaves
+    /// no world behind.
+    #[test]
+    fn an_audit_listener_refuses_isolation() {
+        let backend = EnforceBackend {
+            isolate: true,
+            audit_listener: Some(3),
+            ..EnforceBackend::default()
+        };
+        let target = Target {
+            program: PathBuf::from("/bin/true"),
+            args: Vec::new(),
+            cwd: None,
+        };
+        let err = match backend.spawn(&Policy::default(), &target) {
+            Err(err) => err,
+            Ok(_) => panic!("the combination is refused"),
+        };
+        assert!(err.to_string().contains("namespace isolation"), "{err}");
+    }
     use crate::policy::{Access, DeviceRule, Egress, FsRule, PortForward, ResourceLimits};
     use std::collections::BTreeSet;
     use std::io::Write as _;

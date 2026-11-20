@@ -32,7 +32,8 @@ Then find out what it wanted:
 bailey audit --save-trace trace.json ./program
 ```
 
-Without the audit helper installed, `strace -f -e trace=file ./program` outside the
+Without any observer installed (no helper, and a kernel older than the
+seccomp fallback needs), `strace -f -e trace=file ./program` outside the
 sandbox gives you a rougher version of the same answer.
 
 ## Something that exists says "No such file or directory"
@@ -195,6 +196,11 @@ ls -l target/release/bailey-bpf-helper
 getcap target/release/bailey-bpf-helper
 BAILEY_BPF_HELPER=$PWD/target/release/bailey-bpf-helper bailey audit ./program
 ```
+
+A missing helper does not stop an audit: bailey falls back to the unprivileged
+seccomp observer and says so. Follow that warning back to the helper if you
+want the fuller trace, or pass `--observer seccomp` deliberately. Use
+`--observer ebpf` to fail instead of falling back.
 
 ## A network rule seems to do nothing
 

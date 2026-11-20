@@ -9,6 +9,7 @@ format is read by `bailey profile generate --trace`.
 {
   "version": 1,
   "dropped": 0,
+  "observer": "ebpf",
   "events": [
     {
       "kind": "read",
@@ -32,7 +33,6 @@ format is read by `bailey profile generate --trace`.
 by name rather than misread. `dropped` is the number of accesses the recorder
 could not deliver; anything above zero makes the trace truncated, and
 `profile generate` refuses it without `--accept-truncated`.
-
 ## Fields
 
 | Field | Type | Description |
@@ -42,6 +42,8 @@ could not deliver; anything above zero makes the trace truncated, and
 | `pid` | integer | PID of the accessing process |
 | `timestamp_ns` | integer | Monotonic kernel timestamp |
 | `resolution` | string | `absolute`, `userspace`, `unresolved`, or `not_applicable` |
+| `observer` | string | `ebpf` or `seccomp`. Absent means an older trace, which recorded with eBPF |
+| `loss` | string | Why events beyond the count are missing, when the trace knows. Only the fallback observer sets it, when memory reads stopped entirely |
 
 `host` is optional and may be `null` for a bind event.
 
@@ -58,6 +60,9 @@ relative path names nothing in particular.
   complete.
 - **A short-lived child can be missed.** See
   [known limitations](/security/limitations).
+- **A seccomp trace records less than an eBPF trace.** Its `observer` field
+  says so; the coverage difference and what it means for a generated profile
+  are described under [without the helper](/guide/audit#without-the-helper).
 
 ## Working with a trace
 

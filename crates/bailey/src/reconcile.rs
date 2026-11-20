@@ -15,7 +15,7 @@
 //! from a single run is a gamble.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::backend::world;
 use crate::event::{AccessEvent, AccessKind, Resolution, Resource, Usage};
@@ -462,6 +462,9 @@ pub fn never_generated(path: &Path) -> bool {
 }
 
 fn never_generated_under_home(path: &Path, home: Option<&Path>) -> bool {
+    // The tier judges the path the way the kernel resolves it, so a
+    // lexical `..` cannot name a longer spelling to dodge the rule with.
+    let path = &normalise(path);
     if path == Path::new("/") {
         return true;
     }
@@ -478,6 +481,25 @@ fn never_generated_under_home(path: &Path, home: Option<&Path>) -> bool {
         .iter()
         .map(|component| home.join(component))
         .any(|location| location.starts_with(path))
+}
+
+/// A path without `.` or `..` components, resolved lexically. A `..` at the
+/// root clamps the way the kernel resolves one; a relative path stays
+/// relative.
+fn normalise(path: &Path) -> PathBuf {
+    let mut kept = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if let Some(Component::Normal(_)) = kept.last() {
+                    kept.pop();
+                }
+            }
+            other => kept.push(other),
+        }
+    }
+    kept.into_iter().collect()
 }
 
 fn is_credential_path(path: &Path) -> bool {
@@ -551,6 +573,41 @@ mod tests {
             timestamp_ns: 0,
             resolution: Resolution::NotApplicable,
         }
+    }
+
+    /// The tier reads the path the way the kernel resolves it, so a lexical
+    /// `..` cannot hide the home behind a longer spelling.
+    #[test]
+    fn a_dotdot_spelling_is_judged_after_normalisation() {
+        let home = Path::new("/home/user");
+        assert!(
+            never_generated_under_home(Path::new("/home/user/proj/.."), Some(home)),
+            "/home/user/proj/.. is the home once the `..` resolves"
+        );
+        assert!(
+            never_generated_under_home(Path::new("/home/user/proj/../.ssh"), Some(home)),
+            "the credential path behind the `..` is still a credential path"
+        );
+    }
+
+    /// A finding whose path carries `..` is granted nowhere: the tier judges
+    /// the normalised path, so `/home/user/proj/..` comes back withheld
+    /// rather than becoming a home-wide read in a generated profile.
+    #[test]
+    fn a_dotdot_path_is_withheld_like_the_path_it_names() {
+        let home = Path::new("/home/user");
+        let findings = vec![Finding {
+            kind: AccessKind::Read,
+            resource: Resource::Path(PathBuf::from("/home/user/proj/..")),
+            risk: Risk::Low,
+            unresolved: false,
+        }];
+        let (profile, withheld) = generate_profile_under_home(&findings, Some(home));
+        assert!(
+            !profile.contains("/home/user"),
+            "the path normalises to the home, which is never granted: {profile}"
+        );
+        assert_eq!(withheld, vec!["/home/user/proj/..".to_owned()]);
     }
 
     #[test]

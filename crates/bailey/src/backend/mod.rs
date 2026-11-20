@@ -7,9 +7,11 @@
 
 pub mod audit;
 pub mod audit_helper;
+pub(crate) mod audit_notify;
 pub mod cgroup;
 pub(crate) mod dbus;
 pub mod enforce;
+pub(crate) mod fdpass;
 pub mod forward;
 pub mod fuse;
 pub mod isolation;

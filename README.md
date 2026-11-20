@@ -40,7 +40,7 @@ needs" into a profile you can read.
 | Resources | cgroup v2 | Caps memory, process count, and CPU |
 | World | user, mount, PID, UTS namespaces | Rebuilds the root from the policy, so ungranted paths are absent rather than merely denied, host processes are invisible, and the target is not told the machine's name |
 | Reachability | Landlock scoping | Host abstract UNIX sockets and processes outside the sandbox are out of reach |
-| Observation | eBPF, via a privileged helper | Records what the program opens and connects to, without blocking it |
+| Observation | eBPF via a privileged helper, or an unprivileged seccomp fallback | Records what the program opens and connects to, without blocking it |
 | Coverage | Inheritance | `bailey shell` confines a shell, and a Landlock ruleset cannot be dropped, so everything started from it is confined too |
 
 One policy drives all of it. Config resolves into a single mechanism-independent
@@ -59,8 +59,9 @@ stable toolchain and no system dependencies:
 cargo build --release
 ```
 
-The audit recorder is a separate, minimal binary that loads the eBPF programs.
-Building it needs nightly and `bpf-linker`:
+The audit recorder has two observers. The eBPF one is a separate, minimal
+binary that loads the eBPF programs; building it needs nightly and
+`bpf-linker`:
 
 ```sh
 rustup toolchain install nightly
@@ -76,7 +77,9 @@ sudo setcap cap_bpf,cap_perfmon+ep ./target/release/bailey-bpf-helper
 ```
 
 The main tool finds the helper through `BAILEY_BPF_HELPER`, then next to its own
-executable, then on `PATH`.
+executable, then on `PATH`. Without it, `bailey audit` still runs on Linux 5.5+:
+it says so and records with the unprivileged seccomp fallback, which sees less
+than eBPF.
 
 ## Quick start
 
@@ -196,7 +199,9 @@ high-risk findings are separated and never included without an explicit opt-in.
   and egress is restricted by TCP port only.
 - Cgroup v2 with a writable delegated cgroup for resource limits. Without one,
   limits are skipped with a warning rather than failing the run.
-- Kernel BTF and the privileged helper for `bailey audit`.
+- For `bailey audit`: the privileged helper with kernel BTF for the full eBPF
+  trace, or nothing at all beyond Linux 5.5 for the unprivileged seccomp
+  fallback, which records less and says so.
 
 ## What bailey does not do yet
 

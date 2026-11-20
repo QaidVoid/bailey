@@ -30,7 +30,7 @@ use crate::backend::{BackendError, Target};
 use crate::event::{AccessEvent, AccessKind, Resolution, Resource, Trace, Usage};
 
 /// Maximum number of events retained, to bound memory for chatty targets.
-const MAX_EVENTS: usize = 200_000;
+pub(crate) const MAX_EVENTS: usize = 200_000;
 
 /// How long to wait for the target to stop before exec, and for the helper to
 /// acknowledge the scope.

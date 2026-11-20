@@ -9,8 +9,20 @@ bailey audit --save-trace trace.json ./program
 
 ## What it does
 
-The program runs while eBPF programs record the filesystem and network access of
-its process tree. When it exits, the trace is diffed against your current resolved
+The program runs while bailey records the filesystem and network access of its
+process tree, and reports everything the resolved policy does not already
+grant. Two observers can do the recording, chosen with `--observer`:
+
+- **eBPF** (the default when available): the privileged helper loads programs
+  that hook the kernel below the syscalls and stream events out.
+- **seccomp** (the fallback): a seccomp notification listener answers the
+  target's opens, execs and connects one by one, with no helper and no
+  privilege.
+
+By default bailey starts the eBPF helper and falls back to seccomp when the
+helper cannot run, saying so. See [Without the helper](#without-the-helper).
+
+When the program exits, the trace is diffed against your current resolved
 policy, and everything the policy does not already grant is reported:
 
 ```
@@ -125,32 +137,106 @@ findings are separated and never included silently.
 The resolved policy applies during an audit, widened only by read access to the
 target's own directory. A program audited under the default policy still cannot
 reach your home directory or the network; the attempts are recorded instead.
-`--unconfined` lifts that, and says so when it does.
+`--unconfined` lifts that, and says so when it does. It needs the eBPF
+observer, because the fallback observes through the very filter that
+`--unconfined` would lift.
 :::
 
 ## Requirements and privilege
 
-Audit needs the `bailey-bpf-helper` binary with `CAP_BPF` and `CAP_PERFMON`, and a
-kernel with BTF. See [installation](/guide/installation).
+Audit has two observers, and they need different things.
 
-The helper does not run the program. The unprivileged main tool spawns it and tells
-the helper which PID to observe, so the program never runs with elevated
-privilege. The helper loads a fixed set of eBPF programs and copies bytes; that is
-its entire job.
+The eBPF observer needs the `bailey-bpf-helper` binary with `CAP_BPF` and
+`CAP_PERFMON`, and a kernel with BTF. The seccomp observer needs only Linux
+5.5 or newer, and no privilege at all. Either one is enough to audit. See
+[installation](/guide/installation).
+
+Neither observer runs the program. The unprivileged main tool spawns or
+notifies, and the program never runs with elevated privilege. The helper loads
+a fixed set of eBPF programs and copies bytes; that is its entire job.
+
+## Without the helper
+
+`--observer` selects who records:
+
+- `auto` (the default) starts the helper; when it cannot run, records with the
+  fallback and says so.
+- `ebpf` uses the helper only. Without it, the audit fails.
+- `seccomp` uses the fallback only, which needs Linux 5.5+ and no privilege.
+
+Auto-falling back is loud, twice. When the helper is not found, the run prints
+the reason and the cost before the target starts:
+
+```
+bailey: warning: required kernel feature unavailable: no `bailey-bpf-helper`
+found. Looked at $BAILEY_BPF_HELPER, beside this executable, and on PATH.
+Build it with `cargo build --release -p bailey-bpf-helper`, then grant it
+capabilities with `setcap cap_bpf,cap_perfmon+ep`.; recording with the seccomp
+fallback observer instead. It is less complete than eBPF, and each observed
+open, exec and connect waits for bailey.
+```
+
+and after the findings, what the fallback does not see:
+
+```
+bailey: note: recorded with the seccomp fallback observer, which is less
+complete than eBPF: it does not see the opens the kernel makes on the target's
+behalf (the ELF and script interpreters), a racing writer can skew what was
+recorded, and every observed open, exec and connect waits for bailey
+```
+
+A profile generated from such a trace carries the same note as a header
+comment.
+
+The cost is real but bounded: each observed syscall stops the target until
+bailey has read what it needs out of the target's memory and continued it,
+which measured about 7.5 microseconds per open, exec and connect. A workload
+that opens tens of thousands of files pays it on every one; see
+[benchmarks](/reference/benchmarks). `bailey doctor` reports whether the
+fallback is available on this host, under `audit:`.
+
+### What each observer sees
+
+| | eBPF | seccomp fallback |
+| --- | --- | --- |
+| Opens by the target, however named | Every one, seen at `do_filp_open` | `open`, `openat`, `openat2` |
+| Opens the kernel makes on the target's behalf (ELF and script interpreters) | Seen | Not seen |
+| Executions | Every one, seen at `do_open_execat` | `execve` |
+| Outbound connects | IPv4 and IPv6 | IPv4 and IPv6 (`AF_INET`, `AF_INET6`) |
+| Relative paths | Resolved against the accessing process's working directory | Same |
+| Delivery | Streamed from the kernel, off the target's critical path | Each observed syscall waits for bailey |
+| Privilege | Helper with `CAP_BPF`, `CAP_PERFMON`, kernel BTF | None; Linux 5.5+ |
+
+The fallback's own filter is what makes it work, so it cannot audit an
+unconfined run: `--unconfined` needs the eBPF observer.
+
+### Descendants left behind
+
+A fallback audit observes while the audited target lives. If the target exits
+and leaves a descendant running (a backgrounded job, a daemon it forked), that
+descendant keeps the filter but has no listener behind it anymore: its next
+open, exec or connect fails with `ENOSYS` ("Function not implemented"). The
+run itself ends when the target exits, and does not wait for the descendant.
+Record what you meant to record before backgrounding work, or leave the
+background work to a supervisor that outlives the audit.
 
 ## What the trace covers
 
-Every way of opening a path, because the recorder attaches below the syscalls at
-`do_filp_open` rather than to `openat` alone. Program executions. Outbound
-connections, IPv4 and IPv6. Each event carries a timestamp and the path as the
-kernel resolved it; a relative path is resolved against the accessing process's
-working directory and marked as such, and one that could not be resolved is
-listed separately rather than compared against your policy as though it were
-absolute.
+Both observers record the same event shapes. The eBPF observer sees every way
+of opening a path, because its programs attach below the syscalls at
+`do_filp_open` rather than to `openat` alone. The fallback sees the syscalls
+its filter notifies it about. Program executions. Outbound connections, IPv4
+and IPv6. Each event carries a timestamp and the path as the kernel resolved
+it; a relative path is resolved against the accessing process's working
+directory and marked as such, and one that could not be resolved is listed
+separately rather than compared against your policy as though it were
+absolute. See [What each observer sees](#what-each-observer-sees) for the
+difference in coverage.
 
-The trace records what it lost. If the kernel could not deliver an event, or the
-event cap was reached, the count reaches the trace and `profile generate` refuses
-to turn it into a profile without `--accept-truncated`.
+The trace records what it lost. If the kernel could not deliver an event, the
+event cap was reached, or the fallback gave up on a memory read, the count and
+the reason reach the trace and `profile generate` refuses to turn it into a
+profile without `--accept-truncated`.
 
 ### Resource peaks
 

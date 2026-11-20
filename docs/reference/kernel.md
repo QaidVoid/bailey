@@ -15,7 +15,8 @@ reports what it could not enforce.
 | Unprivileged user namespaces | The isolation layer, and a denied egress | long-standing, often disabled | Falls back to Landlock and seccomp, warned; egress is restricted by TCP port only |
 | cgroup v2 with delegation | Resource limits | long-standing | Limits skipped, warned |
 | seccomp filters | Syscall denylist | long-standing | Run fails to establish |
-| BTF (`/sys/kernel/btf/vmlinux`) | Audit backend | 5.x with `CONFIG_DEBUG_INFO_BTF` | Audit unavailable |
+| seccomp user notification with `SECCOMP_USER_NOTIF_FLAG_CONTINUE` | The fallback audit observer | 5.5 | Audit needs the privileged helper; without it, `bailey audit` refuses |
+| BTF (`/sys/kernel/btf/vmlinux`) | The eBPF audit observer | 5.x with `CONFIG_DEBUG_INFO_BTF` | Audit records with the fallback observer, which sees less |
 
 ## Checking
 

@@ -152,9 +152,16 @@ accesses the current policy does not grant, split into high-risk and routine.
 | `-p, --profile <NAME>` | Profile used as the base, as for `run` |
 | `--save-trace <FILE>` | Write the recorded trace as JSON |
 | `--unconfined` | Run with no confinement at all, reported when used |
+| `--observer <AUTO\|EBPF\|SECCOMP>` | Who records. `auto` (the default) starts the privileged helper and falls back to the unprivileged seccomp observer, loudly, when it cannot run. `ebpf` fails without the helper. `seccomp` never uses the helper; it needs Linux 5.5+ and records less: no kernel-internal opens, and every observed open, exec and connect waits for bailey |
 
 The resolved policy applies during an audit; the accesses it denies are recorded
-rather than permitted. `--unconfined` lifts that.
+rather than permitted. `--unconfined` lifts that, and needs `--observer ebpf`:
+the seccomp observer observes through the very filter `--unconfined` would
+lift, so the two cannot combine.
+
+The seccomp observer records outbound connects only for IPv4 and IPv6
+(`AF_INET`, `AF_INET6`); other address families, including UNIX sockets, are
+not recorded. The eBPF observer records the same IPv4 and IPv6 coverage.
 
 Audit the target by its absolute path. A path opened relatively cannot be
 resolved after the fact, and an unresolved finding is reported but never
@@ -166,7 +173,9 @@ namespace, so `--isolate` is rejected with an explanation rather than ignored.
 
 Port publication is not available in audit, including entries from config.
 
-Requires the privileged audit helper. See [installation](/guide/installation).
+Audit needs one of its two observers: the privileged helper for eBPF, or just
+Linux 5.5+ for the seccomp fallback. See [installation](/guide/installation)
+and [without the helper](/guide/audit#without-the-helper).
 
 ## `bailey show`
 
@@ -248,8 +257,9 @@ A shell with no integration is refused rather than given untested code. See
 Reports what this host can enforce and what each gap costs: the Landlock ABI and
 which policy elements it covers, user namespaces, cgroup delegation, kernel BTF,
 whether the private network mode is available, with what automatic mode
-will do as a result, and whether the audit helper can actually load its
-programs. See [knowing what was enforced](/guide/diagnostics).
+will do as a result, and which audit observer is available: whether the helper
+can actually load its programs, and whether the seccomp fallback is possible.
+See [knowing what was enforced](/guide/diagnostics).
 
 ## `bailey completions <shell>` and `bailey man`
 

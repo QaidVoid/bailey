@@ -64,6 +64,49 @@ fn doctor_reports_every_mechanism_with_its_consequence() {
     }
 }
 
+/// `doctor` says whether the fallback observer can record, and what audit
+/// does without the helper when the fallback stands in for it.
+#[test]
+fn doctor_reports_the_fallback_observer() {
+    let output = run(&["doctor"]);
+    assert!(output.status.success());
+    let report = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        report.contains("audit:"),
+        "doctor must have an audit section: {report}"
+    );
+    assert!(
+        report.contains("fallback observer: available")
+            || report.contains("fallback observer: unavailable ("),
+        "the fallback must be reported as available or named unavailable: {report}"
+    );
+
+    if !bailey::backend::probe::fallback_status().is_available() {
+        common::skip("the fallback observer is unavailable on this host");
+        return;
+    }
+
+    // Where the fallback stands in, a missing helper is a degraded audit,
+    // not a missing audit: doctor must say audit will still run. A host
+    // with a discoverable helper never reaches that branch, so it skips.
+    if bailey::backend::probe::locate_helper().is_some() {
+        common::skip("a helper is discoverable on this host");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let output = Command::new(bailey())
+        .arg("doctor")
+        .env("BAILEY_BPF_HELPER", dir.path().join("no-such-helper"))
+        .output()
+        .unwrap();
+    let report = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        report.contains("audit will use the fallback observer"),
+        "a missing helper with the fallback available must say so: {report}"
+    );
+}
+
 #[test]
 fn doctor_explains_what_a_missing_feature_costs() {
     let output = run(&["doctor"]);
@@ -665,10 +708,13 @@ fn a_profile_others_can_write_is_refused() {
 /// name.
 ///
 /// Runs a sibling test binary that skips on a host without the audit
-/// helper, and asserts the line it appends. Cargo is invoked for the child
-/// so the sibling is found whatever layout the target directory uses; the
-/// build lock is not held while tests execute, so the nested invocation
-/// only re-checks fingerprints and runs.
+/// helper, and asserts the lines it appends. The audit tests skip per
+/// observer, so the eBPF variant's key carries its variant. Which lines
+/// appear depends on whether this host can also run the fallback: with it,
+/// only the eBPF variant skips; without it, both do. Cargo is invoked for
+/// the child so the sibling is found whatever layout the target directory
+/// uses; the build lock is not held while tests execute, so the nested
+/// invocation only re-checks fingerprints and runs.
 #[test]
 fn a_skip_is_logged_where_ci_reads_it() {
     if std::env::var_os("BAILEY_BPF_HELPER").is_some() {
@@ -701,9 +747,16 @@ fn a_skip_is_logged_where_ci_reads_it() {
         String::from_utf8_lossy(&output.stderr)
     );
     let line = std::fs::read_to_string(&log).unwrap();
+    let mut expected =
+        "audit::startup_access_is_recorded[ebpf]\tno audit helper configured\n".to_owned();
+    if !bailey::backend::probe::fallback_status().is_available() {
+        expected.push_str(
+            "audit::startup_access_is_recorded[seccomp]\tthe fallback observer is unavailable on this host\n",
+        );
+    }
     assert_eq!(
-        line, "audit::startup_access_is_recorded\tno audit helper configured\n",
-        "the skip must be logged under the crate and test the expectation files name"
+        line, expected,
+        "the skip must be logged under the crate, test and variant the expectation files name"
     );
 }
 

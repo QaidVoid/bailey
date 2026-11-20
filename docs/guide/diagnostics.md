@@ -19,6 +19,7 @@ kernel:
     resource limits will be skipped
     systemd is not init; there is no user manager to ask
 audit:
+  fallback observer: available
   kernel BTF: yes
   helper: ready (/usr/local/bin/bailey-bpf-helper)
 ```
@@ -40,7 +41,25 @@ not linger (`loginctl enable-linger` to opt in), a private socket that is
 missing or not served by your uid, or the manager's own refusal.
 
 `doctor` starts the audit helper to find out whether it can really load its
-programs, rather than guessing from the file being present.
+programs, rather than guessing from the file being present. The fallback
+observer is probed the same way: the real seccomp mechanism runs in a
+throwaway child, so the answer is what the kernel would do, not what a feature
+column says. With the helper missing but the fallback available, the cost is
+named rather than counted as a failure:
+
+```
+  helper: not found
+    audit will use the fallback observer; recording is less complete than eBPF
+```
+
+and with neither observer available, audit is the one thing that refuses
+instead of degrading:
+
+```
+  helper: not found
+    `bailey audit` will not run: neither observer is available (...);
+    build the helper with -p bailey-bpf-helper
+```
 
 ## After a run
 

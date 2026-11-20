@@ -5,10 +5,17 @@
 //! enforce before running anything rather than after a program mysteriously
 //! fails.
 
+use std::ffi::CString;
+use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
+use crate::backend::audit_notify;
 use crate::backend::cgroup;
+use crate::backend::fdpass;
 use crate::backend::isolation;
 
 /// `landlock_create_ruleset`, which reports the supported ABI when asked for the
@@ -216,6 +223,190 @@ fn helper_is_trusted(candidate: &Path) -> bool {
     std::fs::metadata(candidate)
         .map(|meta| meta.is_file() && runnable_as_caller(&meta))
         .unwrap_or(false)
+}
+
+/// Whether the seccomp notification fallback observer can run on this host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FallbackStatus {
+    /// The whole mechanism works: the listener arms, hands over, and the
+    /// supervisor can read the target's memory.
+    Available,
+    /// A listener already watches this process, so a second cannot exist.
+    /// A fallback audit nested inside one, or any sandbox that installed its
+    /// own listener, lands here.
+    Busy,
+    /// The kernel has no user notification, so it is older than 5.0.
+    NoUserNotif,
+    /// The kernel has no `CONTINUE`, so it is older than 5.5.
+    NoContinue,
+    /// The supervisor cannot read target memory, usually a hardened Yama
+    /// `ptrace_scope`.
+    MemoryRead(String),
+    /// Some other reason, carried in the text.
+    Unavailable(String),
+}
+
+impl FallbackStatus {
+    /// Why the fallback is unavailable, when it is.
+    pub fn reason(&self) -> Option<String> {
+        match self {
+            FallbackStatus::Available => None,
+            FallbackStatus::Busy => Some(
+                "a seccomp listener already observes this process, and a \
+                 fallback audit cannot run nested"
+                    .to_owned(),
+            ),
+            FallbackStatus::NoUserNotif => {
+                Some("this kernel has no seccomp user notification (needs Linux 5.5)".to_owned())
+            }
+            FallbackStatus::NoContinue => {
+                Some("this kernel cannot continue a notified syscall (needs Linux 5.5)".to_owned())
+            }
+            FallbackStatus::MemoryRead(reason) => Some(reason.clone()),
+            FallbackStatus::Unavailable(reason) => Some(reason.clone()),
+        }
+    }
+
+    /// Whether the fallback observer can record.
+    pub fn is_available(&self) -> bool {
+        matches!(self, FallbackStatus::Available)
+    }
+}
+
+/// Run the fallback mechanism for real, in a throwaway child, and report
+/// what happened.
+///
+/// The child arms a listener over `openat` through the same install and
+/// handover the audit uses, then opens `/`. The parent plays the supervisor
+/// once: it reads the path from the child's memory and continues the
+/// syscall. The probe informs `doctor`; `auto` selection asks the helper
+/// directly instead, so this never gates a run.
+pub fn fallback_status() -> FallbackStatus {
+    let (parent_end, child_end) = match UnixStream::pair() {
+        Ok(ends) => ends,
+        Err(err) => return FallbackStatus::Unavailable(format!("no socketpair: {err}")),
+    };
+    // The handover must not wait forever: a kernel that accepts the install
+    // but never delivers the listener would hang the caller.
+    if let Err(err) = parent_end.set_read_timeout(Some(Duration::from_secs(2))) {
+        return FallbackStatus::Unavailable(format!("no socket timeout: {err}"));
+    }
+    let handover = child_end.as_raw_fd();
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return FallbackStatus::Unavailable(format!("no fork: {}", io::Error::last_os_error()));
+    }
+    if pid == 0 {
+        // In the probe child. Exit codes distinguish the install failures:
+        // 4 for EBUSY, 5 for EINVAL, 3 for anything else.
+        drop(parent_end);
+        // Installing a filter needs either this or CAP_SYS_ADMIN, exactly as
+        // it does in the audit's own pre-exec.
+        let nnp = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+        let status = if nnp != 0 {
+            3
+        } else {
+            match audit_notify::arm(handover) {
+                Ok(()) => 0,
+                Err(err) => match err.raw_os_error() {
+                    Some(libc::EBUSY) => 4,
+                    Some(libc::EINVAL) => 5,
+                    _ => 3,
+                },
+            }
+        };
+        if status == 0 {
+            let path = CString::new("/").expect("a path without NUL");
+            unsafe {
+                libc::openat(libc::AT_FDCWD, path.as_ptr(), libc::O_PATH);
+            }
+        }
+        unsafe { libc::_exit(status) };
+    }
+    drop(child_end);
+    let outcome = probe_from_parent(parent_end, pid as u32);
+    let mut status: libc::c_int = 0;
+    unsafe { libc::waitpid(pid, &mut status, 0) };
+    outcome
+}
+
+/// The parent half of the probe: serve one notification like the supervisor
+/// would, and classify whatever goes wrong.
+fn probe_from_parent(parent_end: UnixStream, pid: u32) -> FallbackStatus {
+    let listener = match fdpass::recv_fds(&parent_end, 1, "probe listener") {
+        Ok(fds) => unsafe { OwnedFd::from_raw_fd(fds[0]) },
+        Err(_) => {
+            return match wait_status(pid) {
+                4 => FallbackStatus::Busy,
+                5 => FallbackStatus::NoUserNotif,
+                code => FallbackStatus::Unavailable(format!(
+                    "the probe child could not arm a listener (exit {code})"
+                )),
+            };
+        }
+    };
+    let (notif_size, resp_size) = match audit_notify::notif_sizes() {
+        Ok(sizes) => sizes,
+        Err(err) => return unavailable_after(pid, listener, err),
+    };
+    let mut notif = vec![0u8; notif_size];
+    let mut resp = vec![0u8; resp_size];
+    // The notification sits on the listener until it is read or the child
+    // dies; bound the wait so the probe can never hang.
+    let mut pollfd = libc::pollfd {
+        fd: listener.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let ready = unsafe { libc::poll(&mut pollfd, 1, 2000) };
+    if ready <= 0 {
+        return unavailable_after(
+            pid,
+            listener,
+            io::Error::other("the probe notification never arrived"),
+        );
+    }
+    loop {
+        match audit_notify::recv_notification(listener.as_raw_fd(), &mut notif) {
+            Ok(()) => break,
+            Err(err) if err.raw_os_error() == Some(libc::ENOENT) => continue,
+            Err(err) => return unavailable_after(pid, listener, err),
+        }
+    }
+    let notification: libc::seccomp_notif =
+        unsafe { std::ptr::read_unaligned(notif.as_ptr().cast()) };
+    let path_pointer = notification.data.args[1];
+    if let Err(err) = audit_notify::read_memory_now(pid, path_pointer, 2) {
+        return FallbackStatus::MemoryRead(format!(
+            "target memory could not be read ({err}); check the Yama ptrace_scope policy"
+        ));
+    }
+    if let Err(err) = audit_notify::reply_continue(listener.as_raw_fd(), notification.id, &mut resp)
+    {
+        return match err.raw_os_error() {
+            Some(libc::EINVAL) => FallbackStatus::NoContinue,
+            _ => unavailable_after(pid, listener, err),
+        };
+    }
+    FallbackStatus::Available
+}
+
+/// Close the listener so the held probe syscall fails, then say why.
+fn unavailable_after(pid: u32, listener: OwnedFd, err: io::Error) -> FallbackStatus {
+    drop(listener);
+    let _ = wait_status(pid);
+    FallbackStatus::Unavailable(format!("the probe run failed: {err}"))
+}
+
+/// The probe child's exit code, 0 when it cannot be read.
+fn wait_status(pid: u32) -> i32 {
+    let mut status: libc::c_int = 0;
+    unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
+    if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else {
+        0
+    }
 }
 
 #[cfg(test)]

@@ -174,6 +174,34 @@ def main() -> None:
     )
     table(rows, rows[0][1]["median"])
 
+    print("== observing that workload ==\n")
+    # An audit needs an observer. Which ones this host can run decides which
+    # cases make sense to time.
+    doctor = subprocess.run([bailey, "doctor"], capture_output=True, text=True).stdout
+    open(os.path.join(root, "audit.toml"), "w").write(
+        "[filesystem]\nread = [\"/usr/include\"]\n"
+    )
+    observe = [("no observer", ["/bin/sh", "-c", work])]
+    if "helper: ready" in doctor:
+        observe.append(
+            (
+                "eBPF observer",
+                [bailey, "audit", "--observer", "ebpf", "-c", f"{root}/audit.toml", "/bin/sh", "-c", work],
+            )
+        )
+    if "fallback observer: available" in doctor:
+        observe.append(
+            (
+                "seccomp fallback observer",
+                [bailey, "audit", "--observer", "seccomp", "-c", f"{root}/audit.toml", "/bin/sh", "-c", work],
+            )
+        )
+    if len(observe) > 1:
+        rows = compare(observe, root, env, heavy_runs, 2)
+        table(rows, rows[0][1]["median"])
+    else:
+        print("(no audit observer available on this host)\n")
+
 
 if __name__ == "__main__":
     sys.exit(main())

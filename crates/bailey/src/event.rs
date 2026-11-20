@@ -90,6 +90,18 @@ pub struct Usage {
     pub unmeasured: Vec<String>,
 }
 
+/// Which observer recorded a trace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Observer {
+    /// The privileged eBPF helper. The complete observer.
+    #[default]
+    Ebpf,
+    /// The seccomp notification fallback, used where the helper cannot run.
+    /// It records less, and every observed syscall waits for bailey.
+    Seccomp,
+}
+
 /// A recorded session, with what the backend knows about its completeness.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Trace {
@@ -105,6 +117,15 @@ pub struct Trace {
     /// suggesting limits from nothing.
     #[serde(default)]
     pub usage: Option<Usage>,
+    /// The observer that recorded the trace. Absent on traces written before
+    /// traces named their observer, which are eBPF traces.
+    #[serde(default)]
+    pub observer: Observer,
+    /// What this trace knows it lost beyond the counted events, when it
+    /// knows why. The fallback observer sets this when memory reads stopped
+    /// entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loss: Option<String>,
 }
 
 impl Trace {
@@ -116,6 +137,8 @@ impl Trace {
             dropped,
             events,
             usage: None,
+            observer: Observer::Ebpf,
+            loss: None,
         }
     }
 
@@ -147,7 +170,30 @@ mod tests {
         let text = r#"{"version":1,"dropped":0,"events":[]}"#;
         let trace: Trace = serde_json::from_str(text).expect("an old trace still loads");
         assert!(trace.usage.is_none());
+        assert_eq!(trace.observer, Observer::Ebpf);
         assert!(trace.check_version().is_ok());
+    }
+
+    /// A fallback trace names its observer when saved and round-trips.
+    #[test]
+    fn a_seccomp_trace_round_trips_and_an_absent_one_is_ebpf() {
+        let mut trace = Trace::new(Vec::new(), 2);
+        trace.observer = Observer::Seccomp;
+        trace.loss = Some("memory reads stopped after 4 stalled reads".into());
+        let text = serde_json::to_string(&trace).expect("a trace always serializes");
+        assert!(text.contains("\"observer\":\"seccomp\""), "{text}");
+        let loaded: Trace = serde_json::from_str(&text).expect("and reads back");
+        assert_eq!(loaded.observer, Observer::Seccomp);
+        assert_eq!(
+            loaded.loss.as_deref(),
+            Some("memory reads stopped after 4 stalled reads")
+        );
+
+        let bare: Trace =
+            serde_json::from_str(r#"{"version":1,"dropped":0,"events":[],"observer":"seccomp"}"#)
+                .expect("a trace with only the observer loads");
+        assert_eq!(bare.observer, Observer::Seccomp);
+        assert!(bare.loss.is_none());
     }
 
     /// A trace with peaks round-trips through the format.

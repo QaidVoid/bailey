@@ -8,6 +8,35 @@ fn bailey() -> &'static str {
     env!("CARGO_BIN_EXE_bailey")
 }
 
+/// Write a trace of one routine read, naming `observer` as its recorder.
+fn write_trace(dir: &std::path::Path, name: &str, observer: &str) -> std::path::PathBuf {
+    let trace = dir.join(name);
+    let target_dir = dir.display();
+    fs::write(
+        &trace,
+        format!(
+            r#"{{"version":1,"dropped":0,"events":[
+              {{"kind":"read","resource":{{"path":"{target_dir}/data.pak"}},"pid":10,"timestamp_ns":0,"resolution":"absolute"}}
+            ],"observer":"{observer}"}}"#
+        ),
+    )
+    .unwrap();
+    trace
+}
+
+/// Generate a profile from `trace`, naming `target` beside it.
+fn generate(dir: &std::path::Path, trace: &std::path::Path) -> std::process::Output {
+    let target = dir.join("game");
+    fs::write(&target, "").unwrap();
+    Command::new(bailey())
+        .args(["profile", "generate", "--trace"])
+        .arg(trace)
+        .arg("--target")
+        .arg(&target)
+        .output()
+        .unwrap()
+}
+
 /// The privileged helper, when this host has one that can actually load its
 /// programs. Without it there is no trace to generate anything from.
 fn helper() -> Option<std::path::PathBuf> {
@@ -562,5 +591,59 @@ fn a_suggestion_parses_and_applies_nothing() {
     assert!(
         report.contains("pids_max: Some(80)"),
         "uncommenting applies the suggested pids_max: {report}"
+    );
+}
+
+/// A fallback trace says so in the generated profile, on stdout as a header
+/// comment the profile carries with it, and on stderr as a note.
+#[test]
+fn a_fallback_trace_says_so_in_the_profile() {
+    let dir = tempfile::tempdir().unwrap();
+    let trace = write_trace(dir.path(), "trace.json", "seccomp");
+
+    let output = generate(dir.path(), &trace);
+    assert!(output.status.success());
+    let profile = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        profile.contains("# Recorded with the seccomp fallback observer"),
+        "the profile header must carry the observer note: {profile}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("seccomp fallback observer"),
+        "the user must be told what the trace came from: {stderr}"
+    );
+}
+
+/// The observer that recorded a trace is not what a profile grants: the
+/// same events under either observer generate the same grant lines.
+#[test]
+fn the_same_events_generate_the_same_grants_under_either_observer() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut grants = Vec::new();
+    for (name, observer) in [
+        ("trace-ebpf.json", "ebpf"),
+        ("trace-seccomp.json", "seccomp"),
+    ] {
+        let trace = write_trace(dir.path(), name, observer);
+        let output = generate(dir.path(), &trace);
+        assert!(output.status.success());
+        grants.push(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter(|line| !line.starts_with('#') && !line.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+    }
+
+    assert_eq!(
+        grants[0], grants[1],
+        "grants come from the events, not from the observer that recorded them"
+    );
+    assert!(
+        grants[0].contains("data.pak"),
+        "the generated grant names the read: {}",
+        grants[0]
     );
 }

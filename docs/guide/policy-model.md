@@ -43,8 +43,10 @@ So observing and enforcing are mechanically different things:
 
 - The **enforcement backend** builds a deny-by-default world with Landlock,
   seccomp, cgroups, and optionally namespaces.
-- The **audit backend** runs the program under that same policy while eBPF
-  programs record everything it touches, granted or not.
+- The **audit backend** runs the program under that same policy while an
+  observer records everything it touches, granted or not: eBPF programs when
+  the privileged helper is available, and a seccomp notification fallback that
+  records less when it is not.
 
 They share the policy type, which is what makes the workflow work: a profile you
 built by watching a program is directly usable for confining it.

@@ -43,10 +43,13 @@ profile generation, and the CLI.
 
 ## The audit recorder
 
-Audit mode records access with eBPF. The eBPF programs are loaded by a separate,
-minimal binary, `bailey-bpf-helper`, which is the only component that needs
-privilege. Keeping it separate means the main tool carries no eBPF code and needs
-no capabilities.
+Audit mode records access with one of two observers. The eBPF observer's
+programs are loaded by a separate, minimal binary, `bailey-bpf-helper`, which
+is the only component that needs privilege. Keeping it separate means the main
+tool carries no eBPF code and needs no capabilities. The seccomp fallback
+observer needs none of this: it runs unprivileged on Linux 5.5+ and records a
+less complete trace. Either one is enough to audit; the helper is what makes
+the trace complete.
 
 Building it needs a nightly toolchain and `bpf-linker`:
 
@@ -65,11 +68,16 @@ sudo setcap cap_bpf,cap_perfmon+ep ./target/release/bailey-bpf-helper
 
 With that in place, `bailey audit` runs unprivileged and drives the helper. If you
 would rather not use file capabilities, run the audit under `sudo` instead.
+Without the helper at all, `bailey audit` still runs: it says so and records
+with the unprivileged fallback, which does not see the kernel-internal opens
+the eBPF observer sees. See [auditing a
+program](/guide/audit#without-the-helper).
 
 ::: tip The target never runs privileged
-The helper does not spawn the program being audited. The unprivileged main tool
-runs it and tells the helper which process to observe, so the program itself never
-inherits elevated privilege.
+Neither observer spawns the program being audited with elevated privilege. The
+unprivileged main tool runs it (and for the eBPF observer, tells the helper
+which process to observe), so the program itself never inherits elevated
+privilege.
 :::
 
 ### How the helper is found

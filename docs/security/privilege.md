@@ -25,9 +25,11 @@ local root exploit. Bailey has no such binary in the enforcement path.
 
 ## Audit needs capabilities, in a separate binary
 
-Loading eBPF programs requires `CAP_BPF` and `CAP_PERFMON`. Those live on
+The eBPF observer loads programs with `CAP_BPF` and `CAP_PERFMON`. Those live on
 `bailey-bpf-helper`, a small separate binary whose whole job is to load a fixed
-set of programs and copy bytes from a ring buffer to its stdout.
+set of programs and copy bytes from a ring buffer to its stdout. The seccomp
+fallback observer needs no privilege at all, and records less; the helper is
+what makes a trace complete, not what makes an audit possible.
 
 ```sh
 sudo setcap cap_bpf,cap_perfmon+ep ./target/release/bailey-bpf-helper
@@ -37,9 +39,9 @@ The design constraints on that binary:
 
 - **The main tool has no eBPF code and no capabilities.** It cannot load programs
   even if compromised.
-- **The helper never spawns the target.** The unprivileged main tool runs the
-  program and tells the helper which PID to watch, so the audited program never
-  inherits elevated privilege.
+- **Neither observer spawns the target privileged.** The unprivileged main tool
+  runs the program and tells the helper which PID to watch, so the audited
+  program never inherits elevated privilege.
 - **The helper's interface is two pipes.** A greeting with a protocol version
   out, the PID and cgroup id to observe in, an acknowledgement and then framed
   records out, EOF to stop. There is no path by which the target influences what
