@@ -1890,14 +1890,6 @@ fn report_unenforceable_denials(policy: &Policy, nested: bool) {
 }
 
 fn report_degradation(policy: &Policy) {
-    if let Egress::Allow(rules) = &policy.network.egress
-        && rules.iter().any(|rule| rule.host != "*")
-    {
-        eprintln!(
-            "bailey: warning: host-based egress rules are not enforced by Landlock; \
-                 outbound access is limited by TCP port only"
-        );
-    }
     note_runtime_dir_grant(policy);
 }
 

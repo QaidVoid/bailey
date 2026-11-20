@@ -76,10 +76,159 @@ pub enum Egress {
 /// A permitted egress destination.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EgressRule {
-    /// Destination hostname or CIDR block.
-    pub host: String,
+    /// Who may be reached: any host, one pinned name, one address, or a
+    /// block.
+    pub host: Destination,
     /// Destination port, or `None` for any port.
     pub port: Option<u16>,
+    /// The transport the rule allows.
+    pub protocol: Protocol,
+}
+
+/// Where an egress rule's traffic may go.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Destination {
+    /// Any destination: the rule bounds the port and protocol only.
+    Any,
+    /// A hostname, resolved once when the run starts and pinned to the
+    /// addresses it answered with.
+    Name(String),
+    /// One address.
+    Address(std::net::IpAddr),
+    /// A block of addresses, written as CIDR. The address is the block's
+    /// base as written; the ruleset masks it to the prefix.
+    Block(std::net::IpAddr, u8),
+}
+
+impl Destination {
+    /// Whether the rule bounds only the port and protocol.
+    pub fn is_any(&self) -> bool {
+        matches!(self, Self::Any)
+    }
+
+    /// Whether the rule names a block that contains the loopback addresses.
+    /// A deny naming them would contradict a forward or publication of the
+    /// same port, so resolution refuses it.
+    pub fn covers_loopback(&self) -> bool {
+        match self {
+            Self::Address(addr) => addr.is_loopback(),
+            Self::Block(addr, prefix) => match addr {
+                std::net::IpAddr::V4(v4) => {
+                    let bits = u32::from(*v4);
+                    let loopback = u32::from(std::net::Ipv4Addr::LOCALHOST)
+                        & mask(*prefix, 32);
+                    bits & mask(*prefix, 32) == loopback
+                }
+                std::net::IpAddr::V6(v6) => {
+                    let bits = u128::from(*v6);
+                    let loopback = u128::from(std::net::Ipv6Addr::LOCALHOST)
+                        & mask6(*prefix);
+                    bits & mask6(*prefix) == loopback
+                }
+            },
+            Self::Any | Self::Name(_) => false,
+        }
+    }
+}
+
+/// The address bits kept by a CIDR prefix of the given width.
+fn mask(prefix: u8, width: u8) -> u32 {
+    if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (width - prefix)
+    }
+}
+
+/// The address bits kept by a CIDR prefix, for IPv6.
+fn mask6(prefix: u8) -> u128 {
+    if prefix == 0 {
+        0
+    } else {
+        u128::MAX << (128 - prefix)
+    }
+}
+
+impl std::fmt::Display for Destination {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Any => write!(f, "*"),
+            Self::Name(name) => write!(f, "{name}"),
+            Self::Address(addr) => write!(f, "{addr}"),
+            Self::Block(addr, prefix) => write!(f, "{addr}/{prefix}"),
+        }
+    }
+}
+
+/// The transport an egress rule allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Protocol {
+    /// Outbound TCP connections.
+    Tcp,
+    /// Outbound UDP datagrams.
+    Udp,
+}
+
+impl Protocol {
+    /// Parse the value a config file writes, or `None` for anything else.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "tcp" => Some(Self::Tcp),
+            "udp" => Some(Self::Udp),
+            _ => None,
+        }
+    }
+
+    /// The name a config file writes, for messages.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+        }
+    }
+}
+
+/// A destination whose traffic is dropped whatever the allowances say.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DenyRule {
+    /// Who may not be reached: one pinned name, one address, or a block.
+    pub host: Destination,
+    /// Destination port, or `None` for every port.
+    pub port: Option<u16>,
+}
+
+/// Whether the run may ask DNS questions, and who answers them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DnsSetting {
+    /// Allowed exactly when a rule needs names resolved: an allow rule whose
+    /// host is any address.
+    #[default]
+    Auto,
+    /// Allowed, to the namespace's forwarder only.
+    Allow,
+    /// Dropped, whatever the allow rules say.
+    Deny,
+}
+
+impl DnsSetting {
+    /// Parse the value a config file writes, or `None` for anything else.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "auto" => Some(Self::Auto),
+            "allow" => Some(Self::Allow),
+            "deny" => Some(Self::Deny),
+            _ => None,
+        }
+    }
+
+    /// The name a config file writes, for messages.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+        }
+    }
 }
 
 /// How a run with allowed egress picks its network namespace.
@@ -136,6 +285,11 @@ pub struct NetworkPolicy {
     /// The config layer or flag that set [`NetworkPolicy::broker`], when one
     /// is set.
     pub broker_source: Option<String>,
+    /// Destinations dropped ahead of every allowance, in the private
+    /// namespace's netfilter rules.
+    pub deny: Vec<DenyRule>,
+    /// Whether the run may ask DNS questions, and who answers them.
+    pub dns: DnsSetting,
 }
 
 impl Default for NetworkPolicy {
@@ -148,6 +302,32 @@ impl Default for NetworkPolicy {
             publish_ports: Vec::new(),
             mode_source: "the default (auto)".to_owned(),
             broker_source: None,
+            deny: Vec::new(),
+            dns: DnsSetting::Auto,
+        }
+    }
+}
+
+impl NetworkPolicy {
+    /// Whether any egress rule needs more than Landlock's TCP port rules.
+    ///
+    /// A rule naming a destination, a UDP allowance, an egress denial, and a
+    /// DNS denial are all enforced in the private namespace's netfilter
+    /// rules; the host's namespace has nothing that carries them.
+    pub fn needs_egress_namespace(&self) -> bool {
+        self.dns == DnsSetting::Deny
+            || !self.deny.is_empty()
+            || self.egress_rules_need_namespace()
+    }
+
+    /// Whether an allow rule names a destination or protocol Landlock
+    /// cannot match.
+    fn egress_rules_need_namespace(&self) -> bool {
+        match &self.egress {
+            Egress::Allow(rules) => rules
+                .iter()
+                .any(|rule| !rule.host.is_any() || rule.protocol == Protocol::Udp),
+            Egress::DenyAll | Egress::AllowAll => false,
         }
     }
 }

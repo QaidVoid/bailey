@@ -143,7 +143,9 @@ before the run starts.
 | Key | Type | Description |
 | --- | --- | --- |
 | `egress` | `"deny"` or `"allow"` | Outbound policy. Default `"deny"` |
-| `egress_allow` | list of tables | Permitted destinations, `{ host, port }` |
+| `egress_allow` | list of tables | Permitted destinations, `{ host, port, protocol }` |
+| `egress_deny` | list of tables | Destinations dropped ahead of every allowance, `{ host, port }` |
+| `dns` | `"auto"`, `"allow"` or `"deny"` | Whether the run may ask DNS questions. Default `"auto"` |
 | `mode` | `"auto"`, `"private"` or `"host"` | How the network is placed. Default `"auto"` |
 | `broker` | `"ADDR:PORT"` | Hold the run to one egress route, through a broker at that address |
 | `bind_ports` | list of integers | TCP ports the target may bind |
@@ -155,10 +157,10 @@ egress_allow = [{ host = "*", port = 443 }]
 bind_ports = [27015]
 ```
 
-`egress_allow` takes precedence over `egress` when both are present. `bind_ports`
-and `publish_ports` accumulate across layers; `egress`, `mode` and `broker` are
-replaced by the nearest layer that sets them, and `filesystem.reset = true`
-clears an inherited broker.
+`egress_allow` takes precedence over `egress` when both are present.
+`bind_ports`, `publish_ports`, `egress_allow` and `egress_deny` accumulate
+across layers; `egress`, `mode`, `broker` and `dns` are replaced by the nearest
+layer that sets them, and `filesystem.reset = true` clears an inherited broker.
 
 `mode` picks how the network is placed. `auto`, the default, uses the private
 namespace wherever the host provides it, falls back to the host's namespace
@@ -177,8 +179,9 @@ nothing else. It needs the private namespace and `nft`, and refuses the run
 where either is missing.
 
 Resolved settings that contradict each other are refused at resolution,
-naming the layers that set them: host mode with forwards, published ports, or
-a broker under allowed egress, or a broker beside forwards or published ports.
+naming the layers that set them: host mode with forwards, published ports, a
+destination rule, a UDP allowance, an egress denial, a DNS denial, or a broker
+under allowed egress, or a broker beside forwards or published ports.
 
 `publish_ports = [3800]` makes a TCP service bound inside the sandbox on
 `127.0.0.1:3800` or `0.0.0.0:3800` reachable from the host at
@@ -197,11 +200,39 @@ outbound egress and leaves unrelated host loopback services blocked. Only TCP
 over IPv4 is published, never UDP or IPv6. See
 [publishing a sandbox service](/guide/network#publishing-a-sandbox-service).
 
-- `host` is advisory. Landlock matches on TCP port only, and bailey warns when
-  `host` is anything other than `*`.
-- An entry without a `port` is a resolution error, because the resulting policy
-  would mean the opposite of what it says.
-- Only TCP is restricted. See [known limitations](/security/limitations).
+`egress_allow` entries name who may be reached and on what terms:
+
+- `host` is `*` for any destination, a hostname, an address, or a CIDR block
+  such as `203.0.113.0/24`. A hostname is resolved once when the run starts,
+  refused if it does not resolve, and pinned into the sandbox's `/etc/hosts`,
+  so the rules the namespace enforces and the addresses a client dials are the
+  same. A name with a wildcard, such as `*.example.com`, is a resolution error,
+  because it cannot be pinned to addresses.
+- `port` is required on every entry. Port 53 is refused: DNS is decided by the
+  `dns` setting alone, and an egress rule naming it would read as a second way
+  to allow DNS.
+- `protocol` is `tcp`, the default, or `udp`.
+
+Destination rules, UDP rules and `dns = "deny"` are enforced by netfilter in
+the private namespace, so they need it: under `auto` they make the namespace
+required, and with `mode = "host"` resolution refuses the run naming the layer
+that set the rule. A port-only TCP rule needs no namespace, because Landlock
+enforces it wherever the run lands.
+
+`egress_deny` entries drop traffic to a destination ahead of every allowance,
+so `egress = "allow"` with a deny entry is the usual "everything except"
+shape. An entry without a `port` denies every port. A deny entry naming a
+loopback address is refused, because loopback inside the namespace is governed
+by forwards and publications, and a deny there would contradict a forward of
+the same port.
+
+`dns = "auto"`, the default, allows DNS exactly when a rule needs names
+resolved, which today means an allow rule whose host is `*`: such a rule is
+useless without resolution. Queries go to the namespace's forwarder only.
+`dns = "allow"` permits those queries whatever the rules name, and
+`dns = "deny"` drops them, so names must resolve through the pinned
+`/etc/hosts`. A DNS denial is a netfilter rule, so it needs the private
+namespace like a destination rule does.
 
 ## `[[device]]`
 

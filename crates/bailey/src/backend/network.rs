@@ -104,16 +104,19 @@ pub struct NetworkDecision {
 ///
 /// A forward under allowed egress needs pasta to carry it, a published port
 /// needs a namespace the host can dial into, and a broker needs a namespace
-/// its netfilter rule can hold. Under automatic mode their presence turns a
-/// fallback into a refusal; a feature forming a boundary is never silently
-/// dropped.
+/// its netfilter rule can hold. So does every rule that names a destination,
+/// allows UDP, denies a destination, or denies DNS: netfilter in that
+/// namespace is the only mechanism that carries them. Under automatic mode
+/// their presence turns a fallback into a refusal; a feature forming a
+/// boundary is never silently dropped.
 pub fn needs_private_namespace(
     policy: &Policy,
     forwards: &[PortForward],
     publishes: &[u16],
 ) -> bool {
     let egress_allowed = !matches!(policy.network.egress, Egress::DenyAll);
-    (egress_allowed && !forwards.is_empty())
+    policy.network.needs_egress_namespace()
+        || (egress_allowed && !forwards.is_empty())
         || !publishes.is_empty()
         || policy.network.broker.is_some()
 }
@@ -218,6 +221,13 @@ pub fn decide(
                     .to_owned(),
             });
         }
+        if policy.network.needs_egress_namespace() {
+            anyhow::bail!(
+                "the policy's deny rules or DNS denial are enforced in the \
+                 private namespace, which needs unprivileged user \
+                 namespaces, which are unavailable; the run is refused"
+            );
+        }
         return Ok(NetworkDecision {
             mode: NetworkMode::LandlockOnly,
             source: "the policy denies egress".to_owned(),
@@ -277,6 +287,8 @@ pub fn decide(
             "the published ports"
         } else if !forwards.is_empty() {
             "the port forwards"
+        } else if policy.network.needs_egress_namespace() {
+            "the policy's destination, UDP and deny rules"
         } else {
             "the policy"
         };
@@ -565,7 +577,7 @@ fn errno(err: nix::errno::Errno) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::{EgressRule, NetworkPolicy};
+    use crate::policy::{Destination, EgressRule, NetworkPolicy, Protocol};
 
     fn policy_with(network: NetworkPolicy) -> Policy {
         Policy {
@@ -598,12 +610,114 @@ mod tests {
     fn allowed_egress_stays_on_landlock() {
         let policy = policy_with(NetworkPolicy {
             egress: Egress::Allow(vec![EgressRule {
-                host: "*".into(),
+                host: Destination::Any,
+                protocol: Protocol::Tcp,
                 port: Some(443),
             }]),
             ..NetworkPolicy::default()
         });
         assert_eq!(select(&policy, true), NetworkMode::LandlockOnly);
+    }
+
+    /// A rule naming a destination, a UDP rule, a deny rule and a DNS denial
+    /// are all netfilter work: under automatic mode they make the private
+    /// namespace required, so a host without it refuses the run instead of
+    /// silently dropping the boundary the policy names.
+    #[test]
+    fn destination_rules_require_the_private_namespace() {
+        let no_caps = caps(false, false, false);
+        let full = caps(true, true, true);
+
+        let named = policy_with(NetworkPolicy {
+            egress: Egress::Allow(vec![EgressRule {
+                host: Destination::Name("api.example.com".to_owned()),
+                protocol: Protocol::Tcp,
+                port: Some(443),
+            }]),
+            ..NetworkPolicy::default()
+        });
+        assert_eq!(
+            decide(&named, &full, false, &[], &[]).unwrap().mode,
+            NetworkMode::Private
+        );
+        let err = decide(&named, &no_caps, false, &[], &[]).unwrap_err().to_string();
+        assert!(err.contains("destination, UDP and deny rules"), "{err}");
+
+        let udp = policy_with(NetworkPolicy {
+            egress: Egress::Allow(vec![EgressRule {
+                host: Destination::Any,
+                protocol: Protocol::Udp,
+                port: Some(27015),
+            }]),
+            ..NetworkPolicy::default()
+        });
+        assert!(decide(&udp, &no_caps, false, &[], &[]).is_err());
+
+        let denied = policy_with(NetworkPolicy {
+            egress: Egress::AllowAll,
+            deny: vec![crate::policy::DenyRule {
+                host: Destination::Address("169.254.169.254".parse().unwrap()),
+                port: None,
+            }],
+            ..NetworkPolicy::default()
+        });
+        assert_eq!(
+            decide(&denied, &full, false, &[], &[]).unwrap().mode,
+            NetworkMode::Private
+        );
+        assert!(decide(&denied, &no_caps, false, &[], &[]).is_err());
+
+        let no_dns = policy_with(NetworkPolicy {
+            egress: Egress::AllowAll,
+            dns: crate::policy::DnsSetting::Deny,
+            ..NetworkPolicy::default()
+        });
+        assert_eq!(
+            decide(&no_dns, &full, false, &[], &[]).unwrap().mode,
+            NetworkMode::Private
+        );
+        assert!(decide(&no_dns, &no_caps, false, &[], &[]).is_err());
+    }
+
+    /// A deny rule or DNS denial beside denied egress still needs the
+    /// namespace: the Landlock-only fallback denies TCP by port rules but
+    /// leaves DNS and UDP open, which would drop the boundary those name.
+    #[test]
+    fn a_deny_or_dns_denial_under_denied_egress_requires_the_namespace() {
+        let no_userns = caps(true, false, false);
+
+        let denied_dns = policy_with(NetworkPolicy {
+            dns: crate::policy::DnsSetting::Deny,
+            ..NetworkPolicy::default()
+        });
+        let err = decide(&denied_dns, &no_userns, false, &[], &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("DNS denial"), "{err}");
+        assert_eq!(
+            decide(&denied_dns, &caps(true, true, true), false, &[], &[])
+                .unwrap()
+                .mode,
+            NetworkMode::Isolated
+        );
+
+        let denied_dest = policy_with(NetworkPolicy {
+            deny: vec![crate::policy::DenyRule {
+                host: Destination::Address("169.254.169.254".parse().unwrap()),
+                port: None,
+            }],
+            ..NetworkPolicy::default()
+        });
+        assert!(decide(&denied_dest, &no_userns, false, &[], &[]).is_err());
+
+        // Without either, denied egress degrades to the port rules as before.
+        let plain = NetworkPolicy::default();
+        assert_eq!(
+            decide(&policy_with(plain), &no_userns, false, &[], &[])
+                .unwrap()
+                .mode,
+            NetworkMode::LandlockOnly
+        );
     }
 
     /// Publishing a bound port used to cost the whole namespace, which handed
@@ -635,7 +749,8 @@ mod tests {
         // What `permit_broker_port` leaves behind for a brokered run.
         let policy = policy_with(NetworkPolicy {
             egress: Egress::Allow(vec![EgressRule {
-                host: "*".to_string(),
+                host: Destination::Any,
+                protocol: Protocol::Tcp,
                 port: Some(8443),
             }]),
             bind_ports: Vec::new(),
@@ -693,7 +808,8 @@ mod tests {
         // A project config selects the private namespace.
         let private = policy_with(NetworkPolicy {
             egress: Egress::Allow(vec![EgressRule {
-                host: "*".into(),
+                host: Destination::Any,
+                protocol: Protocol::Tcp,
                 port: Some(443),
             }]),
             mode: crate::policy::NetworkMode::Private,

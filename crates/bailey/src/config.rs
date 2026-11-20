@@ -27,8 +27,9 @@ use serde::Deserialize;
 
 use crate::hooks::Hooks;
 use crate::policy::{
-    Access, DeviceRule, Egress, EgressRule, EnvPolicy, FsRule, FuseMount, NetworkPolicy, Policy,
-    PortForward, ResourceLimits, SocketRelay,
+    Access, DenyRule, Destination, DeviceRule, DnsSetting, Egress, EgressRule, EnvPolicy, FsRule,
+    FuseMount, NetworkMode, NetworkPolicy, Policy, PortForward, Protocol, ResourceLimits,
+    SocketRelay,
 };
 use crate::trust::{Rejected, Store};
 
@@ -326,6 +327,10 @@ struct RawNetwork {
     egress: Option<String>,
     #[serde(default)]
     egress_allow: Vec<RawEgressRule>,
+    #[serde(default)]
+    egress_deny: Vec<RawDenyRule>,
+    /// Whether the run may ask DNS questions: auto, allow, or deny.
+    dns: Option<String>,
     /// How a run with allowed egress picks its namespace.
     mode: Option<String>,
     /// The egress broker a run is held to, as `ADDR:PORT`.
@@ -339,6 +344,15 @@ struct RawNetwork {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawEgressRule {
+    host: String,
+    port: Option<u16>,
+    /// `tcp` or `udp`, defaulting to `tcp`.
+    protocol: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDenyRule {
     host: String,
     port: Option<u16>,
 }
@@ -388,9 +402,18 @@ struct Accumulator {
     relocated: BTreeMap<PathBuf, PathBuf>,
     denied: BTreeSet<PathBuf>,
     read_only: BTreeSet<PathBuf>,
-    /// The egress allowance, with the path of the layer that set it, for the
-    /// same reason as `self_fuse` above.
-    egress: Option<(Egress, PathBuf)>,
+    /// The egress choice from `egress = "allow" | "deny"`, with the path of
+    /// the layer that set it, for the same reason as `self_fuse` above. A
+    /// layer that sets only `egress_allow` does not touch it.
+    egress_all: Option<(bool, PathBuf)>,
+    /// The egress allowances, each with the path of the layer that set it,
+    /// so a later error can name where the rule came from. The list
+    /// accumulates across layers.
+    egress_rules: Vec<(crate::policy::EgressRule, PathBuf)>,
+    /// The egress denials, accumulated across layers with their layer paths.
+    egress_denies: Vec<(crate::policy::DenyRule, PathBuf)>,
+    /// Whether the run may ask DNS questions, with the layer that set it.
+    dns: Option<(crate::policy::DnsSetting, PathBuf)>,
     /// How the run picks a namespace when egress is allowed, with the layer
     /// that set it, so the summary and `show` can name the source.
     mode: Option<(crate::policy::NetworkMode, PathBuf)>,
@@ -627,7 +650,27 @@ fn apply_layer(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> 
 
     if let Some(network) = &layer.raw.network {
         if network.egress.is_some() || !network.egress_allow.is_empty() {
-            acc.egress = Some((build_egress(network, &layer.path)?, layer.path.clone()));
+            let (all, rules) = build_egress(network, &layer.path)?;
+            if let Some(all) = all {
+                acc.egress_all = Some((all, layer.path.clone()));
+            }
+            acc.egress_rules.extend(rules.into_iter().map(|rule| (rule, layer.path.clone())));
+        }
+        if !network.egress_deny.is_empty() {
+            let denies = build_egress_deny(network, &layer.path)?;
+            acc.egress_denies
+                .extend(denies.into_iter().map(|rule| (rule, layer.path.clone())));
+        }
+        if let Some(dns) = &network.dns {
+            let Some(dns) = crate::policy::DnsSetting::parse(dns) else {
+                return Err(ConfigError::Invalid {
+                    path: layer.path.clone(),
+                    reason: format!(
+                        "network dns `{dns}` is not one of auto, allow, deny"
+                    ),
+                });
+            };
+            acc.dns = Some((dns, layer.path.clone()));
         }
         if let Some(mode) = &network.mode {
             let Some(mode) = crate::policy::NetworkMode::parse(mode) else {
@@ -988,17 +1031,18 @@ fn finalize(mut acc: Accumulator) -> Result<Resolved, ConfigError> {
         // The egress port rules are Landlock rules, and Landlock is the half of
         // confinement this switch gives up: the ruleset that would carry them
         // is built and then not applied, so an allowance would promise a
-        // restriction nothing in the run makes. A denial is not in that
-        // position, because it is held by the run's own network namespace.
-        if let Some((Egress::Allow(_), egress_source)) = &acc.egress {
+        // restriction nothing in the run makes. Allow-everything promises no
+        // restriction, and a denial is held by the run's own network
+        // namespace, so neither is in that position.
+        if let Some((_, rule_source)) = acc.egress_rules.first() {
             return Err(ConfigError::Conflict {
                 path: source.clone(),
                 target: "self_fuse".into(),
                 reason: format!(
-                    "`{}` is a partial egress allowance, enforced only by the \
-                     Landlock ruleset that self_fuse drops. Clear `self_fuse`, \
-                     or drop the egress allowance",
-                    egress_source.display()
+                    "`{}` is a partial egress allowance, enforced only by \
+                     the Landlock ruleset that self_fuse drops. Clear \
+                     `self_fuse`, or drop the egress allowance",
+                    rule_source.display()
                 ),
             });
         }
@@ -1026,6 +1070,34 @@ fn finalize(mut acc: Accumulator) -> Result<Resolved, ConfigError> {
         });
     }
 
+    let network = {
+        let mode = acc.mode.as_ref().map(|(mode, _)| *mode).unwrap_or_default();
+        refuse_unenforceable_network_rules(&acc, mode)?;
+        NetworkPolicy {
+            egress: if !acc.egress_rules.is_empty() {
+                Egress::Allow(acc.egress_rules.iter().map(|(rule, _)| rule.clone()).collect())
+            } else if acc.egress_all.as_ref().is_some_and(|(all, _)| *all) {
+                Egress::AllowAll
+            } else {
+                Egress::DenyAll
+            },
+            mode,
+            broker: acc.broker.as_ref().map(|(broker, _)| *broker),
+            bind_ports: acc.bind_ports.clone(),
+            publish_ports: acc.publish_ports.clone(),
+            mode_source: acc
+                .mode
+                .as_ref()
+                .map(|(_, path)| format!("{}", path.display()))
+                .unwrap_or_else(|| "the default (auto)".to_owned()),
+            broker_source: acc
+                .broker
+                .as_ref()
+                .map(|(_, path)| path.display().to_string()),
+            deny: acc.egress_denies.iter().map(|(rule, _)| rule.clone()).collect(),
+            dns: acc.dns.map(|(dns, _)| dns).unwrap_or_default(),
+        }
+    };
     let relocated = acc.relocated;
     let filesystem = acc
         .filesystem
@@ -1046,25 +1118,7 @@ fn finalize(mut acc: Accumulator) -> Result<Resolved, ConfigError> {
             filesystem,
             denied: acc.denied.into_iter().collect(),
             read_only: acc.read_only.into_iter().collect(),
-            network: NetworkPolicy {
-                egress: acc
-                    .egress
-                    .map(|(egress, _)| egress)
-                    .unwrap_or(Egress::DenyAll),
-                mode: acc.mode.as_ref().map(|(mode, _)| *mode).unwrap_or_default(),
-                broker: acc.broker.as_ref().map(|(broker, _)| *broker),
-                bind_ports: acc.bind_ports,
-                publish_ports: acc.publish_ports,
-                mode_source: acc
-                    .mode
-                    .as_ref()
-                    .map(|(_, path)| format!("{}", path.display()))
-                    .unwrap_or_else(|| "the default (auto)".to_owned()),
-                broker_source: acc
-                    .broker
-                    .as_ref()
-                    .map(|(_, path)| path.display().to_string()),
-            },
+            network,
             devices,
             resources: acc.resources,
             env: acc.env,
@@ -1078,36 +1132,214 @@ fn finalize(mut acc: Accumulator) -> Result<Resolved, ConfigError> {
     })
 }
 
-/// Build the egress intent for a layer.
+/// Refuse network rules no mechanism can enforce.
 ///
-/// An `egress_allow` entry without a port is rejected rather than dropped: the
-/// only mechanism available matches on TCP port, so silently ignoring the rule
-/// would resolve "allow this destination" into a full deny.
-fn build_egress(network: &RawNetwork, path: &Path) -> Result<Egress, ConfigError> {
-    if !network.egress_allow.is_empty() {
-        let mut rules = Vec::with_capacity(network.egress_allow.len());
-        for rule in &network.egress_allow {
-            let Some(port) = rule.port else {
-                return Err(ConfigError::Invalid {
-                    path: path.to_path_buf(),
-                    reason: format!(
-                        "egress_allow entry for host `{}` has no port; \
-                         outbound rules are matched by TCP port, so a port is required",
-                        rule.host
-                    ),
-                });
+/// The host namespace offers only Landlock's TCP port rules, so a rule that
+/// names a destination, allows UDP, or denies DNS would resolve into a policy
+/// that means something else. Where the resolved mode is `host`, such a rule
+/// is refused, naming the layer that set it. Under `auto` or `private` the
+/// namespace decision makes the private namespace required instead.
+fn refuse_unenforceable_network_rules(
+    acc: &Accumulator,
+    mode: crate::policy::NetworkMode,
+) -> Result<(), ConfigError> {
+    if mode != crate::policy::NetworkMode::Host {
+        return Ok(());
+    }
+    for (rule, layer) in &acc.egress_rules {
+        if !rule.host.is_any() || rule.protocol == crate::policy::Protocol::Udp {
+            let what = if rule.host.is_any() {
+                "a UDP allowance".to_owned()
+            } else {
+                format!("an egress_allow entry for host `{}`", rule.host)
             };
-            rules.push(EgressRule {
-                host: rule.host.clone(),
-                port: Some(port),
+            return Err(ConfigError::Invalid {
+                path: layer.clone(),
+                reason: format!(
+                    "{what} needs the private network namespace, which \
+                     `mode = \"host\"` does not provide; drop `mode = \"host\"` \
+                     or set the rule's host to `*` with protocol `tcp`"
+                ),
             });
         }
-        Ok(Egress::Allow(rules))
-    } else if network.egress.as_deref() == Some("allow") {
-        Ok(Egress::AllowAll)
-    } else {
-        Ok(Egress::DenyAll)
     }
+    for (rule, layer) in &acc.egress_denies {
+        return Err(ConfigError::Invalid {
+            path: layer.clone(),
+            reason: format!(
+                "an egress_deny entry for host `{}` needs the private \
+                 network namespace, which `mode = \"host\"` does not provide",
+                rule.host
+            ),
+        });
+    }
+    if let Some((crate::policy::DnsSetting::Deny, layer)) = &acc.dns {
+        return Err(ConfigError::Invalid {
+            path: layer.clone(),
+            reason: "a DNS denial needs the private network namespace, which \
+                     `mode = \"host\"` does not provide"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Build the egress intent for a layer.
+///
+/// Returns the `egress = "allow" | "deny"` choice, when the layer set one,
+/// and the layer's parsed allowances. An `egress_allow` entry without a port
+/// is rejected rather than dropped: silently ignoring the rule would resolve
+/// "allow this destination" into a full deny.
+fn build_egress(
+    network: &RawNetwork,
+    path: &Path,
+) -> Result<(Option<bool>, Vec<EgressRule>), ConfigError> {
+    let mut rules = Vec::with_capacity(network.egress_allow.len());
+    for rule in &network.egress_allow {
+        let Some(port) = rule.port else {
+            return Err(ConfigError::Invalid {
+                path: path.to_path_buf(),
+                reason: format!(
+                    "egress_allow entry for host `{}` has no port; \
+                     outbound rules are matched by port, so a port is required",
+                    rule.host
+                ),
+            });
+        };
+        if port == 53 {
+            return Err(ConfigError::Invalid {
+                path: path.to_path_buf(),
+                reason: format!(
+                    "egress_allow entry for host `{}` names port 53; DNS is \
+                     decided by the `dns` setting, not by an egress rule",
+                    rule.host
+                ),
+            });
+        }
+        let host = parse_destination(&rule.host).map_err(|reason| ConfigError::Invalid {
+            path: path.to_path_buf(),
+            reason: format!("egress_allow entry for host `{}`: {reason}", rule.host),
+        })?;
+        let protocol = match rule.protocol.as_deref() {
+            None => crate::policy::Protocol::Tcp,
+            Some(value) => {
+                let Some(protocol) = crate::policy::Protocol::parse(value) else {
+                    return Err(ConfigError::Invalid {
+                        path: path.to_path_buf(),
+                        reason: format!(
+                            "egress_allow entry for host `{}` names protocol \
+                             `{value}`; the accepted values are tcp and udp",
+                            rule.host
+                        ),
+                    });
+                };
+                protocol
+            }
+        };
+        rules.push(EgressRule {
+            host,
+            port: Some(port),
+            protocol,
+        });
+    }
+    let all = match network.egress.as_deref() {
+        Some("allow") => Some(true),
+        Some(other) if other != "deny" => {
+            return Err(ConfigError::Invalid {
+                path: path.to_path_buf(),
+                reason: format!(
+                    "network egress `{other}` is not one of allow, deny"
+                ),
+            });
+        }
+        _ => None,
+    };
+    Ok((all, rules))
+}
+
+/// Build a layer's egress denials.
+///
+/// A deny naming loopback is rejected: loopback inside the namespace is
+/// governed by forwards and publications, and a deny there would contradict a
+/// forward of the same port.
+fn build_egress_deny(network: &RawNetwork, path: &Path) -> Result<Vec<DenyRule>, ConfigError> {
+    let mut denies = Vec::with_capacity(network.egress_deny.len());
+    for rule in &network.egress_deny {
+        let host = parse_destination(&rule.host).map_err(|reason| ConfigError::Invalid {
+            path: path.to_path_buf(),
+            reason: format!("egress_deny entry for host `{}`: {reason}", rule.host),
+        })?;
+        if host.covers_loopback() {
+            return Err(ConfigError::Invalid {
+                path: path.to_path_buf(),
+                reason: format!(
+                    "egress_deny entry names loopback ({}); loopback is \
+                     governed by forwards and publications, not by egress rules",
+                    rule.host
+                ),
+            });
+        }
+        denies.push(DenyRule {
+            host,
+            port: rule.port,
+        });
+    }
+    Ok(denies)
+}
+
+/// Parse the `host` value of an egress or deny rule.
+///
+/// `*` means any destination. An address or `address/prefix` is parsed as
+/// such; everything else is a hostname, which a later step resolves and
+/// pins. A wildcard anywhere but alone is rejected now rather than at start,
+/// because a wildcard name cannot be pinned to addresses.
+fn parse_destination(raw: &str) -> Result<Destination, String> {
+    if raw == "*" {
+        return Ok(Destination::Any);
+    }
+    if raw.contains('*') {
+        return Err(
+            "a wildcard name cannot be pinned to addresses; name the hosts \
+             or address blocks you need"
+                .to_owned(),
+        );
+    }
+    if let Ok(addr) = raw.parse::<std::net::IpAddr>() {
+        return Ok(Destination::Address(addr));
+    }
+    if let Some((addr, prefix)) = raw.rsplit_once('/') {
+        let Ok(addr) = addr.parse::<std::net::IpAddr>() else {
+            return Err(format!("`{addr}` in `{raw}` is neither an address nor a hostname"));
+        };
+        let Ok(prefix) = prefix.parse::<u8>() else {
+            return Err(format!("`{prefix}` in `{raw}` is not a prefix length"));
+        };
+        let width = match addr {
+            std::net::IpAddr::V4(_) => 32,
+            std::net::IpAddr::V6(_) => 128,
+        };
+        if prefix > width {
+            return Err(format!(
+                "prefix /{prefix} is too long for {addr}; the longest is /{width}"
+            ));
+        }
+        return Ok(Destination::Block(addr, prefix));
+    }
+    let plausible = !raw.is_empty()
+        && !raw.contains(['/', ' ', '\t', ':', '$'])
+        && raw.len() <= 253
+        && raw.split('.').all(|label| {
+            !label.is_empty()
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        });
+    if !plausible {
+        return Err(format!(
+            "`{raw}` is neither an address, a CIDR block, `*`, nor a plausible hostname"
+        ));
+    }
+    Ok(Destination::Name(raw.to_owned()))
 }
 
 /// Resolve one `connect` entry, under the stricter rules a socket grant needs.
@@ -2251,6 +2483,66 @@ mod tests {
         );
     }
 
+    /// The host namespace has nothing that carries a destination rule, a UDP
+    /// allowance, an egress denial, or a DNS denial, so a policy naming any
+    /// of them beside an explicit `mode = "host"` is refused at resolution,
+    /// naming the layer that set each side.
+    #[test]
+    fn host_mode_with_a_destination_rule_is_refused() {
+        let layers = [
+            layer("/global", "[network]\nmode = \"host\""),
+            layer(
+                "/project",
+                "[network]\negress_allow = [{ host = \"api.example.com\", port = 443 }]",
+            ),
+        ];
+        let err = merge(&layers).unwrap_err().to_string();
+        assert!(err.contains("api.example.com"), "{err}");
+        assert!(err.contains("/project/bailey.toml"), "{err}");
+    }
+
+    #[test]
+    fn host_mode_with_a_udp_rule_is_refused() {
+        let layers = [layer(
+            "/base",
+            "[network]\nmode = \"host\"\negress_allow = [{ host = \"*\", port = 27015, protocol = \"udp\" }]",
+        )];
+        let err = merge(&layers).unwrap_err().to_string();
+        assert!(err.contains("UDP allowance"), "{err}");
+    }
+
+    #[test]
+    fn host_mode_with_a_deny_rule_is_refused() {
+        let layers = [layer(
+            "/base",
+            "[network]\nmode = \"host\"\negress_deny = [{ host = \"169.254.169.254\" }]",
+        )];
+        let err = merge(&layers).unwrap_err().to_string();
+        assert!(err.contains("169.254.169.254"), "{err}");
+    }
+
+    #[test]
+    fn host_mode_with_a_dns_denial_is_refused() {
+        let layers = [layer(
+            "/base",
+            "[network]\nmode = \"host\"\ndns = \"deny\"",
+        )];
+        let err = merge(&layers).unwrap_err().to_string();
+        assert!(err.contains("DNS denial"), "{err}");
+    }
+
+    /// A port-only TCP allowance is exactly what Landlock enforces, so host
+    /// mode beside one stays coherent.
+    #[test]
+    fn host_mode_with_a_port_only_rule_is_unchanged() {
+        let layers = [layer(
+            "/base",
+            "[network]\nmode = \"host\"\negress_allow = [{ host = \"*\", port = 443 }]",
+        )];
+        let resolved = merge(&layers).unwrap();
+        assert_eq!(resolved.policy.network.mode, NetworkMode::Host);
+    }
+
     #[test]
     fn reset_clears_an_inherited_broker() {
         let layers = [
@@ -2293,10 +2585,181 @@ mod tests {
         assert_eq!(
             resolved.policy.network.egress,
             Egress::Allow(vec![EgressRule {
-                host: "*".into(),
+                host: Destination::Any,
+                protocol: Protocol::Tcp,
                 port: Some(443),
             }])
         );
+    }
+
+    /// The protocol names are few on purpose; anything else is a typo to
+    /// catch, not a transport to guess at.
+    #[test]
+    fn an_unknown_protocol_is_rejected() {
+        let layers = [layer(
+            "/base",
+            "[network]\negress_allow = [{ host = \"*\", port = 443, protocol = \"sctp\" }]",
+        )];
+        let err = merge(&layers).unwrap_err().to_string();
+        assert!(err.contains("sctp"), "{err}");
+        assert!(err.contains("tcp") && err.contains("udp"), "{err}");
+    }
+
+    #[test]
+    fn a_udp_rule_resolves_with_its_protocol() {
+        let layers = [layer(
+            "/base",
+            "[network]\negress_allow = [{ host = \"*\", port = 27015, protocol = \"udp\" }]",
+        )];
+        let resolved = merge(&layers).unwrap();
+        assert_eq!(
+            resolved.policy.network.egress,
+            Egress::Allow(vec![EgressRule {
+                host: Destination::Any,
+                protocol: Protocol::Udp,
+                port: Some(27015),
+            }])
+        );
+    }
+
+    /// A prefix longer than the address has no addresses in it, and a name
+    /// with a slash is not a name the resolver can be asked for.
+    #[test]
+    fn a_malformed_cidr_is_rejected() {
+        let layers = [layer(
+            "/base",
+            "[network]\negress_allow = [{ host = \"203.0.113.0/33\", port = 443 }]",
+        )];
+        let err = merge(&layers).unwrap_err().to_string();
+        assert!(err.contains("prefix"), "{err}");
+
+        let layers = [layer(
+            "/base",
+            "[network]\negress_allow = [{ host = \"example.com/24\", port = 443 }]",
+        )];
+        let err = merge(&layers).unwrap_err().to_string();
+        assert!(err.contains("neither an address"), "{err}");
+    }
+
+    #[test]
+    fn a_cidr_rule_resolves_to_a_block() {
+        let layers = [layer(
+            "/base",
+            "[network]\negress_allow = [{ host = \"203.0.113.0/24\", port = 443 }]",
+        )];
+        let resolved = merge(&layers).unwrap();
+        assert_eq!(
+            resolved.policy.network.egress,
+            Egress::Allow(vec![EgressRule {
+                host: Destination::Block(
+                    "203.0.113.0".parse().unwrap(),
+                    24
+                ),
+                protocol: Protocol::Tcp,
+                port: Some(443),
+            }])
+        );
+    }
+
+    /// A wildcard name cannot be pinned to addresses, so `*.example.com` is
+    /// refused rather than silently read as one fixed host.
+    #[test]
+    fn a_wildcard_subdomain_is_rejected() {
+        let layers = [layer(
+            "/base",
+            "[network]\negress_allow = [{ host = \"*.example.com\", port = 443 }]",
+        )];
+        let err = merge(&layers).unwrap_err().to_string();
+        assert!(err.contains("wildcard"), "{err}");
+    }
+
+    /// Port 53 is DNS, and DNS is decided by the `dns` setting alone; an
+    /// egress rule naming it would read as a second way to allow DNS.
+    #[test]
+    fn an_egress_rule_for_port_53_is_rejected() {
+        let layers = [layer(
+            "/base",
+            "[network]\negress_allow = [{ host = \"*\", port = 53 }]",
+        )];
+        let err = merge(&layers).unwrap_err().to_string();
+        assert!(err.contains("port 53") && err.contains("dns"), "{err}");
+    }
+
+    /// Loopback inside the namespace is governed by forwards and
+    /// publications; a deny there would contradict a forward of the same
+    /// port.
+    #[test]
+    fn a_deny_rule_for_loopback_is_rejected() {
+        let layers = [layer(
+            "/base",
+            "[network]\negress_deny = [{ host = \"127.0.0.1\" }]",
+        )];
+        let err = merge(&layers).unwrap_err().to_string();
+        assert!(err.contains("loopback"), "{err}");
+
+        // A range that contains loopback is refused too.
+        let layers = [layer(
+            "/base",
+            "[network]\negress_deny = [{ host = \"127.0.0.0/8\" }]",
+        )];
+        let err = merge(&layers).unwrap_err().to_string();
+        assert!(err.contains("loopback"), "{err}");
+    }
+
+    #[test]
+    fn a_deny_rule_resolves_and_accumulates_across_layers() {
+        let layers = [
+            layer("/base", "[network]\negress_deny = [{ host = \"169.254.169.254\" }]"),
+            layer(
+                "/project",
+                "[network]\negress_deny = [{ host = \"169.254.170.2\", port = 80 }]",
+            ),
+        ];
+        let resolved = merge(&layers).unwrap();
+        assert_eq!(
+            resolved.policy.network.deny,
+            vec![
+                DenyRule {
+                    host: Destination::Address("169.254.169.254".parse().unwrap()),
+                    port: None,
+                },
+                DenyRule {
+                    host: Destination::Address("169.254.170.2".parse().unwrap()),
+                    port: Some(80),
+                },
+            ]
+        );
+    }
+
+    /// A deny list works under full egress too: `egress = "allow"` plus
+    /// `egress_deny` is the usual "everything except" shape.
+    #[test]
+    fn a_deny_list_under_full_egress_resolves() {
+        let layers = [layer(
+            "/base",
+            "[network]\negress = \"allow\"\negress_deny = [{ host = \"169.254.169.254\" }]",
+        )];
+        let resolved = merge(&layers).unwrap();
+        assert_eq!(resolved.policy.network.egress, Egress::AllowAll);
+        assert_eq!(resolved.policy.network.deny.len(), 1);
+    }
+
+    #[test]
+    fn dns_merges_as_a_scalar() {
+        let layers = [
+            layer("/base", "[network]\ndns = \"allow\""),
+            layer("/project", "[network]\ndns = \"deny\""),
+        ];
+        let resolved = merge(&layers).unwrap();
+        assert_eq!(resolved.policy.network.dns, DnsSetting::Deny);
+    }
+
+    #[test]
+    fn an_unknown_dns_value_is_rejected_naming_the_layer() {
+        let layers = [layer("/deep", "[network]\ndns = \"proxy\"")];
+        let err = merge(&layers).unwrap_err().to_string();
+        assert!(err.contains("/deep/bailey.toml"), "{err}");
+        assert!(err.contains("proxy"), "{err}");
     }
 
     #[test]
@@ -2510,7 +2973,8 @@ mod tests {
         assert_eq!(
             resolved.policy.network.egress,
             Egress::Allow(vec![EgressRule {
-                host: "*".into(),
+                host: Destination::Any,
+                protocol: Protocol::Tcp,
                 port: Some(443)
             }])
         );

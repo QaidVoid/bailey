@@ -735,9 +735,10 @@ pub(crate) fn parse_egress_proxy(value: &str) -> anyhow::Result<(std::net::Ipv4A
 
 /// Permit a local endpoint's TCP port after netfilter bounds its destination.
 fn permit_egress_port(policy: &mut crate::policy::Policy, port: u16) {
-    use crate::policy::{Egress, EgressRule};
+    use crate::policy::{Destination, Egress, EgressRule, Protocol};
     let rule = EgressRule {
-        host: "*".to_string(),
+        host: Destination::Any,
+        protocol: Protocol::Tcp,
         port: Some(port),
     };
     match &mut policy.network.egress {
@@ -906,6 +907,13 @@ fn check_network_contradictions(
             anyhow::bail!(
                 "host mode ({source}) cannot forward ports under allowed \
                  egress, which needs a private namespace"
+            );
+        }
+        if policy.network.needs_egress_namespace() {
+            anyhow::bail!(
+                "host mode ({source}) cannot carry the policy's destination, \
+                 UDP and deny rules, which are enforced in the private \
+                 namespace's netfilter rules; drop the rules or the host mode"
             );
         }
     }
@@ -2912,10 +2920,11 @@ mod tests {
 
     #[test]
     fn proxy_forward_connect_ports_do_not_widen_partial_remote_egress() {
-        use crate::policy::EgressRule;
+        use crate::policy::{Destination, EgressRule, Protocol};
         let mut policy = Policy::default();
         policy.network.egress = Egress::Allow(vec![EgressRule {
-            host: "*".into(),
+            host: Destination::Any,
+            protocol: Protocol::Tcp,
             port: Some(443),
         }]);
         let forwards = [PortForward {
@@ -2937,14 +2946,15 @@ mod tests {
 
     #[test]
     fn proxy_forwards_preserve_existing_remote_port_allowances() {
-        use crate::policy::EgressRule;
+        use crate::policy::{Destination, EgressRule, Protocol};
         let forwards = [PortForward {
             port: 8081,
             host_port: 8080,
         }];
         for port in [0, 8081] {
             let egress = Egress::Allow(vec![EgressRule {
-                host: "*".into(),
+                host: Destination::Any,
+                protocol: Protocol::Tcp,
                 port: Some(port),
             }]);
             let rules = proxy_loopback_ruleset(&forwards, &[], &egress);
@@ -3098,6 +3108,28 @@ mod tests {
         check_network_contradictions(&denied, &forwards, &[]).unwrap();
     }
 
+    /// `--no-proxy-net` downgrades the mode to host after resolution, so the
+    /// destination rules a profile or project config set would arrive in a
+    /// namespace nothing enforces them in. That downgrade is refused, and the
+    /// message names what to drop.
+    #[test]
+    fn the_no_proxy_net_flag_cannot_drop_destination_rules() {
+        use crate::policy::Destination;
+        let mut policy = Policy::default();
+        policy.network.egress = Egress::Allow(vec![crate::policy::EgressRule {
+            host: Destination::Name("api.example.com".to_owned()),
+            protocol: crate::policy::Protocol::Tcp,
+            port: Some(443),
+        }]);
+        policy.network.mode = crate::policy::NetworkMode::Host;
+        policy.network.mode_source = "flag --no-proxy-net".to_owned();
+        let err = check_network_contradictions(&policy, &[], &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("host mode"), "{err}");
+        assert!(err.contains("--no-proxy-net"), "{err}");
+    }
+
     /// Each flag overrides each config value, as the highest layer.
     #[test]
     fn network_flags_override_every_config_value() {
@@ -3214,12 +3246,13 @@ mod tests {
 
     #[test]
     fn permitting_the_broker_port_widens_only_that_port() {
-        use crate::policy::{Egress, EgressRule, Policy};
+        use crate::policy::{Destination, Egress, EgressRule, Policy, Protocol};
 
         // An Allow policy gains the broker port alongside what it had.
         let mut policy = Policy::default();
         policy.network.egress = Egress::Allow(vec![EgressRule {
-            host: "*".into(),
+            host: Destination::Any,
+            protocol: Protocol::Tcp,
             port: Some(443),
         }]);
         permit_egress_port(&mut policy, 8443);
