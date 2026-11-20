@@ -165,10 +165,33 @@ pub(crate) fn set_user_namespace_limit(limit: u32) -> io::Result<()> {
 }
 
 /// Map the caller's uid and gid into a freshly created user namespace.
-fn write_identity_map(uid: u32, gid: u32) -> io::Result<()> {
+///
+/// `uid` and `gid` are the caller's ids in the parent namespace's terms, the
+/// only ids this process is allowed to map. The ids presented are the host's,
+/// from [`HOST_IDENTITY`], so a target built beneath a proxy namespace reads
+/// its caller's uid rather than the 0 the proxy mapped the caller to.
+pub(crate) fn write_identity_map(uid: u32, gid: u32) -> io::Result<()> {
+    let (host_uid, host_gid) =
+        *HOST_IDENTITY.get_or_init(|| (unsafe { libc::getuid() }, unsafe { libc::getgid() }));
     fs::write("/proc/self/setgroups", "deny")?;
-    fs::write("/proc/self/gid_map", format!("{gid} {gid} 1"))?;
-    fs::write("/proc/self/uid_map", format!("{uid} {uid} 1"))
+    fs::write("/proc/self/gid_map", format!("{host_gid} {gid} 1"))?;
+    fs::write("/proc/self/uid_map", format!("{host_uid} {uid} 1"))
+}
+
+/// The numerical identity the caller had on the host, captured before any
+/// namespace remaps it.
+///
+/// The private-network namespace maps the caller to 0 so `nft` keeps its
+/// capabilities across exec, and `getuid` inside it answers 0. Writing that 0
+/// straight back from a namespace built beneath it would make the target root,
+/// which programs refuse and D-Bus EXTERNAL authentication rejects, so the
+/// host identity is captured once, before the first unshare, and every map
+/// written afterwards presents it.
+static HOST_IDENTITY: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
+
+/// Record the caller's host identity before the first namespace remaps it.
+pub(crate) fn capture_host_identity() {
+    let _ = HOST_IDENTITY.set((unsafe { libc::getuid() }, unsafe { libc::getgid() }));
 }
 
 /// Create a guard user namespace beneath the current one: an identity map and
@@ -181,6 +204,7 @@ fn write_identity_map(uid: u32, gid: u32) -> io::Result<()> {
 pub(crate) fn create_guard_namespace(limit: u32) -> io::Result<()> {
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
+    capture_host_identity();
     unshare(CloneFlags::CLONE_NEWUSER).map_err(errno)?;
     write_identity_map(uid, gid)?;
     set_user_namespace_limit(limit)
@@ -189,6 +213,7 @@ pub(crate) fn create_guard_namespace(limit: u32) -> io::Result<()> {
 fn probe() -> io::Result<()> {
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
+    capture_host_identity();
     unshare(CloneFlags::CLONE_NEWUSER).map_err(errno)?;
     write_identity_map(uid, gid)?;
     unshare(CloneFlags::CLONE_NEWNS).map_err(errno)?;
@@ -226,6 +251,10 @@ pub fn enter(plan: &IsolationPlan, create_guard: bool) -> io::Result<()> {
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
 
+    // Before any namespace remaps the caller, so every map written later
+    // presents the host's numbers even though getuid stops answering with
+    // them.
+    capture_host_identity();
     // The guard namespace when this run builds its own from the host: the
     // identity map, then a limit of one namespace, which the run's own spends.
     // Without it the target could create a user namespace beneath the run's

@@ -600,6 +600,53 @@ fn the_target_keeps_the_callers_uid() {
     );
 }
 
+/// The private network namespace maps its caller to 0 so the netfilter rule
+/// survives exec, and the namespaces built beneath it must map the host
+/// identity back. Automatic mode takes that path by default for an
+/// egress-allowing policy, so this is the shape an ordinary run has.
+#[test]
+fn a_private_network_run_keeps_the_callers_uid_and_gid() {
+    if !isolation_active() {
+        eprintln!("skipping: isolation unavailable on this host");
+        return;
+    }
+    if bailey::cli::resolve_helper("pasta").is_err() {
+        eprintln!("skipping: needs trusted pasta");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("bailey.toml");
+    fs::write(&config, "[network]\negress = \"allow\"\n").unwrap();
+    let output = Command::new(bailey())
+        .args(["run", "-c"])
+        .arg(&config)
+        .args(["/bin/sh", "-c", "id -u; id -g"])
+        .env("XDG_DATA_HOME", dir.path())
+        .output()
+        .unwrap();
+
+    let seen = String::from_utf8_lossy(&output.stdout);
+    let real_uid = unsafe { libc::getuid() }.to_string();
+    let real_gid = unsafe { libc::getgid() }.to_string();
+    let mut lines = seen.lines().filter(|line| !line.is_empty());
+    let uid = lines.next().unwrap_or_default().trim();
+    let gid = lines.next().unwrap_or_default().trim();
+    assert_eq!(
+        uid,
+        real_uid,
+        "an automatic private-network run must keep the caller's uid, not the 0 \
+         the proxy namespace maps its caller to: a target that refuses root \
+         would refuse here\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        gid,
+        real_gid,
+        "the caller's gid must survive the proxy namespace as well\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn a_denied_file_is_concealed_rather_than_failing_the_run() {
     if !isolation_active() {

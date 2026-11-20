@@ -383,11 +383,12 @@ impl Inherited {
 ///
 /// A run that fully denies the network says nothing, in keeping with the rest of
 /// the tool: output means something needs attention.
+///
+/// Private mode stays in scope on purpose: its namespace carries allowed egress,
+/// but the run's own rules still gate TCP ports only, so a partial allowance
+/// leaves every other protocol free to leave through pasta.
 pub fn report(mode: NetworkMode, policy: &Policy, inherited: Inherited) {
-    if matches!(
-        mode,
-        NetworkMode::Isolated | NetworkMode::Brokered | NetworkMode::Private
-    ) {
+    if matches!(mode, NetworkMode::Isolated | NetworkMode::Brokered) {
         return;
     }
     if inherited == Inherited::Brokered {
@@ -468,6 +469,11 @@ pub fn enter_proxy_namespace(limit: u32) -> io::Result<()> {
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
 
+    // Before the unshare, while getuid still answers with the host's numbers:
+    // the map below makes this namespace's caller 0, and the namespaces built
+    // beneath it must present the host identity, not that 0.
+    crate::backend::isolation::capture_host_identity();
+
     unshare(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNET | CloneFlags::CLONE_NEWIPC)
         .map_err(errno)?;
     fs::write("/proc/self/setgroups", "deny")?;
@@ -487,6 +493,8 @@ pub fn enter_isolated(create_guard: bool) -> io::Result<()> {
     let uid = unsafe { libc::getuid() };
     let gid = unsafe { libc::getgid() };
 
+    // Before the unshare, while getuid still answers with the host's numbers.
+    crate::backend::isolation::capture_host_identity();
     if create_guard {
         create_guard_namespace(1)?;
     }
@@ -495,9 +503,10 @@ pub fn enter_isolated(create_guard: bool) -> io::Result<()> {
     // not files, so nothing in the filesystem policy can withhold them.
     unshare(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNET | CloneFlags::CLONE_NEWIPC)
         .map_err(errno)?;
-    fs::write("/proc/self/setgroups", "deny")?;
-    fs::write("/proc/self/gid_map", format!("{gid} {gid} 1"))?;
-    fs::write("/proc/self/uid_map", format!("{uid} {uid} 1"))?;
+    // The shared writer presents the host identity: from inside a proxy
+    // namespace, getuid answers 0, and mapping that straight back would make
+    // the target root.
+    crate::backend::isolation::write_identity_map(uid, gid)?;
 
     bring_loopback_up()
 }

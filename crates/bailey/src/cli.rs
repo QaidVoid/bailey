@@ -748,10 +748,17 @@ fn proxy_loopback_ruleset(forwards: &[PortForward], publishes: &[u16], egress: &
 /// Apply the network flags to the resolved policy as its highest layer.
 ///
 /// `--proxy-net` requests the private namespace, `--no-proxy-net` the host's,
-/// and `--egress-proxy` names a broker. Whatever a config layer set, a flag
-/// passed to this run replaces it, and the source names the flag so the
-/// summary says what chose the mode.
+/// and `--egress-proxy` names a broker, which selects the private namespace
+/// with it. `--publish-port` ports join the policy's own publications, so the
+/// policy a `show` reports is the one this invocation resolves. Whatever a
+/// config layer set, a flag passed to this run replaces or extends it, and
+/// the source names the flag so the summary says what chose the mode.
 fn apply_network_flags(policy: &mut Policy, args: &NetworkArgs) -> anyhow::Result<()> {
+    for port in &args.publish_port {
+        if !policy.network.publish_ports.contains(port) {
+            policy.network.publish_ports.push(*port);
+        }
+    }
     if args.no_proxy_net {
         policy.network.mode = crate::policy::NetworkMode::Host;
         policy.network.mode_source = "flag --no-proxy-net".to_owned();
@@ -761,6 +768,12 @@ fn apply_network_flags(policy: &mut Policy, args: &NetworkArgs) -> anyhow::Resul
     }
     if let Some(proxy) = &args.egress_proxy {
         let (addr, port) = parse_egress_proxy(proxy)?;
+        // The broker needs the private namespace, so naming one selects the
+        // mode as well: it outranks a configured host mode the same way
+        // --proxy-net does, while a contradiction written entirely in config
+        // stays refused.
+        policy.network.mode = crate::policy::NetworkMode::Private;
+        policy.network.mode_source = "flag --egress-proxy".to_owned();
         policy.network.broker = Some((addr, port));
         policy.network.broker_source = Some("flag --egress-proxy".to_owned());
     }
@@ -793,7 +806,10 @@ fn check_network_contradictions(
                  network namespace of the run's own"
             );
         }
-        if !forwards.is_empty() {
+        // Denied-egress forwards are carried by the backend in the namespace
+        // the policy builds anyway, so they need nothing host mode gives up.
+        // Only forwards under allowed egress need the private namespace.
+        if !forwards.is_empty() && !matches!(policy.network.egress, Egress::DenyAll) {
             anyhow::bail!(
                 "host mode ({source}) cannot forward ports under allowed \
                  egress, which needs a private namespace"
@@ -1247,20 +1263,26 @@ fn refuse_root() -> anyhow::Result<()> {
     if unsafe { libc::geteuid() } != 0 {
         return Ok(());
     }
-    // Being uid 0 is not the same as being root. Inside a user namespace the
-    // caller is often mapped to 0 while owning nothing on the host: pasta does
-    // exactly that for the inner run. What matters is who 0 stands for
-    // outside, which the map says.
+    // Being uid 0 is not the same as being real root. Inside a user namespace
+    // the caller is often mapped to 0 while owning nothing on the host: pasta
+    // does exactly that for the inner run. What matters is who 0 stands for
+    // and how far the mapping reaches, which the kernel's map says. Nothing
+    // from the environment is consulted, because a caller can set any of it:
+    // a guard that trusts its own marker has a door built in.
     let map = std::fs::read_to_string("/proc/self/uid_map").unwrap_or_default();
-    if host_uid_of_root(&map) == Some(0) {
-        // An identity map also reads inside a nested user namespace, where 0
-        // stands for the outer sandbox's caller. That caller was refused as
-        // real root on the host already, and a child user namespace can only
-        // map what its parent has, so inside a bailey sandbox 0 is never real
-        // root again.
-        if world::inside_sandbox() {
-            return Ok(());
-        }
+    let Some((host_uid, range)) = host_uid_of_root(&map) else {
+        anyhow::bail!(
+            "bailey confines an unprivileged process, but /proc/self/uid_map \
+             cannot be read to tell real root from a mapped one; the run is \
+             refused"
+        );
+    };
+    // 0 mapped to 0 across the whole uid range happens in exactly one way: a
+    // namespace the host's root seeded, the initial one directly or a nested
+    // one granted the full range. A nested 0 that maps less is someone else's
+    // mapped root, and the namespace that produced it was subject to this
+    // guard when it ran unconfined.
+    if host_uid == 0 && range == u32::MAX {
         anyhow::bail!(
             "bailey confines an unprivileged process and is running as real root; \
              a target would be root on the host too. Run it as the user it is for"
@@ -1271,16 +1293,17 @@ fn refuse_root() -> anyhow::Result<()> {
 
 /// Who uid 0 stands for outside this user namespace, read from a `uid_map`.
 ///
-/// A line is `<inside> <outside> <count>`. The entry whose range covers 0 says
-/// what 0 really is; `None` when nothing does, which is not a root run either.
-fn host_uid_of_root(map: &str) -> Option<u32> {
+/// A line is `<inside> <outside> <count>`. The entry whose range covers 0
+/// answers with the outside uid and the width of the mapped range; `None`
+/// when nothing covers 0.
+fn host_uid_of_root(map: &str) -> Option<(u32, u32)> {
     for line in map.lines() {
         let mut parts = line.split_whitespace();
         let inside: u32 = parts.next()?.parse().ok()?;
         let outside: u32 = parts.next()?.parse().ok()?;
         let count: u32 = parts.next()?.parse().ok()?;
         if inside == 0 && count >= 1 {
-            return Some(outside);
+            return Some((outside, count));
         }
     }
     None
@@ -2822,6 +2845,20 @@ mod tests {
         assert_eq!(publish("3800").unwrap(), vec![3800]);
     }
 
+    /// The publication flag lands in the policy itself, so `show` reports the
+    /// publications this invocation resolves.
+    #[test]
+    fn a_publish_port_flag_joins_the_policy() {
+        let mut policy = Policy::default();
+        policy.network.publish_ports = vec![4000];
+        apply_network_flags(
+            &mut policy,
+            &publish_args(&["--publish-port", "3800", "--publish-port", "4000"]),
+        )
+        .unwrap();
+        assert_eq!(policy.network.publish_ports, vec![4000, 3800]);
+    }
+
     /// Each contradictory combination the policy-config delta names, refused
     /// with both sides named.
     #[test]
@@ -2888,6 +2925,13 @@ mod tests {
         rescued.network.mode = crate::policy::NetworkMode::Private;
         rescued.network.mode_source = "flag --proxy-net".to_owned();
         check_network_contradictions(&rescued, &forwards, &[]).unwrap();
+
+        // A denied-egress forward needs no private namespace, so host mode
+        // beside one is no contradiction: the backend carries it in the
+        // namespace the policy builds anyway.
+        let mut denied = host_mode(false, "");
+        denied.network.egress = Egress::DenyAll;
+        check_network_contradictions(&denied, &forwards, &[]).unwrap();
     }
 
     /// Each flag overrides each config value, as the highest layer.
@@ -2932,6 +2976,18 @@ mod tests {
             policy.network.broker_source.as_deref(),
             Some("flag --egress-proxy")
         );
+
+        // --egress-proxy over a config's host mode selects the mode as well:
+        // the broker needs the private namespace, so naming one implies
+        // --proxy-net.
+        let mut policy = config_layer("host", false);
+        apply_network_flags(
+            &mut policy,
+            &publish_args(&["--egress-proxy", "169.254.169.1:8443"]),
+        )
+        .unwrap();
+        assert_eq!(policy.network.mode, crate::policy::NetworkMode::Private);
+        assert_eq!(policy.network.mode_source, "flag --egress-proxy");
     }
 
     #[test]
@@ -3170,15 +3226,17 @@ mod root_guard_tests {
 
     #[test]
     fn a_mapped_root_is_not_real_root() {
-        // The initial namespace: 0 really is root.
+        // 0 mapped to 0 across the whole range: the initial namespace, or a
+        // nested one the host's root seeded. Both are the caller the guard
+        // refuses.
         assert_eq!(
             host_uid_of_root("         0          0 4294967295\n"),
-            Some(0)
+            Some((0, u32::MAX))
         );
         // What pasta gives the inner run: 0 stands for the caller.
         assert_eq!(
             host_uid_of_root("         0       1000          1\n"),
-            Some(1000)
+            Some((1000, 1))
         );
         // A map that does not cover 0 at all.
         assert_eq!(host_uid_of_root("      1000       1000          1\n"), None);

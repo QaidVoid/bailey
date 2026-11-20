@@ -125,7 +125,8 @@ fn a_configured_mode_is_reported_with_its_source() {
 }
 
 /// Automatic mode that falls back says the private namespace was unavailable
-/// and names the prerequisite it missed.
+/// and names the prerequisite it missed. Which prerequisite is missing depends
+/// on the host: without user namespaces, that is named before pasta is.
 #[test]
 fn an_automatic_fallback_names_the_missing_prerequisite() {
     let helpers = tempfile::tempdir().unwrap();
@@ -140,9 +141,13 @@ fn an_automatic_fallback_names_the_missing_prerequisite() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let missing = if bailey::backend::isolation::available() {
+        "pasta is not in a trusted location"
+    } else {
+        "unprivileged user namespaces are unavailable"
+    };
     assert!(
-        stderr.contains("automatic mode fell back")
-            && stderr.contains("pasta is not in a trusted location"),
+        stderr.contains("automatic mode fell back") && stderr.contains(missing),
         "the fallback must name the private namespace and the missing helper: {stderr}"
     );
 }
@@ -191,7 +196,8 @@ fn doctor_reports_the_private_network_available() {
 }
 
 /// A host without a trusted pasta is one where automatic mode shares the
-/// host's namespace and refuses policies that need the private one.
+/// host's namespace and refuses policies that need the private one. A host
+/// without user namespaces names that prerequisite instead of pasta.
 #[test]
 fn doctor_reports_missing_pasta_and_its_consequences() {
     let helpers = tempfile::tempdir().unwrap();
@@ -199,8 +205,13 @@ fn doctor_reports_missing_pasta_and_its_consequences() {
     command.env("BAILEY_HELPER_DIRS", helpers.path());
     let output = command.arg("doctor").output().unwrap();
     let report = String::from_utf8_lossy(&output.stdout);
+    let missing = if bailey::backend::isolation::available() {
+        "pasta, which is not in a trusted location"
+    } else {
+        "unprivileged user namespaces, which are unavailable"
+    };
     assert!(
-        report.contains("private network: unavailable (pasta, which is not in a trusted location)"),
+        report.contains(&format!("private network: unavailable ({missing})")),
         "an empty helper search must report pasta missing: {report}"
     );
     assert!(
