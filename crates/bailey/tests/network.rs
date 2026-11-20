@@ -3,6 +3,7 @@
 //! The interesting cases need a program that can open sockets, so these use
 //! `python3` and self-skip where it is absent. They also self-skip where user
 //! namespaces are unavailable, since the network namespace depends on them.
+mod common;
 
 use std::fs;
 use std::io::{Read, Write};
@@ -65,7 +66,7 @@ fn stdout_of(output: &std::process::Output) -> String {
 #[test]
 fn denied_egress_blocks_udp_as_well_as_tcp() {
     if python().is_none() || !netns_available() {
-        eprintln!("skipping: needs python3 and user namespaces");
+        common::skip("needs python3 and user namespaces");
         return;
     }
     let output = run_python(
@@ -88,7 +89,7 @@ fn denied_egress_blocks_udp_as_well_as_tcp() {
 #[test]
 fn denied_egress_blocks_name_resolution() {
     if python().is_none() || !netns_available() {
-        eprintln!("skipping: needs python3 and user namespaces");
+        common::skip("needs python3 and user namespaces");
         return;
     }
     let output = run_python(
@@ -106,7 +107,7 @@ fn denied_egress_blocks_name_resolution() {
 #[test]
 fn loopback_works_inside_the_sandbox() {
     if python().is_none() || !netns_available() {
-        eprintln!("skipping: needs python3 and user namespaces");
+        common::skip("needs python3 and user namespaces");
         return;
     }
     let output = run_python(
@@ -128,7 +129,7 @@ fn loopback_works_inside_the_sandbox() {
 #[test]
 fn only_loopback_is_visible() {
     if !netns_available() {
-        eprintln!("skipping: user namespaces unavailable");
+        common::skip("user namespaces unavailable");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -154,7 +155,7 @@ fn host_abstract_socket_is_refused() {
     use std::os::unix::net::{SocketAddr, UnixListener};
 
     if python().is_none() {
-        eprintln!("skipping: needs python3");
+        common::skip("needs python3");
         return;
     }
     // Egress is allowed, so no network namespace is created and the abstract
@@ -186,7 +187,7 @@ fn host_abstract_socket_is_refused() {
 #[test]
 fn signalling_a_host_process_is_refused() {
     if python().is_none() {
-        eprintln!("skipping: needs python3");
+        common::skip("needs python3");
         return;
     }
     // The test process belongs to the same user, so this would succeed without
@@ -263,7 +264,7 @@ fn accepted_count(listener: &TcpListener) -> usize {
 #[test]
 fn mptcp_cannot_reach_an_ungranted_port() {
     if python().is_none() {
-        eprintln!("skipping: needs python3");
+        common::skip("needs python3");
         return;
     }
     let (port, v4, v6) = ungranted_listeners();
@@ -297,7 +298,7 @@ fn mptcp_cannot_reach_an_ungranted_port() {
 #[test]
 fn mptcp_cannot_bind_an_ungranted_port() {
     if python().is_none() {
-        eprintln!("skipping: needs python3");
+        common::skip("needs python3");
         return;
     }
     // Hold the port first so the attempt below is known to target a free one,
@@ -340,7 +341,14 @@ fn mptcp_cannot_bind_an_ungranted_port() {
 #[test]
 fn every_stream_protocol_respects_port_rules() {
     if python().is_none() {
-        eprintln!("skipping: needs python3");
+        common::skip("needs python3");
+        return;
+    }
+    // The errno table names Landlock's refusals, which exist from ABI 4
+    // (Linux 6.7). Below it nothing enforces the port rule, and the table
+    // would describe the namespace's routing rather than the policy.
+    if !bailey::backend::probe::landlock_abi().is_some_and(|abi| abi >= 4) {
+        common::skip("landlock does not enforce port rules before ABI 4");
         return;
     }
     let (port, v4, v6) = ungranted_listeners();
@@ -463,12 +471,12 @@ impl Drop for EchoServer {
 
 fn proxy_net_available() -> bool {
     if python().is_none() || !netns_available() {
-        eprintln!("skipping: needs python3 and user namespaces");
+        common::skip("needs python3 and user namespaces");
         return false;
     }
     for helper in ["pasta", "nft"] {
         if let Err(err) = bailey::cli::resolve_helper(helper) {
-            eprintln!("skipping: needs trusted {helper}: {err}");
+            common::skip(&format!("needs trusted {helper}: {err}"));
             return false;
         }
     }
@@ -509,7 +517,7 @@ subprocess.run([{nft:?}, '-f', '-'], input='table inet bailey_test {{\n chain ou
 #[test]
 fn forwarded_ports_carry_to_the_host_and_others_stay_dead() {
     if python().is_none() || !netns_available() {
-        eprintln!("skipping: needs python3 and user namespaces");
+        common::skip("needs python3 and user namespaces");
         return;
     }
     let echo = EchoServer::start();
@@ -719,9 +727,17 @@ fn auto_mode_uses_the_private_namespace() {
         return;
     }
     let Some(host_address) = non_loopback_host_address() else {
-        eprintln!("skipping: no non-loopback host address");
+        common::skip("no non-loopback host address");
         return;
     };
+    // A QEMU guest on user networking sits at 10.0.2.15, the very address
+    // bailey's private namespace is given (cli's PROXY_ADDRESS_V4), so there
+    // sandbox and host report the same address and the assertion below says
+    // nothing about the namespace.
+    if host_address.to_string() == "10.0.2.15" {
+        common::skip("the host's address is the sandbox's own (QEMU slirp)");
+        return;
+    }
     let output = run_python(
         "[network]\negress = \"allow\"\n",
         r#"import socket
@@ -758,7 +774,7 @@ with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
 #[test]
 fn auto_mode_refuses_when_a_forward_needs_it() {
     if !netns_available() {
-        eprintln!("skipping: needs user namespaces");
+        common::skip("needs user namespaces");
         return;
     }
     let helpers = tempfile::tempdir().unwrap();
@@ -788,7 +804,7 @@ fn auto_mode_refuses_when_a_forward_needs_it() {
 #[test]
 fn auto_mode_falls_back_when_nothing_needs_it() {
     if !netns_available() {
-        eprintln!("skipping: needs user namespaces");
+        common::skip("needs user namespaces");
         return;
     }
     let helpers = tempfile::tempdir().unwrap();
@@ -994,8 +1010,10 @@ impl PublishingChild {
 
 impl Drop for PublishingChild {
     fn drop(&mut self) {
+        let pid = self.child.id();
         let _ = self.child.kill();
         let _ = self.child.wait();
+        common::remove_staging_for(pid);
     }
 }
 
@@ -1011,6 +1029,28 @@ fn publication_echo(port: u16, payload: &[u8]) -> std::io::Result<()> {
     client.read_exact(&mut echoed)?;
     assert_eq!(echoed, payload);
     Ok(())
+}
+
+/// A connect the sandbox never asked for can still succeed against an
+/// unrelated host listener that happened to draw the same ephemeral port
+/// number. Only an accept inside the sandbox proves a real forward, and the
+/// child reports that itself by failing on unrequested ingress; probe the
+/// port and let the child's fate classify the connection.
+fn probe_reaches_sandbox(child: &mut PublishingChild, address: std::net::SocketAddr) -> bool {
+    let mut probe = match std::net::TcpStream::connect_timeout(&address, Duration::from_millis(500))
+    {
+        Ok(probe) => probe,
+        Err(_) => return false,
+    };
+    let _ = probe.write_all(b"unrequested-probe");
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        if child.child.try_wait().unwrap().is_some() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
 }
 
 fn non_loopback_host_address() -> Option<std::net::Ipv4Addr> {
@@ -1142,23 +1182,21 @@ with selectors.DefaultSelector() as selector:
     }
     if let Some(address) = non_loopback_host_address() {
         assert!(
-            std::net::TcpStream::connect_timeout(
-                &std::net::SocketAddr::from((address, port)),
-                Duration::from_millis(500),
-            )
-            .is_err(),
-            "published TCP port was reachable on non-loopback address {address}"
+            !probe_reaches_sandbox(&mut child, std::net::SocketAddr::from((address, port))),
+            "published TCP port was reachable on non-loopback address {address}: {}",
+            child.diagnostics()
         );
     } else {
-        eprintln!("skipping non-loopback assertion: no active non-loopback IPv4 address");
+        common::skip("non-loopback assertion: no active non-loopback IPv4 address");
     }
     assert!(
-        std::net::TcpStream::connect_timeout(
-            &std::net::SocketAddr::from(([127, 0, 0, 1], unpublished_port)),
-            Duration::from_millis(500),
-        )
-        .is_err(),
-        "an unpublished sandbox TCP listener was reachable from the host"
+        !probe_reaches_sandbox(
+            &mut child,
+            std::net::SocketAddr::from(([127, 0, 0, 1], unpublished_port)),
+        ),
+        "an unpublished sandbox TCP listener was reachable from the host \
+         (port {unpublished_port} answered): {}",
+        child.diagnostics()
     );
     let udp = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
     udp.set_read_timeout(Some(Duration::from_millis(400)))

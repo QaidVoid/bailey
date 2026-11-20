@@ -66,7 +66,7 @@ fn denial_workspace() -> (tempfile::TempDir, std::path::PathBuf) {
 #[test]
 fn denied_subdirectory_is_concealed_under_isolation() {
     if !isolation_active() {
-        eprintln!("skipping: isolation unavailable on this host");
+        common::skip("isolation unavailable on this host");
         return;
     }
     let (dir, config) = denial_workspace();
@@ -106,7 +106,7 @@ fn denied_subdirectory_is_concealed_under_isolation() {
 #[test]
 fn denied_directory_is_empty_and_read_only_under_isolation() {
     if !isolation_active() {
-        eprintln!("skipping: isolation unavailable on this host");
+        common::skip("isolation unavailable on this host");
         return;
     }
     let (dir, config) = denial_workspace();
@@ -145,7 +145,7 @@ fn denied_directory_is_empty_and_read_only_under_isolation() {
 #[test]
 fn ungranted_path_is_absent_under_isolation() {
     if !isolation_active() {
-        eprintln!("skipping: isolation unavailable on this host");
+        common::skip("isolation unavailable on this host");
         return;
     }
     // `/var` is not granted, and unlike `/home` it is not a parent of anything
@@ -171,7 +171,7 @@ fn ungranted_path_is_absent_under_isolation() {
 #[test]
 fn orphans_a_target_leaves_are_reaped() {
     if !isolation_active() {
-        eprintln!("skipping: isolation unavailable on this host");
+        common::skip("isolation unavailable on this host");
         return;
     }
     // Two generations: the inner sh backgrounds a sleeper and exits, so the
@@ -201,7 +201,7 @@ fn orphans_a_target_leaves_are_reaped() {
 #[test]
 fn landlock_still_denies_writes_under_isolation() {
     if !isolation_active() {
-        eprintln!("skipping: isolation unavailable on this host");
+        common::skip("isolation unavailable on this host");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -230,7 +230,7 @@ fn landlock_still_denies_writes_under_isolation() {
 #[test]
 fn a_read_only_island_survives_inside_a_writable_grant() {
     if !isolation_active() {
-        eprintln!("skipping: isolation unavailable on this host");
+        common::skip("isolation unavailable on this host");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -297,7 +297,7 @@ fn a_read_only_island_survives_inside_a_writable_grant() {
 #[test]
 fn two_grants_the_user_wrote_still_accumulate() {
     if !isolation_active() {
-        eprintln!("skipping: isolation unavailable on this host");
+        common::skip("isolation unavailable on this host");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -337,7 +337,7 @@ fn two_grants_the_user_wrote_still_accumulate() {
 #[test]
 fn a_read_only_grant_inside_the_home_is_not_writable() {
     if !isolation_active() {
-        eprintln!("skipping: isolation unavailable on this host");
+        common::skip("isolation unavailable on this host");
         return;
     }
     let home = tempfile::tempdir().unwrap();
@@ -391,7 +391,7 @@ fn a_read_only_grant_inside_the_home_is_not_writable() {
 #[test]
 fn a_symlink_into_a_granted_tree_stays_a_symlink() {
     if !isolation_active() {
-        eprintln!("skipping: isolation unavailable on this host");
+        common::skip("isolation unavailable on this host");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -443,7 +443,7 @@ fn a_symlink_into_a_granted_tree_stays_a_symlink() {
 #[test]
 fn a_grant_can_be_placed_at_another_path() {
     if !isolation_active() {
-        eprintln!("skipping: isolation unavailable on this host");
+        common::skip("isolation unavailable on this host");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -495,7 +495,7 @@ fn a_grant_can_be_placed_at_another_path() {
 #[test]
 fn the_host_path_of_a_relocated_grant_is_gone() {
     if !isolation_active() {
-        eprintln!("skipping: isolation unavailable on this host");
+        common::skip("isolation unavailable on this host");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -542,7 +542,7 @@ fn the_host_path_of_a_relocated_grant_is_gone() {
 #[test]
 fn the_target_is_not_told_the_machines_name() {
     if !isolation_active() {
-        eprintln!("skipping: isolation unavailable on this host");
+        common::skip("isolation unavailable on this host");
         return;
     }
     let real = std::process::Command::new("uname")
@@ -578,7 +578,7 @@ fn the_target_is_not_told_the_machines_name() {
 #[test]
 fn the_target_keeps_the_callers_uid() {
     if !isolation_active() {
-        eprintln!("skipping: isolation unavailable on this host");
+        common::skip("isolation unavailable on this host");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -607,11 +607,11 @@ fn the_target_keeps_the_callers_uid() {
 #[test]
 fn a_private_network_run_keeps_the_callers_uid_and_gid() {
     if !isolation_active() {
-        eprintln!("skipping: isolation unavailable on this host");
+        common::skip("isolation unavailable on this host");
         return;
     }
     if bailey::cli::resolve_helper("pasta").is_err() {
-        eprintln!("skipping: needs trusted pasta");
+        common::skip("needs trusted pasta");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -650,7 +650,7 @@ fn a_private_network_run_keeps_the_callers_uid_and_gid() {
 #[test]
 fn a_denied_file_is_concealed_rather_than_failing_the_run() {
     if !isolation_active() {
-        eprintln!("skipping: isolation unavailable on this host");
+        common::skip("isolation unavailable on this host");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -698,7 +698,7 @@ fn a_denied_file_is_concealed_rather_than_failing_the_run() {
 #[test]
 fn granting_dev_pts_gives_the_run_terminals_of_its_own() {
     if !isolation_active() {
-        eprintln!("skipping: isolation unavailable on this host");
+        common::skip("isolation unavailable on this host");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -783,11 +783,11 @@ fn mount_workspace(
 #[test]
 fn self_fuse_lets_the_target_mount_and_unmount() {
     if !isolation_active() {
-        eprintln!("skipping: isolation unavailable on this host");
+        common::skip("isolation unavailable on this host");
         return;
     }
     if !Path::new("/usr/bin/python3").exists() {
-        eprintln!("skipping: /usr/bin/python3 unavailable");
+        common::skip("/usr/bin/python3 unavailable");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -835,11 +835,11 @@ fn self_fuse_lets_the_target_mount_and_unmount() {
 #[test]
 fn target_cannot_create_a_user_namespace() {
     if !isolation_active() {
-        eprintln!("skipping: isolation unavailable on this host");
+        common::skip("isolation unavailable on this host");
         return;
     }
     if !Path::new("/usr/bin/python3").exists() {
-        eprintln!("skipping: /usr/bin/python3 unavailable");
+        common::skip("/usr/bin/python3 unavailable");
         return;
     }
     let pasta = Command::new("sh")
@@ -881,7 +881,7 @@ fn target_cannot_create_a_user_namespace() {
     ];
     for (name, config_body, extra_args) in layouts {
         if extra_args.contains(&"--proxy-net") && !pasta {
-            eprintln!("skipping: pasta unavailable for the {name} layout");
+            common::skip(&format!("pasta unavailable for the {name} layout"));
             continue;
         }
         let config = dir.path().join("bailey.toml");
@@ -910,11 +910,11 @@ fn target_cannot_create_a_user_namespace() {
 #[test]
 fn mounting_stays_refused_without_self_fuse() {
     if !isolation_active() {
-        eprintln!("skipping: isolation unavailable on this host");
+        common::skip("isolation unavailable on this host");
         return;
     }
     if !Path::new("/usr/bin/python3").exists() {
-        eprintln!("skipping: /usr/bin/python3 unavailable");
+        common::skip("/usr/bin/python3 unavailable");
         return;
     }
     let dir = tempfile::tempdir().unwrap();

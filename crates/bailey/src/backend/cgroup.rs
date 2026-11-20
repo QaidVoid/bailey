@@ -10,6 +10,10 @@
 //! of bailey's own, because bailey's own cgroup always contains bailey. The run
 //! is therefore created as a *sibling*, in the nearest ancestor that is
 //! delegated to this user, which is the same shape systemd uses for a scope.
+//! Delegation containment adds one more question: the target joins the run's
+//! cgroup by writing itself into its `cgroup.procs`, and the kernel demands
+//! write access to the common ancestor's file too, so a subtree is only usable
+//! when bailey itself lives under it.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -47,18 +51,22 @@ pub fn own() -> Option<PathBuf> {
 }
 
 /// Find a cgroup that runs can be created in, with `needed` controllers
-/// available to their children.
+/// available to their children, and that this process can actually move
+/// itself into.
 ///
 /// Walks up from bailey's own cgroup, because the delegated subtree is normally
 /// an ancestor: the session manager hands the user a directory and the user's
-/// processes live in a leaf of it.
+/// processes live in a leaf of it. Creation alone is not enough; the kernel's
+/// delegation containment (see [`caller_may_join`]) also decides whether the
+/// target can join what it creates, and a root that answers no there is not
+/// usable however well it delegates.
 pub fn usable_root(needed: &[&'static str]) -> Option<PathBuf> {
+    let own = own()?;
     if let Some(path) = std::env::var_os(ROOT_OVERRIDE) {
         let path = PathBuf::from(path);
-        return can_host_runs(&path, needed).then_some(path);
+        return (can_host_runs(&path, needed) && caller_may_join(&own, &path)).then_some(path);
     }
 
-    let own = own()?;
     let root = Path::new(CGROUP_ROOT);
     // Bailey's own cgroup is skipped: it contains bailey, so its controllers
     // cannot be delegated to children.
@@ -66,7 +74,7 @@ pub fn usable_root(needed: &[&'static str]) -> Option<PathBuf> {
         if !candidate.starts_with(root) {
             break;
         }
-        if can_host_runs(candidate, needed) {
+        if can_host_runs(candidate, needed) && caller_may_join(&own, candidate) {
             return Some(candidate.to_path_buf());
         }
         if candidate == root {
@@ -82,6 +90,42 @@ pub(crate) fn can_host_runs(dir: &Path, needed: &[&'static str]) -> bool {
     carries_all(dir, needed).len() == needed.len()
 }
 
+/// Whether a process in `own` may move itself into a cgroup under `base`.
+///
+/// The kernel's delegation containment names two write requirements for a
+/// non-root process migration: the writer must have write access to the
+/// destination's `cgroup.procs`, and to the `cgroup.procs` of the source and
+/// destination's common ancestor. The first is guaranteed, because the run's
+/// cgroup is created by this very user; the second is what decides usability.
+/// A caller sitting outside the delegated subtree, in a cgroup whose files it
+/// does not own (the hierarchy root, a system slice owned by root), can create
+/// the run's cgroup but the target's join would be denied, which used to kill
+/// the run at spawn with a bare permission error. Asking here keeps limits
+/// best-effort: they are skipped with a warning instead.
+fn caller_may_join(own: &Path, base: &Path) -> bool {
+    let ancestor = common_ancestor(own, base);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(ancestor.join("cgroup.procs"))
+        .is_ok()
+}
+
+/// The longest directory both paths live under, the kernel's permission
+/// boundary for moving a process between two cgroups.
+fn common_ancestor(a: &Path, b: &Path) -> PathBuf {
+    let mut ancestor = PathBuf::new();
+    for (left, right) in a.iter().zip(b.iter()) {
+        if left != right {
+            break;
+        }
+        ancestor.push(left);
+    }
+    if ancestor.as_os_str().is_empty() {
+        ancestor.push("/");
+    }
+    ancestor
+}
+
 /// Which of `needed` a child created under `dir` would carry.
 ///
 /// A controller reaches a child only once `dir` delegates it, so a child is
@@ -93,10 +137,9 @@ pub(crate) fn carries_all(dir: &Path, needed: &[&'static str]) -> Vec<&'static s
     if !dir.is_dir() {
         return Vec::new();
     }
-    let probe = dir.join(format!("bailey.probe.{}", std::process::id()));
-    if fs::create_dir(&probe).is_err() {
+    let Some(probe) = make_probe_dir(dir) else {
         return Vec::new();
-    }
+    };
     let missing: Vec<&'static str> = needed
         .iter()
         .copied()
@@ -112,10 +155,9 @@ pub(crate) fn carries_all(dir: &Path, needed: &[&'static str]) -> Vec<&'static s
     if enable(dir, &missing).is_err() {
         return Vec::new();
     }
-    let probe = dir.join(format!("bailey.probe.{}", std::process::id()));
-    if fs::create_dir(&probe).is_err() {
+    let Some(probe) = make_probe_dir(dir) else {
         return Vec::new();
-    }
+    };
     let carried: Vec<&'static str> = needed
         .iter()
         .copied()
@@ -123,6 +165,32 @@ pub(crate) fn carries_all(dir: &Path, needed: &[&'static str]) -> Vec<&'static s
         .collect();
     let _ = fs::remove_dir(&probe);
     carried
+}
+
+/// Create a probe child of `dir`, named uniquely for this call.
+///
+/// Two questions asked at once, as concurrent tests of one process do, used to
+/// race on a probe named for the pid alone: the second `create_dir` saw the
+/// first's and read that as `dir` refusing children, which made a usable
+/// delegation answer unusable depending on timing. A sequence number past the
+/// pid keeps each call's probe its own.
+fn make_probe_dir(dir: &Path) -> Option<PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    for _ in 0..2 {
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let probe = dir.join(format!("bailey.probe.{}.{seq}", std::process::id()));
+        match fs::create_dir(&probe) {
+            Ok(()) => return Some(probe),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                // A leftover of a dead caller with a recycled pid. Its
+                // contents are not ours to trust, so it is replaced.
+                let _ = fs::remove_dir_all(&probe);
+            }
+            Err(_) => return None,
+        }
+    }
+    None
 }
 
 fn enable(dir: &Path, controllers: &[&str]) -> std::io::Result<()> {
@@ -173,5 +241,31 @@ mod tests {
         if let Some(root) = usable_root(&["memory"]) {
             assert!(root.starts_with(CGROUP_ROOT));
         }
+    }
+
+    #[test]
+    fn the_ancestor_of_a_subtree_is_the_shared_prefix() {
+        let own = Path::new("/sys/fs/cgroup/ci/session");
+        let run = Path::new("/sys/fs/cgroup/ci/bailey.9");
+        assert_eq!(
+            common_ancestor(own, run),
+            PathBuf::from("/sys/fs/cgroup/ci")
+        );
+    }
+
+    #[test]
+    fn cgroups_sharing_nothing_meet_at_the_hierarchy_root() {
+        let own = Path::new("/sys/fs/cgroup/one/leaf");
+        let other = Path::new("/sys/fs/cgroup/two");
+        assert_eq!(common_ancestor(own, other), PathBuf::from("/sys/fs/cgroup"));
+    }
+
+    #[test]
+    fn a_cgroup_is_its_own_ancestor() {
+        let own = Path::new("/sys/fs/cgroup/ci/session");
+        assert_eq!(
+            common_ancestor(own, own),
+            PathBuf::from("/sys/fs/cgroup/ci/session")
+        );
     }
 }

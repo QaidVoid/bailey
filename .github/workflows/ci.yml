@@ -37,13 +37,125 @@ jobs:
         run: cargo build --all-targets
 
       # What this runner can actually enforce, recorded before the tests run.
-      # Tests that need a layer the host cannot provide skip rather than fail,
-      # so this is what says whether a green run exercised them.
+      # It says nothing about which tests skip: which tests run is asserted
+      # exactly by the kernel matrix below, whose hosts are pinned. This job
+      # runs on whatever kernel the runner image ships, so its skip set is
+      # not stable enough to assert.
       - name: Host capabilities
         run: cargo run -p bailey --quiet -- doctor || true
 
       - name: Test
         run: cargo test
+
+  # ci/kernels.json is also read by guest.sh inside each guest, and the
+  # matrix cannot read files at parse time, so one tiny job hands it over.
+  read-matrix:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.read.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: read
+        run: echo "matrix=$(jq -c .kernel ci/kernels.json)" >> "$GITHUB_OUTPUT"
+
+  # The sandbox on the kernels bailey supports, one pinned kernel per job.
+  #
+  # ci/kernels.json is the source of truth for the matrix, and ci/guest.sh is
+  # the job's whole body: it boots nothing itself but prepares the guest,
+  # drops to the checkout's uid, runs doctor and the suite, and holds the
+  # results to ci/kernels/<id>.doctor and <id>.skips. A green job says both
+  # what passed and exactly which tests skipped, per kernel.
+  #
+  # The kernel downloads land in the runner user's cache and are keyed by
+  # version, so adding an entry only fetches the new kernel.
+  kernels:
+    needs: read-matrix
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel: ${{ fromJSON(needs.read-matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Standard runners ship /dev/kvm, but only root may open it until a
+      # rule says otherwise. Without the device this job would fall back to
+      # emulation and time out, so opening it is asserted before anything
+      # downloads.
+      - name: Allow the runner user to open /dev/kvm
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666"' \
+            | sudo tee /etc/udev/rules.d/99-kvm.rules
+          sudo udevadm control --reload
+          sudo udevadm trigger /dev/kvm
+          python3 -c "open('/dev/kvm', 'r+b')"
+
+      - name: Install the guest toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 passt nftables
+          python3 -m pip install --user --break-system-packages virtme-ng==1.42
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/virtme-ng
+          key: virtme-ng-${{ runner.arch }}-${{ matrix.kernel.version }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: kernels
+
+      # The guest runs the binaries this host built, and guest.sh drives both
+      # the tool and the suite from target/debug.
+      - name: Build
+        run: |
+          cargo test --no-run
+          cargo build -p bailey
+
+      # The sleep holds the job until the console is up: writes in the first
+      # seconds of a boot never reach the host, and the job log is the only
+      # channel the guest's results travel by. Four vcpus match the four
+      # test threads guest.sh pins.
+      - name: Boot ${{ matrix.kernel.version }} and run the suite
+        run: >-
+          vng --network user --cpus 4 -m 8192 -r ${{ matrix.kernel.version }}
+          --append "${{ matrix.kernel.append }}" --
+          sh -c "sleep 3; ci/guest.sh ${{ matrix.kernel.id }} CARGO_HOME=$HOME/.cargo RUSTUP_HOME=$HOME/.rustup"
+
+  # The other shipped architecture, natively: the suite runs on arm's own
+  # kernel rather than in a VM, since arm runners do not expose KVM and
+  # emulating the whole suite would be too slow for every push.
+  #
+  # No clippy here: it is architecture independent and the check job covers
+  # it. Like the check job, doctor is informational only, on an unpinned
+  # kernel.
+  aarch64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: aarch64
+
+      - name: Build
+        run: cargo build --all-targets
+
+      - name: Host capabilities
+        run: cargo run -p bailey --quiet -- doctor || true
+
+      - name: Test
+        run: cargo test
+
+      - name: Check the musl release target
+        run: cargo check --all-targets --target aarch64-unknown-linux-musl
 
   # The shipped binaries are musl, where the same source behaves differently:
   # std drops `O_PATH` from a custom open flag because musl's `O_ACCMODE`

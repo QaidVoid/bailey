@@ -129,17 +129,15 @@ pub fn runnable_as_caller(meta: &std::fs::Metadata) -> bool {
 /// The controllers a run could be given limits through.
 ///
 /// Asked exactly the way the run asks it, per controller, because a host that
-/// delegates one controller serves a policy that needs only that one. Without
-/// `BAILEY_CGROUP_ROOT` each controller is searched for independently, so the
-/// answer is the set a run asking for all three would actually get; with it,
-/// the named root is asked what it would carry.
+/// delegates one controller serves a policy that needs only that one. Each
+/// controller goes through [`cgroup::usable_root`], which answers the
+/// override variable and the search alike, so the answer is the set a run
+/// asking for all three would actually get, join permission included: a root
+/// the target could not join must not read as delegated.
 fn cgroup_delegated() -> Vec<&'static str> {
-    if let Some(base) = std::env::var_os(cgroup::ROOT_OVERRIDE).map(PathBuf::from) {
-        return cgroup::carries_all(&base, &CONTROLLERS);
-    }
     CONTROLLERS
         .into_iter()
-        .filter(|controller| cgroup::usable_root(&[controller]).is_some())
+        .filter(|controller| cgroup::usable_root(&[*controller]).is_some())
         .collect()
 }
 

@@ -1,4 +1,5 @@
 //! Integration test for the audit-trace to profile generation flow.
+mod common;
 
 use std::fs;
 use std::process::Command;
@@ -174,7 +175,7 @@ fn an_unknown_trace_version_is_rejected() {
 #[test]
 fn a_recorded_run_produces_a_policy_that_run_accepts() {
     let Some(helper) = helper() else {
-        eprintln!("skipping: no audit helper with capabilities on this host");
+        common::skip("no audit helper with capabilities on this host");
         return;
     };
 

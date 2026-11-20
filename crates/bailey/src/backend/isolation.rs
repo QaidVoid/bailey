@@ -950,6 +950,27 @@ fn errno(err: nix::errno::Errno) -> io::Error {
 mod tests {
     use super::*;
     use nix::errno::Errno;
+    use std::io::Write as _;
+
+    /// Report a unit test as skipped and record the skip where CI asks for
+    /// it, mirroring `tests/common/mod.rs`: the same printed line, the same
+    /// log line, with the thread's module path as the test's name.
+    fn skip(reason: &str) {
+        eprintln!("skipping: {reason}");
+        let Some(path) = std::env::var_os("BAILEY_TEST_SKIP_LOG") else {
+            return;
+        };
+        let Ok(mut log) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        else {
+            return;
+        };
+        let name = std::thread::current();
+        let test = name.name().unwrap_or("unknown");
+        let _ = writeln!(log, "{}::{}\t{}", env!("CARGO_CRATE_NAME"), test, reason);
+    }
 
     /// Run `body` in a forked child and return its exit code, so a test can
     /// drive namespace setup that mutates the process: every probe here ends
@@ -1071,7 +1092,7 @@ mod tests {
     #[test]
     fn a_lost_read_only_entry_is_an_error() {
         if !crate::backend::isolation::available() {
-            eprintln!("skipping: user namespaces unavailable on this host");
+            skip("user namespaces unavailable on this host");
             return;
         }
         let host = tempfile::tempdir().unwrap();
@@ -1147,7 +1168,7 @@ mod tests {
     #[test]
     fn a_lost_relocated_entry_is_an_error_naming_the_host_path() {
         if !crate::backend::isolation::available() {
-            eprintln!("skipping: user namespaces unavailable on this host");
+            skip("user namespaces unavailable on this host");
             return;
         }
         let host = tempfile::tempdir().unwrap();
@@ -1193,7 +1214,7 @@ mod tests {
     #[test]
     fn a_read_only_island_over_a_link_is_refused_rather_than_followed() {
         if !crate::backend::isolation::available() {
-            eprintln!("skipping: user namespaces unavailable on this host");
+            skip("user namespaces unavailable on this host");
             return;
         }
         // The remount is a mount, so it needs a namespace of its own to be
@@ -1262,7 +1283,7 @@ mod tests {
     #[test]
     fn an_absent_read_only_entry_is_not_an_error() {
         if !crate::backend::isolation::available() {
-            eprintln!("skipping: user namespaces unavailable on this host");
+            skip("user namespaces unavailable on this host");
             return;
         }
         let empty_root = tempfile::tempdir().unwrap();

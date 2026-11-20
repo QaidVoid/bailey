@@ -70,3 +70,13 @@ builds so that they do not carry a glibc version requirement.
 The eBPF audit programs attach by BTF id and take their argument layout from the
 running kernel, so they are not tied to one architecture. They have been
 exercised on x86_64.
+
+## Kernels exercised in CI
+
+The repository's CI runs the test suite on pinned kernels: 5.15, 6.1, 6.12, and
+a pinned recent mainline, each with `landlock` on the `lsm=` line, plus 6.12
+variants without Landlock, without a delegated cgroup, and with a cgroup the
+caller cannot join. Each run asserts exactly which tests skip on that kernel,
+so the degradations in the table above are exercised rather than described. The
+matrix, and how to reproduce one kernel locally, live in `ci/README.md` in the
+repository.

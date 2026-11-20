@@ -332,6 +332,9 @@ mod tests {
 
     #[test]
     fn every_bundled_profile_parses_and_layers() {
+        // Resolution consults the ambient environment through discovery, so
+        // it must not run while another test holds the environment mid-set.
+        let _env = crate::test_support::env_lock();
         for profile in ALL {
             let layers = base_layers(profile.name).expect("a known profile");
             let borrowed: Vec<(&str, &str)> = layers
@@ -353,6 +356,10 @@ mod tests {
     /// from the profile meant for agents.
     #[test]
     fn the_agent_profile_can_reach_its_api() {
+        // Discovery reads the global config path from the ambient
+        // environment, which other tests set and clear; without the lock a
+        // tempdir config can be seen just before its owner removes it.
+        let _env = crate::test_support::env_lock();
         let layers = base_layers("ai-agent").unwrap();
         let borrowed: Vec<(&str, &str)> = layers
             .iter()

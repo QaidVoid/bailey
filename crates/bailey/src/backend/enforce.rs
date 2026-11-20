@@ -2347,6 +2347,27 @@ mod tests {
     use super::*;
     use crate::policy::{Access, DeviceRule, Egress, FsRule, PortForward};
     use std::collections::BTreeSet;
+    use std::io::Write as _;
+
+    /// Report a unit test as skipped and record the skip where CI asks for
+    /// it, mirroring `tests/common/mod.rs`: the same printed line, the same
+    /// log line, with the thread's module path as the test's name.
+    fn skip(reason: &str) {
+        eprintln!("skipping: {reason}");
+        let Some(path) = std::env::var_os("BAILEY_TEST_SKIP_LOG") else {
+            return;
+        };
+        let Ok(mut log) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        else {
+            return;
+        };
+        let name = std::thread::current();
+        let test = name.name().unwrap_or("unknown");
+        let _ = writeln!(log, "{}::{}\t{}", env!("CARGO_CRATE_NAME"), test, reason);
+    }
 
     /// Builds a plan for a test and removes the staging directory it created,
     /// since only a run holds the guard that removes it.
@@ -2747,11 +2768,9 @@ mod tests {
         match libc::WEXITSTATUS(status) {
             0 => {}
             code if code == PROBE_SECCOMP_FAILED => {
-                eprintln!("skipping: this host will not install an unprivileged seccomp filter")
+                skip("this host will not install an unprivileged seccomp filter")
             }
-            code if code == PROBE_PRCTL_FAILED => {
-                eprintln!("skipping: this host will not set no_new_privs")
-            }
+            code if code == PROBE_PRCTL_FAILED => skip("this host will not set no_new_privs"),
             1 => panic!("clone3 was not refused: a process was created in a new user namespace"),
             2 => panic!("clone3 was not refused: a child was created"),
             3 => panic!("clone3 must be refused with ENOSYS, which libcs fall back on"),
@@ -2831,11 +2850,9 @@ mod tests {
         match libc::WEXITSTATUS(status) {
             0 => {}
             code if code == PROBE_SECCOMP_FAILED => {
-                eprintln!("skipping: this host will not install an unprivileged seccomp filter")
+                skip("this host will not install an unprivileged seccomp filter")
             }
-            code if code == PROBE_PRCTL_FAILED => {
-                eprintln!("skipping: this host will not set no_new_privs")
-            }
+            code if code == PROBE_PRCTL_FAILED => skip("this host will not set no_new_privs"),
             1 => panic!("the AF_SMC refusal returned the wrong errno"),
             2 => panic!("the MPTCP refusal returned the wrong errno"),
             6 => panic!("the SMC protocol refusal returned the wrong errno"),

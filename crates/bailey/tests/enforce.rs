@@ -49,7 +49,7 @@ fn write_config(dir: &Path, extra_read: &str) -> std::path::PathBuf {
 #[test]
 fn no_isolate_refuses_namespace_flags_on_every_route() {
     if !Path::new("/usr/bin/python3").exists() {
-        eprintln!("skipping: /usr/bin/python3 unavailable");
+        common::skip("/usr/bin/python3 unavailable");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -89,7 +89,7 @@ fn no_isolate_refuses_namespace_flags_on_every_route() {
 #[test]
 fn granted_path_is_readable_and_program_runs() {
     if !landlock_available() {
-        eprintln!("skipping: Landlock unavailable");
+        common::skip("Landlock unavailable");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -118,7 +118,7 @@ fn granted_path_is_readable_and_program_runs() {
 #[test]
 fn ungranted_path_is_denied() {
     if !landlock_available() {
-        eprintln!("skipping: Landlock unavailable");
+        common::skip("Landlock unavailable");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -145,11 +145,11 @@ fn ungranted_path_is_denied() {
 #[test]
 fn denied_syscall_is_blocked() {
     if !landlock_available() {
-        eprintln!("skipping: Landlock unavailable");
+        common::skip("Landlock unavailable");
         return;
     }
     if !Path::new("/usr/bin/unshare").exists() {
-        eprintln!("skipping: /usr/bin/unshare not present");
+        common::skip("/usr/bin/unshare not present");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -173,7 +173,7 @@ fn denied_syscall_is_blocked() {
 #[test]
 fn a_file_cannot_grow_past_the_limit() {
     if !landlock_available() {
-        eprintln!("skipping: Landlock unavailable");
+        common::skip("Landlock unavailable");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -225,11 +225,11 @@ fn a_file_cannot_grow_past_the_limit() {
 #[test]
 fn a_process_limit_holds_without_a_cgroup() {
     if !landlock_available() {
-        eprintln!("skipping: Landlock unavailable");
+        common::skip("Landlock unavailable");
         return;
     }
     if bailey::backend::cgroup::usable_root(&["pids"]).is_some() {
-        eprintln!("skipping: a delegated cgroup takes the limit here");
+        common::skip("a delegated cgroup takes the limit here");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -293,7 +293,7 @@ fn a_process_limit_holds_without_a_cgroup() {
 #[test]
 fn the_file_limit_is_reported_as_enforced() {
     if !landlock_available() {
-        eprintln!("skipping: Landlock unavailable");
+        common::skip("Landlock unavailable");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -322,11 +322,11 @@ fn the_file_limit_is_reported_as_enforced() {
 #[test]
 fn a_fuse_mount_is_performed_and_placed() {
     if !isolation_available() {
-        eprintln!("skipping: namespace isolation unavailable on this host");
+        common::skip("namespace isolation unavailable on this host");
         return;
     }
     if !landlock_available() {
-        eprintln!("skipping: Landlock unavailable");
+        common::skip("Landlock unavailable");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -428,15 +428,15 @@ fn a_fuse_mount_without_isolation_is_refused() {
 #[test]
 fn a_socket_relay_carries_a_service_into_the_sandbox() {
     if !isolation_available() {
-        eprintln!("skipping: namespace isolation unavailable on this host");
+        common::skip("namespace isolation unavailable on this host");
         return;
     }
     if !landlock_available() {
-        eprintln!("skipping: Landlock unavailable");
+        common::skip("Landlock unavailable");
         return;
     }
     if !Path::new("/usr/bin/python3").exists() && !Path::new("/bin/python3").exists() {
-        eprintln!("skipping: python3 unavailable to stand in for a service");
+        common::skip("python3 unavailable to stand in for a service");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -519,7 +519,7 @@ fn a_socket_relay_carries_a_service_into_the_sandbox() {
 #[test]
 fn a_dbus_relay_sets_the_bus_address() {
     if !isolation_available() {
-        eprintln!("skipping: namespace isolation unavailable on this host");
+        common::skip("namespace isolation unavailable on this host");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -564,7 +564,7 @@ fn a_dbus_relay_sets_the_bus_address() {
 #[test]
 fn a_socket_relay_overlapping_a_grant_is_refused() {
     if !isolation_available() {
-        eprintln!("skipping: namespace isolation unavailable on this host");
+        common::skip("namespace isolation unavailable on this host");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -609,11 +609,11 @@ fn a_socket_relay_overlapping_a_grant_is_refused() {
 #[test]
 fn the_url_broker_refuses_non_web_schemes_through_a_run() {
     if !isolation_available() {
-        eprintln!("skipping: namespace isolation unavailable on this host");
+        common::skip("namespace isolation unavailable on this host");
         return;
     }
     if !landlock_available() {
-        eprintln!("skipping: Landlock unavailable");
+        common::skip("Landlock unavailable");
         return;
     }
     let dir = tempfile::tempdir().unwrap();

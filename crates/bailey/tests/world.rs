@@ -1,5 +1,6 @@
 //! Integration tests for the world a target is placed in: its environment,
 //! temporary storage, home, and working directory.
+mod common;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -105,7 +106,7 @@ fn named_variables_pass_through_and_denied_ones_do_not() {
 #[test]
 fn private_tmp_is_invisible_to_the_host_and_discarded() {
     if !isolation_active() {
-        eprintln!("skipping: isolation unavailable on this host");
+        common::skip("isolation unavailable on this host");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -187,7 +188,7 @@ fn private_home_persists_and_the_real_home_stays_out_of_reach() {
 #[test]
 fn working_directory_is_kept_under_isolation_when_granted() {
     if !isolation_active() {
-        eprintln!("skipping: isolation unavailable on this host");
+        common::skip("isolation unavailable on this host");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -221,7 +222,7 @@ fn working_directory_is_kept_under_isolation_when_granted() {
 #[test]
 fn no_staging_directory_is_left_behind() {
     if !isolation_active() {
-        eprintln!("skipping: isolation unavailable on this host");
+        common::skip("isolation unavailable on this host");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -231,8 +232,13 @@ fn no_staging_directory_is_left_behind() {
     // A staging directory exists for the lifetime of the run that owns it, and
     // other tests run concurrently, so only directories whose owning process is
     // gone count as leaked. The name is `<pid>.<suffix>`, and a name that
-    // carries no pid is not a staging directory this version made.
-    let leftovers: Vec<_> = fs::read_dir("/tmp")
+    // carries no pid is not a staging directory this version made. A
+    // concurrent run can also exit between the listing and the pid check, its
+    // own guard removing the directory before the process is reaped, so a
+    // freshly dead name may already be gone: a leftover is real only when it
+    // survives a re-check, and one more after a short wait, which a real leak
+    // does.
+    let candidates: Vec<PathBuf> = fs::read_dir("/tmp")
         .unwrap()
         .filter_map(Result::ok)
         .filter_map(|entry| {
@@ -250,6 +256,14 @@ fn no_staging_directory_is_left_behind() {
             }
         })
         .collect();
+    let mut leftovers: Vec<PathBuf> = candidates
+        .into_iter()
+        .filter(|path| path.exists())
+        .collect();
+    if !leftovers.is_empty() {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        leftovers.retain(|path| path.exists());
+    }
     assert!(
         leftovers.is_empty(),
         "isolation must not leave staging directories on the host: {leftovers:?}"
@@ -305,7 +319,7 @@ fn granting_the_real_home_still_opts_out() {
 #[test]
 fn a_dead_runs_staging_is_swept_and_a_live_one_is_not() {
     if !isolation_active() {
-        eprintln!("skipping: isolation unavailable on this host");
+        common::skip("isolation unavailable on this host");
         return;
     }
 
@@ -322,7 +336,7 @@ fn a_dead_runs_staging_is_swept_and_a_live_one_is_not() {
         .unwrap();
     let owner = String::from_utf8_lossy(&owner.stdout).trim().to_owned();
     if Path::new(&format!("/proc/{owner}")).exists() {
-        eprintln!("skipping: pid {owner} was reused");
+        common::skip(&format!("pid {owner} was reused"));
         return;
     }
     let stale = dir
@@ -357,7 +371,7 @@ fn a_dead_runs_staging_is_swept_and_a_live_one_is_not() {
 #[test]
 fn a_grant_relocated_out_of_tmp_keeps_the_private_tmp() {
     if !isolation_active() {
-        eprintln!("skipping: isolation unavailable on this host");
+        common::skip("isolation unavailable on this host");
         return;
     }
     let dir = tempfile::tempdir().unwrap();

@@ -3,6 +3,7 @@
 //! Each test drives `/bin/sh` with a script on stdin rather than a terminal, so
 //! the assertions are about what the shell and its children can reach, which is
 //! the property the command exists for.
+mod common;
 
 use std::fs;
 use std::io::{Read, Write};
@@ -118,7 +119,7 @@ fn workspace() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
 #[test]
 fn a_command_in_the_shell_is_confined() {
     if !landlock_available() {
-        eprintln!("skipping: no Landlock on this kernel");
+        common::skip("no Landlock on this kernel");
         return;
     }
     let store = tempfile::tempdir().unwrap();
@@ -145,7 +146,7 @@ fn a_command_in_the_shell_is_confined() {
 #[test]
 fn a_grandchild_process_is_confined() {
     if !landlock_available() {
-        eprintln!("skipping: no Landlock on this kernel");
+        common::skip("no Landlock on this kernel");
         return;
     }
     let store = tempfile::tempdir().unwrap();
@@ -197,7 +198,7 @@ fn the_launch_directory_is_readable_and_writable() {
 #[test]
 fn a_config_layer_can_retract_the_implicit_grant() {
     if !landlock_available() {
-        eprintln!("skipping: no Landlock on this kernel");
+        common::skip("no Landlock on this kernel");
         return;
     }
     let store = tempfile::tempdir().unwrap();
@@ -236,7 +237,7 @@ fn a_config_layer_can_retract_the_implicit_grant() {
 #[test]
 fn a_read_only_grant_beneath_the_launch_directory_is_honoured() {
     if !isolation_active() {
-        eprintln!("skipping: isolation unavailable on this host");
+        common::skip("isolation unavailable on this host");
         return;
     }
     let store = tempfile::tempdir().unwrap();
@@ -477,12 +478,12 @@ fn python() -> Option<&'static str> {
 
 fn proxy_net_available() -> bool {
     if python().is_none() || !bailey::backend::isolation::available() {
-        eprintln!("skipping: needs python3 and user namespaces");
+        common::skip("needs python3 and user namespaces");
         return false;
     }
     for helper in ["pasta", "nft"] {
         if let Err(err) = bailey::cli::resolve_helper(helper) {
-            eprintln!("skipping: needs trusted {helper}: {err}");
+            common::skip(&format!("needs trusted {helper}: {err}"));
             return false;
         }
     }
@@ -679,7 +680,7 @@ except OSError:
 #[test]
 fn proxy_net_with_denied_egress_keeps_only_private_loopback() {
     if python().is_none() || !bailey::backend::isolation::available() {
-        eprintln!("skipping: needs python3 and user namespaces");
+        common::skip("needs python3 and user namespaces");
         return;
     }
     let (root, project, _private) = workspace();
@@ -773,7 +774,7 @@ print('other-host-ports-refused')
 #[test]
 fn no_proxy_net_keeps_an_allowed_egress_shell_on_the_host_network() {
     if python().is_none() {
-        eprintln!("skipping: needs python3");
+        common::skip("needs python3");
         return;
     }
     let (root, project, _private) = workspace();

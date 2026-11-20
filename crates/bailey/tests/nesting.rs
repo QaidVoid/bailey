@@ -5,6 +5,7 @@
 //! not need to. The inner binary is copied into the granted directory, since a
 //! sandbox's `PATH` is `/usr/local/bin:/usr/bin:/bin` and the test binary is not
 //! on it.
+mod common;
 
 use std::fs;
 use std::io::Write;
@@ -70,7 +71,7 @@ fn outer(store: &Path, dir: &Path, script: &str) -> Output {
 #[test]
 fn an_inherited_layer_is_reported_as_enforced() {
     if !isolation_active() {
-        eprintln!("skipping: isolation unavailable on this host");
+        common::skip("isolation unavailable on this host");
         return;
     }
     let store = tempfile::tempdir().unwrap();
@@ -100,7 +101,7 @@ fn an_inherited_layer_is_reported_as_enforced() {
 #[test]
 fn an_unreachable_trust_store_is_not_reported_as_untrusted() {
     if !isolation_active() {
-        eprintln!("skipping: isolation unavailable on this host");
+        common::skip("isolation unavailable on this host");
         return;
     }
     let store = tempfile::tempdir().unwrap();
@@ -128,7 +129,7 @@ fn an_unreachable_trust_store_is_not_reported_as_untrusted() {
 #[test]
 fn trusting_from_inside_a_sandbox_is_refused() {
     if !isolation_active() {
-        eprintln!("skipping: isolation unavailable on this host");
+        common::skip("isolation unavailable on this host");
         return;
     }
     let store = tempfile::tempdir().unwrap();

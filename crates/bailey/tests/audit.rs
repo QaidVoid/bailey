@@ -4,6 +4,7 @@
 //! `CAP_BPF` and `CAP_PERFMON`. They self-skip where the helper is absent or
 //! lacks its capabilities, so the suite stays green on a machine that cannot
 //! record.
+mod common;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -90,7 +91,7 @@ fn paths_in(trace: &Value) -> Vec<String> {
 #[test]
 fn startup_access_is_recorded() {
     let Some(helper) = helper() else {
-        eprintln!("skipping: no audit helper configured");
+        common::skip("no audit helper configured");
         return;
     };
     let dir = tempfile::tempdir().unwrap();
@@ -117,7 +118,7 @@ fn startup_access_is_recorded() {
 #[test]
 fn the_target_is_confined_during_an_audit() {
     let Some(helper) = helper() else {
-        eprintln!("skipping: no audit helper configured");
+        common::skip("no audit helper configured");
         return;
     };
     let dir = tempfile::tempdir().unwrap();
@@ -144,11 +145,11 @@ fn the_target_is_confined_during_an_audit() {
 #[test]
 fn an_ungranted_egress_attempt_is_refused_during_an_audit() {
     let Some(helper) = helper() else {
-        eprintln!("skipping: no audit helper configured");
+        common::skip("no audit helper configured");
         return;
     };
     if !Path::new("/usr/bin/python3").exists() {
-        eprintln!("skipping: needs python3");
+        common::skip("needs python3");
         return;
     }
 
@@ -180,7 +181,7 @@ fn an_ungranted_egress_attempt_is_refused_during_an_audit() {
 #[test]
 fn an_audit_of_a_network_mode_it_cannot_honour_names_the_gap() {
     let Some(helper) = helper() else {
-        eprintln!("skipping: no audit helper configured");
+        common::skip("no audit helper configured");
         return;
     };
     let dir = tempfile::tempdir().unwrap();
@@ -235,7 +236,7 @@ fn an_audit_of_a_network_mode_it_cannot_honour_names_the_gap() {
 #[test]
 fn unconfined_is_an_explicit_opt_in() {
     let Some(helper) = helper() else {
-        eprintln!("skipping: no audit helper configured");
+        common::skip("no audit helper configured");
         return;
     };
     let dir = tempfile::tempdir().unwrap();
@@ -268,7 +269,7 @@ fn unconfined_is_an_explicit_opt_in() {
 #[test]
 fn execution_of_a_child_program_is_recorded() {
     let Some(helper) = helper() else {
-        eprintln!("skipping: no audit helper configured");
+        common::skip("no audit helper configured");
         return;
     };
     let dir = tempfile::tempdir().unwrap();
@@ -293,14 +294,14 @@ fn execution_of_a_child_program_is_recorded() {
 #[test]
 fn a_short_lived_child_is_recorded_when_scoping_by_cgroup() {
     let Some(helper) = helper() else {
-        eprintln!("skipping: no audit helper configured");
+        common::skip("no audit helper configured");
         return;
     };
     // Scoping by cgroup needs only a cgroup to create, not the controllers that
     // resource limits need. Without one, observation follows the process tree
     // and this case is a race rather than a guarantee.
     if bailey::backend::cgroup::usable_root(&[]).is_none() {
-        eprintln!("skipping: no cgroup to scope observation to");
+        common::skip("no cgroup to scope observation to");
         return;
     }
 

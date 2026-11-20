@@ -3,6 +3,7 @@
 //! The snippets are handed to the shells they are for, rather than only being
 //! string-matched: a shell integration that does not parse is the failure mode
 //! worth catching, and it cannot be caught from Rust.
+mod common;
 
 use std::fs;
 use std::path::Path;
@@ -163,7 +164,7 @@ fn the_snippets_parse_in_the_shells_they_are_for() {
 
     for (shell, check) in [("fish", vec!["-n"]), ("bash", vec!["-n"])] {
         if Command::new(shell).arg("--version").output().is_err() {
-            eprintln!("skipping: no {shell} on this host");
+            common::skip(&format!("no {shell} on this host"));
             continue;
         }
         for flags in [vec![], vec!["--ask"], vec!["--wrap"]] {

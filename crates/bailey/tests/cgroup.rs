@@ -2,6 +2,7 @@
 //!
 //! Limits need a writable delegated cgroup v2. These self-skip where the
 //! session does not provide one, which is common in containers and CI.
+mod common;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -53,7 +54,7 @@ fn cgroup_of_a_forked_descendant(isolate: bool) -> String {
 #[test]
 fn forked_descendant_is_in_the_run_cgroup() {
     if !cgroup_usable() {
-        eprintln!("skipping: no delegated cgroup to create runs in");
+        common::skip("no delegated cgroup to create runs in");
         return;
     }
     let reported = cgroup_of_a_forked_descendant(false);
@@ -66,7 +67,7 @@ fn forked_descendant_is_in_the_run_cgroup() {
 #[test]
 fn limits_apply_under_isolation() {
     if !cgroup_usable() {
-        eprintln!("skipping: no delegated cgroup to create runs in");
+        common::skip("no delegated cgroup to create runs in");
         return;
     }
     let reported = cgroup_of_a_forked_descendant(true);
@@ -79,29 +80,32 @@ fn limits_apply_under_isolation() {
 #[test]
 fn cgroup_is_removed_after_the_run() {
     if !cgroup_usable() {
-        eprintln!("skipping: no delegated cgroup to create runs in");
+        common::skip("no delegated cgroup to create runs in");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
     let config = config_with_limits(dir.path());
 
-    let output = Command::new(bailey())
+    // The check is scoped to this run's own cgroup, named for the bailey
+    // process's pid: the matrix runs suites in parallel, so another test's
+    // live run cgroup may exist while this one looks, and a whole-subtree
+    // scan would fail on it.
+    let mut child = Command::new(bailey())
         .arg("run")
         .arg("-c")
         .arg(&config)
         .arg("/bin/true")
-        .output()
+        .spawn()
         .unwrap();
-    assert!(output.status.success());
-
-    let base = cgroup::usable_root(&["memory", "pids"]).unwrap();
-    let leftovers: Vec<_> = fs::read_dir(&base)
+    let run_cgroup = cgroup::usable_root(&["memory", "pids"])
         .unwrap()
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_name().to_string_lossy().starts_with("bailey."))
-        .collect();
+        .join(format!("bailey.{}", child.id()));
+    let status = child.wait().unwrap();
+    assert!(status.success());
+
     assert!(
-        leftovers.is_empty(),
-        "run cgroups must be removed after the run"
+        !run_cgroup.exists(),
+        "the run's own cgroup must be removed after the run: {}",
+        run_cgroup.display()
     );
 }

@@ -138,3 +138,10 @@ Some tests need more than a toolchain: a delegated cgroup, unprivileged user
 namespaces, or the audit helper with its capabilities. Each of those self-skips
 with a note rather than failing, so a passing run on a restricted host is not
 proof that everything was exercised.
+
+CI provides that proof separately: the kernel matrix job runs the suite inside
+a virtual machine on each kernel listed in `ci/kernels.json`, from 5.15 to a
+pinned recent mainline, including guests without Landlock or without a
+delegated cgroup. Each run asserts exactly which tests skip on that kernel, so
+a green matrix names what ran. The repository's `ci/README.md` explains how to
+reproduce one kernel locally.

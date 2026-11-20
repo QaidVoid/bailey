@@ -236,6 +236,10 @@ in tests, on a host where the helper has its capabilities. Tests that need
 something the host cannot provide, a delegated cgroup or the audit helper, skip
 rather than pretend.
 
+Continuous integration runs the whole suite on a matrix of pinned kernels,
+from 5.15 to a current mainline, including guests without Landlock or without a
+delegated cgroup, and asserts exactly which tests skip on each.
+
 What bailey does not do is listed above and in the documentation, with the reason
 in each case.
 

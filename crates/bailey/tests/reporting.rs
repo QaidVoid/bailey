@@ -1,4 +1,5 @@
 //! Integration tests for what bailey reports about a host and about a run.
+mod common;
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -175,12 +176,12 @@ fn doctor_reports_the_private_network_available() {
     if bailey::backend::isolation::available() {
         for helper in ["pasta", "nft"] {
             if bailey::cli::resolve_helper(helper).is_err() {
-                eprintln!("skipping: needs trusted {helper}");
+                common::skip(&format!("needs trusted {helper}"));
                 return;
             }
         }
     } else {
-        eprintln!("skipping: needs user namespaces");
+        common::skip("needs user namespaces");
         return;
     }
     let output = run(&["doctor"]);
@@ -231,11 +232,11 @@ fn doctor_reports_missing_pasta_and_its_consequences() {
 #[test]
 fn doctor_reports_a_missing_nft_degrades_the_broker() {
     if !bailey::backend::isolation::available() {
-        eprintln!("skipping: needs user namespaces");
+        common::skip("needs user namespaces");
         return;
     }
     if bailey::cli::resolve_helper("pasta").is_err() {
-        eprintln!("skipping: needs trusted pasta");
+        common::skip("needs trusted pasta");
         return;
     }
     // A directory holding a stand-in pasta and no nft, so only the broker's
@@ -264,7 +265,7 @@ fn doctor_reports_a_missing_nft_degrades_the_broker() {
 #[test]
 fn a_run_under_self_fuse_does_not_claim_landlock() {
     if !Path::new("/usr/bin/python3").exists() {
-        eprintln!("skipping: /usr/bin/python3 unavailable");
+        common::skip("/usr/bin/python3 unavailable");
         return;
     }
     // A self_fuse run needs namespace isolation and `enforce` refuses one
@@ -272,7 +273,7 @@ fn a_run_under_self_fuse_does_not_claim_landlock() {
     // reporting. Skipping keeps the answer about this host the same as every
     // other isolation test's.
     if !bailey::backend::isolation::available() {
-        eprintln!("skipping: isolation unavailable on this host");
+        common::skip("isolation unavailable on this host");
         return;
     }
     let dir = tempfile::tempdir().unwrap();
@@ -548,7 +549,7 @@ fn a_bundled_name_cannot_be_shadowed() {
 #[test]
 fn an_isolated_run_reports_the_kernel_limit_and_the_filter() {
     if !bailey::backend::isolation::available() {
-        eprintln!("skipping: isolation unavailable on this host");
+        common::skip("isolation unavailable on this host");
         return;
     }
     let output = run(&["run", "--isolate", "/bin/true"]);
@@ -658,4 +659,50 @@ fn a_profile_others_can_write_is_refused() {
         .output()
         .unwrap();
     assert!(fixed.status.success(), "and works once it is only yours");
+}
+
+/// A skip lands in the log CI reads, under the key the expectation files
+/// name.
+///
+/// Runs a sibling test binary that skips on a host without the audit
+/// helper, and asserts the line it appends. Cargo is invoked for the child
+/// so the sibling is found whatever layout the target directory uses; the
+/// build lock is not held while tests execute, so the nested invocation
+/// only re-checks fingerprints and runs.
+#[test]
+fn a_skip_is_logged_where_ci_reads_it() {
+    if std::env::var_os("BAILEY_BPF_HELPER").is_some() {
+        common::skip(
+            "the audit helper is configured, so the sibling test would run instead of skipping",
+        );
+        return;
+    }
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("skips.log");
+    let output = Command::new(&cargo)
+        .args([
+            "test",
+            "--offline",
+            "--test",
+            "audit",
+            "startup_access_is_recorded",
+            "--",
+            "--nocapture",
+        ])
+        .env("BAILEY_TEST_SKIP_LOG", &log)
+        .env_remove("BAILEY_BPF_HELPER")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "the sibling run itself must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let line = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        line, "audit::startup_access_is_recorded\tno audit helper configured\n",
+        "the skip must be logged under the crate and test the expectation files name"
+    );
 }

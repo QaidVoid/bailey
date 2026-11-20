@@ -1,7 +1,99 @@
 //! Helpers shared by the integration test binaries.
+//!
+//! The kernel matrix asserts, per pinned kernel, exactly which tests skipped
+//! and which ran, so a regression that turns a running test into a skip
+//! fails that kernel's job instead of hiding inside a green run. The
+//! assertion reads a skip log the helpers write when CI sets
+//! `BAILEY_TEST_SKIP_LOG`; without it they only print what every skip has
+//! always printed.
+
+// Each integration binary includes this module and uses only the helpers it
+// needs, so the rest register as dead code from that binary's view.
+#![allow(dead_code)]
 
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
+
+/// Report a test as skipped and record the skip where CI asks for it.
+///
+/// The printed line stays `skipping: <reason>`, so local output reads as it
+/// did before. When `BAILEY_TEST_SKIP_LOG` names a file, the skip is
+/// appended as `<crate>::<test>\t<reason>`. `<test>` is the current
+/// thread's name, which libtest sets to the test's path: the bare test name
+/// in an integration binary, and `module::test` inside the crate's unit
+/// tests. Appends go through `O_APPEND`, which stays atomic for writes this
+/// small even with the suite's tests running in parallel.
+pub fn skip(reason: &str) {
+    eprintln!("skipping: {reason}");
+    record(test_name().as_deref(), reason);
+}
+
+/// Like [`skip`], for a test whose variants skip independently.
+///
+/// Keyed by the test's name alone, two skips inside one test would collapse
+/// into one log line, and a variant that stopped running would hide behind
+/// one that still skips. Naming the variant keeps the keys distinct, and the
+/// expectation checker fails on any key logged twice, so a merged skip
+/// surfaces as an error naming the test instead of a silent loss.
+pub fn skip_variant(variant: &str, reason: &str) {
+    eprintln!("skipping: {reason}");
+    let named = match test_name() {
+        Some(test) => format!("{test}[{variant}]"),
+        None => "unknown".to_owned(),
+    };
+    record(Some(&named), reason);
+}
+
+/// The current thread's name, `None` when there is none to report.
+///
+/// A missing name means the check has no test to attribute the skip to, so
+/// the log carries `unknown`, which the expectation checker refuses.
+fn test_name() -> Option<String> {
+    std::thread::current().name().map(str::to_owned)
+}
+
+fn record(test: Option<&str>, reason: &str) {
+    let Some(path) = std::env::var_os("BAILEY_TEST_SKIP_LOG") else {
+        return;
+    };
+    let Ok(mut log) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        return;
+    };
+    // The whole line goes out in one write: a formatted `writeln!` issues one
+    // write per piece, and pieces of concurrent skippers interleave into
+    // lines no checker can read.
+    let line = format!(
+        "{}::{}\t{}\n",
+        env!("CARGO_CRATE_NAME"),
+        test.unwrap_or("unknown"),
+        reason
+    );
+    let _ = log.write_all(line.as_bytes());
+}
+
+/// Remove the staging directories a killed run left behind.
+///
+/// A run that is killed rather than allowed to exit cannot unwind, so its
+/// staging directory stays on the host and a later leak assertion would
+/// count it as a leak. Tests that kill their runs call this with the run's
+/// pid, so only what the harness itself killed is cleaned.
+pub fn remove_staging_for(pid: u32) {
+    let mine = format!("{}.", pid);
+    for entry in std::fs::read_dir("/tmp").into_iter().flatten().flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(rest) = name.strip_prefix(".bailey-root.") else {
+            continue;
+        };
+        if rest.starts_with(&mine) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+}
 
 /// A probe that asks the kernel for a fresh user and network namespace
 /// through clone3, clone, and unshare, and reports what happened on stdout.
