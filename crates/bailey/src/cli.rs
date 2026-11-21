@@ -3149,6 +3149,75 @@ fn print_policy_to(
         .map(|decision| decision.mode)
         .unwrap_or(network::NetworkMode::LandlockOnly);
 
+    if !policy.http.intercept.is_empty()
+        || !policy.http.allow.is_empty()
+        || !policy.http.deny.is_empty()
+        || !policy.http.credentials.is_empty()
+        || policy.http.log.is_some()
+    {
+        writeln!(out, "http:").expect("writing the policy report");
+        if let Some(source) = &policy.http.source {
+            writeln!(out, "  rules from {source}").expect("writing the policy report");
+        }
+        if !policy.http.intercept.is_empty() {
+            let hosts = policy
+                .http
+                .intercept
+                .iter()
+                .map(|host| host.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            writeln!(out, "  intercept: {hosts}").expect("writing the policy report");
+        }
+        for (list, rules) in [("allow", &policy.http.allow), ("deny", &policy.http.deny)] {
+            for rule in rules {
+                let host = match rule.port {
+                    Some(port) => format!("{}:{port}", rule.host),
+                    None => rule.host.to_string(),
+                };
+                let head = if rule.methods.is_empty() && rule.path.is_none() {
+                    host
+                } else {
+                    let methods = if rule.methods.is_empty() {
+                        "*".to_owned()
+                    } else {
+                        rule.methods.join(",")
+                    };
+                    let path = rule
+                        .path
+                        .as_ref()
+                        .map(|p| p.to_string())
+                        .unwrap_or_default();
+                    format!("{methods} {host}{path}")
+                };
+                writeln!(out, "  {list} {head}").expect("writing the policy report");
+            }
+        }
+        for credential in &policy.http.credentials {
+            let auth = match &credential.auth {
+                crate::policy::AuthShape::Bearer => "bearer".to_owned(),
+                crate::policy::AuthShape::Header(name) => format!("header:{name}"),
+            };
+            let source = match &credential.source {
+                crate::policy::CredentialSource::Env(name) => format!("env:{name}"),
+                crate::policy::CredentialSource::File(path) => {
+                    format!("file:{}", path.display())
+                }
+                crate::policy::CredentialSource::Fd(fd) => format!("fd:{fd}"),
+            };
+            writeln!(
+                out,
+                "  credential {} as {auth} from {source}",
+                credential.host
+            )
+            .expect("writing the policy report");
+        }
+        if let Some(log) = &policy.http.log {
+            writeln!(out, "  log: {} (appended as the caller)", log.display())
+                .expect("writing the policy report");
+        }
+    }
+
     writeln!(out, "devices:").expect("writing the policy report");
     if policy.devices.is_empty() {
         writeln!(out, "  (none)").expect("writing the policy report");
@@ -4481,6 +4550,110 @@ mod tests {
             "{report}"
         );
         assert!(report.contains("post_exit: echo CLEANING UP"), "{report}");
+    }
+
+    /// The broker's HTTP rules are part of the effective policy, so `show`
+    /// reports them: the broker, the intercept list, every rule, and each
+    /// credential's host, auth shape and source kind and name. Never a value:
+    /// a report the caller pastes into a chat must not carry a secret.
+    #[test]
+    fn show_lists_the_broker_the_rules_and_the_credential_shapes() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("prog");
+        let mut policy = Policy::default();
+        policy.network.broker = Some(crate::policy::Broker::Builtin);
+        policy.network.broker_source = Some("flag --egress-proxy".to_owned());
+        policy.http = crate::policy::HttpPolicy {
+            intercept: vec![
+                crate::policy::HttpHost::parse("api.anthropic.com").unwrap(),
+                crate::policy::HttpHost::parse("*.github.com").unwrap(),
+            ],
+            allow: vec![
+                crate::policy::HttpRule {
+                    host: crate::policy::HttpHost::parse("api.anthropic.com").unwrap(),
+                    port: None,
+                    methods: vec!["POST".into()],
+                    path: crate::policy::HttpPath::parse("/v1/*"),
+                },
+                crate::policy::HttpRule {
+                    host: crate::policy::HttpHost::parse("registry.npmjs.org").unwrap(),
+                    port: Some(443),
+                    methods: Vec::new(),
+                    path: None,
+                },
+            ],
+            deny: vec![crate::policy::HttpRule {
+                host: crate::policy::HttpHost::parse("api.github.com").unwrap(),
+                port: None,
+                methods: vec!["DELETE".into()],
+                path: None,
+            }],
+            credentials: vec![
+                crate::policy::CredentialBinding {
+                    host: crate::policy::HttpHost::parse("api.anthropic.com").unwrap(),
+                    auth: crate::policy::AuthShape::Header("x-api-key".into()),
+                    source: crate::policy::CredentialSource::Env("ANTHROPIC_API_KEY".into()),
+                },
+                crate::policy::CredentialBinding {
+                    host: crate::policy::HttpHost::parse("api.github.com").unwrap(),
+                    auth: crate::policy::AuthShape::Bearer,
+                    source: crate::policy::CredentialSource::Fd(3),
+                },
+            ],
+            log: Some(dir.path().join("http-log.jsonl")),
+            source: Some("~/.config/bailey/config.toml".into()),
+        };
+        let resolved = Resolved {
+            policy,
+            ..Default::default()
+        };
+
+        let mut out = Vec::new();
+        print_policy_to(&mut out, &resolved, &target, &NetworkArgs::default());
+        let report = String::from_utf8(out).unwrap();
+
+        assert!(
+            report.contains("  broker: builtin (set by flag --egress-proxy)"),
+            "{report}"
+        );
+        assert!(report.contains("http:"), "{report}");
+        assert!(
+            report.contains("  rules from ~/.config/bailey/config.toml"),
+            "{report}"
+        );
+        assert!(
+            report.contains("  intercept: api.anthropic.com, *.github.com"),
+            "{report}"
+        );
+        assert!(
+            report.contains("  allow POST api.anthropic.com/v1/*"),
+            "{report}"
+        );
+        assert!(
+            report.contains("  allow registry.npmjs.org:443"),
+            "{report}"
+        );
+        assert!(report.contains("  deny DELETE api.github.com"), "{report}");
+        assert!(
+            report.contains(
+                "  credential api.anthropic.com as header:x-api-key from env:ANTHROPIC_API_KEY"
+            ),
+            "{report}"
+        );
+        assert!(
+            report.contains("  credential api.github.com as bearer from fd:3"),
+            "{report}"
+        );
+        let log_path = dir.path().join("http-log.jsonl");
+        assert!(
+            report.contains(&format!(
+                "  log: {} (appended as the caller)",
+                log_path.display()
+            )),
+            "{report}"
+        );
+        // The env name is printed, never a value of it.
+        assert!(!report.contains("sk-ant"), "{report}");
     }
 
     /// A policy that runs no hooks prints no section, so the report of a config

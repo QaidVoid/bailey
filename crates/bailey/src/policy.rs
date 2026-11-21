@@ -613,6 +613,15 @@ impl HttpPath {
     }
 }
 
+impl std::fmt::Display for HttpPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Exact(exact) => write!(f, "{exact}"),
+            Self::Prefix(prefix) => write!(f, "{prefix}*"),
+        }
+    }
+}
+
 /// A permitted or dropped HTTP request.
 ///
 /// A rule bounds its host always, and the port, the methods and the path only
