@@ -1172,7 +1172,7 @@ fn apply_network_flags(policy: &mut Policy, args: &NetworkArgs) -> anyhow::Resul
         // stays refused.
         policy.network.mode = crate::policy::NetworkMode::Private;
         policy.network.mode_source = "flag --egress-proxy".to_owned();
-        policy.network.broker = Some((addr, port));
+        policy.network.broker = Some(crate::policy::Broker::External(addr, port));
         policy.network.broker_source = Some("flag --egress-proxy".to_owned());
     }
     Ok(())
@@ -1191,7 +1191,11 @@ fn check_network_contradictions(
 ) -> anyhow::Result<()> {
     if policy.network.mode == crate::policy::NetworkMode::Host {
         let source = &policy.network.mode_source;
-        if let Some((addr, port)) = policy.network.broker {
+        if let Some((addr, port)) = policy
+            .network
+            .broker
+            .and_then(crate::policy::Broker::external)
+        {
             anyhow::bail!(
                 "host mode ({source}) cannot hold the broker at {addr}:{port} \
                  ({}), which needs a private namespace",
@@ -1465,7 +1469,7 @@ fn pasta_arguments(
 }
 
 fn wrap_in_private_namespace(
-    broker: Option<(std::net::Ipv4Addr, u16)>,
+    broker: Option<crate::policy::Broker>,
     forwards: &[PortForward],
     publishes: &[u16],
     announce: bool,
@@ -1490,7 +1494,9 @@ fn wrap_in_private_namespace(
     //
     // IPv6 only where the host has it: handing the namespace a v6 route the host
     // cannot follow would leave a program stalling on v6 before it fell back.
-    let egress_addr = broker.map(|(addr, _)| addr.to_string());
+    let egress_addr = broker
+        .and_then(crate::policy::Broker::external)
+        .map(|(addr, _)| addr.to_string());
     let pasta_args = pasta_arguments(
         egress_addr.as_deref(),
         host_has_ipv6(),
@@ -1836,7 +1842,11 @@ fn prepare_network(
     // Inside the namespace now, whether by the wrap above or a re-exec into it.
     // The lockdown goes on before the target is confined and run, so there is
     // no window in which the target has both a network and no egress rule.
-    if let Some((addr, port)) = policy.network.broker {
+    if let Some((addr, port)) = policy
+        .network
+        .broker
+        .and_then(crate::policy::Broker::external)
+    {
         // Only the process that created the namespace installs a rule in it.
         // This is not a check on something a caller said; it is which branch of
         // the fork above this process took, and a caller cannot choose that.
@@ -2163,7 +2173,12 @@ fn cmd_audit(args: AuditArgs) -> anyhow::Result<i32> {
     // for more than Landlock's TCP rules reports the gap rather than quietly
     // skipping it. The findings stay about what was recorded.
     if !args.unconfined {
-        if let Some((addr, port)) = resolved.policy.network.broker {
+        if let Some((addr, port)) = resolved
+            .policy
+            .network
+            .broker
+            .and_then(crate::policy::Broker::external)
+        {
             eprintln!(
                 "bailey: note: audit runs in the host namespace, so the broker \
                  at {addr}:{port} ({}) is not applied; the trace records what \
@@ -2917,13 +2932,24 @@ fn print_policy_to(
         .expect("writing the policy report");
     writeln!(out, "  publish_ports: {:?}", policy.network.publish_ports)
         .expect("writing the policy report");
-    if let Some((addr, port)) = policy.network.broker {
-        writeln!(
-            out,
-            "  broker: {addr}:{port} (set by {})",
-            policy.network.broker_source.as_deref().unwrap_or("unknown")
-        )
-        .expect("writing the policy report");
+    match policy.network.broker {
+        Some(crate::policy::Broker::External(addr, port)) => {
+            writeln!(
+                out,
+                "  broker: {addr}:{port} (set by {})",
+                policy.network.broker_source.as_deref().unwrap_or("unknown")
+            )
+            .expect("writing the policy report");
+        }
+        Some(crate::policy::Broker::Builtin) => {
+            writeln!(
+                out,
+                "  broker: builtin (set by {})",
+                policy.network.broker_source.as_deref().unwrap_or("unknown")
+            )
+            .expect("writing the policy report");
+        }
+        None => {}
     }
     // The same decision a run with this invocation would make, refusal
     // included: a policy the host cannot honour shows as refused here rather
@@ -3724,7 +3750,10 @@ mod tests {
             policy.network.mode = crate::policy::NetworkMode::Host;
             policy.network.mode_source = "/global/bailey.toml".to_owned();
             if broker {
-                policy.network.broker = Some(("169.254.169.1".parse().unwrap(), 8443));
+                policy.network.broker = Some(crate::policy::Broker::External(
+                    "169.254.169.1".parse().unwrap(),
+                    8443,
+                ));
                 policy.network.broker_source = Some(broker_source.to_owned());
             }
             policy
@@ -3755,7 +3784,10 @@ mod tests {
         // A broker with forwards, and a broker with published ports.
         let mut brokered = Policy::default();
         brokered.network.egress = Egress::AllowAll;
-        brokered.network.broker = Some(("169.254.169.1".parse().unwrap(), 8443));
+        brokered.network.broker = Some(crate::policy::Broker::External(
+            "169.254.169.1".parse().unwrap(),
+            8443,
+        ));
         brokered.network.broker_source = Some("/project/bailey.toml".to_owned());
         let err = check_network_contradictions(&brokered, &forwards, &[])
             .unwrap_err()
@@ -3880,7 +3912,10 @@ mod tests {
             policy.network.mode = crate::policy::NetworkMode::parse(mode).unwrap();
             policy.network.mode_source = "/project/bailey.toml".to_owned();
             if broker {
-                policy.network.broker = Some(("169.254.169.9".parse().unwrap(), 9000));
+                policy.network.broker = Some(crate::policy::Broker::External(
+                    "169.254.169.9".parse().unwrap(),
+                    9000,
+                ));
                 policy.network.broker_source = Some("/project/bailey.toml".to_owned());
             }
             policy
@@ -3907,7 +3942,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             policy.network.broker,
-            Some(("169.254.169.1".parse().unwrap(), 8443))
+            Some(crate::policy::Broker::External(
+                "169.254.169.1".parse().unwrap(),
+                8443
+            ))
         );
         assert_eq!(
             policy.network.broker_source.as_deref(),

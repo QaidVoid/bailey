@@ -261,6 +261,26 @@ impl NetworkMode {
     }
 }
 
+/// The egress broker a run is held to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Broker {
+    /// The built-in broker bailey spawns outside the target's namespace and
+    /// confines itself. Written `builtin`.
+    Builtin,
+    /// An external broker the caller runs, at one address.
+    External(std::net::Ipv4Addr, u16),
+}
+
+impl Broker {
+    /// The host and port an external broker listens on.
+    pub fn external(self) -> Option<(std::net::Ipv4Addr, u16)> {
+        match self {
+            Self::Builtin => None,
+            Self::External(addr, port) => Some((addr, port)),
+        }
+    }
+}
+
 /// Network access intent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkPolicy {
@@ -268,9 +288,9 @@ pub struct NetworkPolicy {
     pub egress: Egress,
     /// How the run picks a namespace when egress is allowed.
     pub mode: NetworkMode,
-    /// The egress broker a run is held to, as `ADDR:PORT`. Implies the private
-    /// namespace, whatever `mode` says.
-    pub broker: Option<(std::net::Ipv4Addr, u16)>,
+    /// The egress broker a run is held to. Implies the private namespace,
+    /// whatever `mode` says.
+    pub broker: Option<Broker>,
     /// TCP ports the target is allowed to bind.
     pub bind_ports: Vec<u16>,
     /// TCP ports on which the host may reach a service bound inside the

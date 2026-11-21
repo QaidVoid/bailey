@@ -186,7 +186,7 @@ pub fn decide(
         });
     }
 
-    if let Some((addr, port)) = policy.network.broker {
+    if let Some(crate::policy::Broker::External(addr, port)) = policy.network.broker {
         let source = policy.network.broker_source.as_deref().unwrap_or("unknown");
         if !caps.user_namespaces || !caps.pasta {
             anyhow::bail!(
@@ -930,7 +930,10 @@ mod tests {
         // A broker in policy is brokered in every mode, refused where nft or
         // the namespace is missing.
         let mut brokered = private.clone();
-        brokered.network.broker = Some(("169.254.169.1".parse().unwrap(), 8443));
+        brokered.network.broker = Some(crate::policy::Broker::External(
+            "169.254.169.1".parse().unwrap(),
+            8443,
+        ));
         brokered.network.broker_source = Some("/project/bailey.toml".to_owned());
         assert_eq!(
             decide(&brokered, &full, false, &[], &[]).unwrap().mode,
