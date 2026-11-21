@@ -64,6 +64,43 @@ fn doctor_reports_every_mechanism_with_its_consequence() {
     }
 }
 
+/// `doctor` reports the built-in broker helper: found beside this binary
+/// with the protocol it speaks, and not found, with the reason and the
+/// consequence, where the search has nowhere left to look.
+#[test]
+fn doctor_reports_the_broker_helper() {
+    let output = run(&["doctor"]);
+    assert!(output.status.success());
+    let report = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        report.contains("built-in broker: found"),
+        "the helper beside the binary must be found: {report}"
+    );
+    assert!(
+        report.contains("protocol"),
+        "the report carries the protocol the helper speaks: {report}"
+    );
+    assert!(
+        report.contains("broker = \"builtin\""),
+        "the report names the runs the helper serves: {report}"
+    );
+
+    let output = Command::new(bailey())
+        .arg("doctor")
+        .env("BAILEY_HELPER_DIRS", "/nonexistent")
+        .output()
+        .unwrap();
+    let report = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        report.contains("built-in broker: not found"),
+        "an empty helper search must be reported: {report}"
+    );
+    assert!(
+        report.contains("broker = \"builtin\""),
+        "the refusal a run would meet is named: {report}"
+    );
+}
+
 /// `doctor` says whether the fallback observer can record, and what audit
 /// does without the helper when the fallback stands in for it.
 #[test]

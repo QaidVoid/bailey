@@ -2444,3 +2444,199 @@ fn the_bundled_profiles_connect_exactly_to_their_listed_sockets() {
         }
     }
 }
+
+/// A broker stub that speaks the wire protocol and counts what it accepts.
+///
+/// The real broker's CONNECT server is 3.5; what 3.2 needs is a process on
+/// the other end of the handed-off listener, so this stub answers the ready
+/// line the protocol defines and appends one line per accepted connection to
+/// a file the test reads afterwards.
+const STUB_BROKER: &str = r#"#!/usr/bin/python3
+import json, os, socket, sys
+config = sys.stdin.buffer.read()
+sys.stdout.write(json.dumps({
+    "version": 1, "ca_pem": None,
+    "layers": {"seccomp": False, "landlock": False, "landlock_network": False},
+}) + "\n")
+sys.stdout.flush()
+listener = socket.fromfd(3, socket.AF_INET, socket.SOCK_STREAM)
+while True:
+    try:
+        conn, peer = listener.accept()
+    except OSError:
+        break
+    with open(os.environ["BAILEY_STUB_REPORT"], "ab") as report:
+        report.write(f"accepted {peer[0]}:{peer[1]}\n".encode())
+    conn.close()
+"#;
+
+/// A builtin run aims every proxy variable at the handed-off listener, which
+/// only the broker serves, while the namespace has no route to anything
+/// else: not to the internet, and not to the host's loopback.
+#[test]
+fn builtin_broker_reaches_the_broker_and_nothing_else() {
+    if python().is_none() || !netns_available() {
+        common::skip("needs python3 and user namespaces");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let helpers = dir.path().join("helpers");
+    fs::create_dir(&helpers).unwrap();
+    let stub = helpers.join("bailey-broker");
+    fs::write(&stub, STUB_BROKER).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let report = dir.path().join("accepted.log");
+    let host_service = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let host_port = host_service.local_addr().unwrap().port();
+    // The host service must be serving while the target dials it.
+    std::thread::spawn(move || {
+        for stream in host_service.incoming() {
+            drop(stream);
+        }
+    });
+
+    let program = format!(
+        r#"
+import os, socket, sys
+from urllib.parse import urlparse
+
+proxy = urlparse(os.environ["HTTPS_PROXY"])
+assert proxy.hostname == "127.0.0.1", proxy
+port = proxy.port
+
+# The broker's listener answers, whatever is sent to it.
+s = socket.create_connection(("127.0.0.1", port), timeout=5)
+s.sendall(b"CONNECT api.example.com:443 HTTP/1.1\r\n\r\n")
+s.close()
+print("broker-reached")
+
+# No route in the namespace, so the internet fails at once.
+try:
+    socket.create_connection(("1.1.1.1", 80), timeout=5)
+    print("internet-REACHED")
+except OSError as err:
+    print("internet-refused", err.errno)
+
+# The host's loopback is another namespace's loopback.
+try:
+    socket.create_connection(("127.0.0.1", {host_port}), timeout=5)
+    print("host-loopback-REACHED")
+except OSError as err:
+    print("host-loopback-refused", err.errno)
+"#,
+        host_port = host_port
+    );
+
+    let config = "[network]\negress_allow = [{ host = \"*\", port = 443 }]\nbroker = \"builtin\"\n";
+    let config_path = dir.path().join("bailey.toml");
+    fs::write(&config_path, config).unwrap();
+
+    let output = isolated_command(dir.path())
+        .env("BAILEY_HELPER_DIRS", &helpers)
+        .env("BAILEY_STUB_REPORT", &report)
+        .arg("run")
+        .arg("-c")
+        .arg(&config_path)
+        .args([python().unwrap(), "-c", &program])
+        .output()
+        .unwrap();
+    let stdout = stdout_of(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    assert!(output.status.success(), "the run must succeed: {stderr}");
+    assert!(stdout.contains("broker-reached"), "{stdout}");
+    assert!(
+        stdout.contains("internet-refused") && !stdout.contains("internet-REACHED"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("host-loopback-refused") && !stdout.contains("host-loopback-REACHED"),
+        "{stdout}"
+    );
+    // Exactly one connection reached the stub: the one the target made.
+    let accepted = fs::read_to_string(&report).unwrap_or_default();
+    assert_eq!(accepted.lines().count(), 1, "{accepted}");
+}
+
+/// A stub broker whose answer is written by the test: a good ready line, a
+/// bad version, garbage, or nothing at all.
+fn stub_broker_with_answer(answer: &str) -> String {
+    format!(
+        r#"#!/usr/bin/env python3
+import os, sys
+listener = os.environ.get("BAILEY_STUB_REPORT")
+if listener:
+    with open(listener, "ab") as report:
+        report.write(b"started\n")
+config = sys.stdin.buffer.read()
+answer = {answer:?}
+if answer:
+    sys.stdout.buffer.write(answer)
+    sys.stdout.buffer.flush()
+"#,
+        answer = answer
+    )
+}
+
+/// A helper's refusal must fail the run before the target starts: the
+/// namespace is never given a route, so nothing the target would have done
+/// can happen. Each way a helper can be wrong is refused here.
+#[test]
+fn a_failing_builtin_helper_refuses_the_run_before_the_target_starts() {
+    if python().is_none() || !netns_available() {
+        common::skip("needs python3 and user namespaces");
+        return;
+    }
+    let good_ready = r#"{"version":1,"ca_pem":null,"layers":{"seccomp":false,"landlock":false,"landlock_network":false}}"#;
+    let wrong_version = good_ready.replace("\"version\":1", "\"version\":999");
+    let cases: [(&str, Option<&str>, bool); 4] = [
+        // (name, the helper's stdout answer, whether a helper exists at all)
+        ("a missing helper", None, false),
+        ("a wrong protocol version", Some(wrong_version.as_str()), true),
+        ("a helper that exits before answering", None, true),
+        ("an answer that is not a ready line", Some("garbage\n"), true),
+    ];
+    for (name, answer, helper_exists) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let helpers = dir.path().join("helpers");
+        fs::create_dir(&helpers).unwrap();
+        if helper_exists {
+            let stub = helpers.join("bailey-broker");
+            let script = match answer {
+                Some(answer) => stub_broker_with_answer(&format!("{answer}\n")),
+                None => stub_broker_with_answer(""),
+            };
+            fs::write(&stub, script).unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let started = dir.path().join("target-started");
+        let program = format!(
+            r#"
+with open({started:?}, "w") as marker:
+    marker.write("started")
+"#,
+            started = started
+        );
+        let config = "[network]\negress_allow = [{ host = \"*\", port = 443 }]\nbroker = \"builtin\"\n";
+        let config_path = dir.path().join("bailey.toml");
+        fs::write(&config_path, config).unwrap();
+
+        let output = isolated_command(dir.path())
+            .env("BAILEY_HELPER_DIRS", &helpers)
+            .arg("run")
+            .arg("-c")
+            .arg(&config_path)
+            .args([python().unwrap(), "-c", &program])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        assert!(
+            !output.status.success(),
+            "{name} must refuse the run: {stderr}"
+        );
+        assert!(!started.exists(), "{name}: the target must never start");
+    }
+}
