@@ -103,6 +103,27 @@ pub struct QuickGrants {
     /// port only; a config layer's egress choice is replaced.
     #[arg(long, value_name = "PORT", value_parser = clap::value_parser!(u16).range(1..))]
     pub allow_net: Vec<u16>,
+    /// Allow HTTP requests through the built-in broker, as
+    /// `[METHOD] HOST[:PORT][/PATH]`, where a path ending in `*` bounds the
+    /// prefix. Repeatable.
+    #[arg(long = "http-allow", value_name = "RULE")]
+    pub http_allow: Vec<String>,
+    /// Deny HTTP requests, in the same form as `--http-allow`. Checked ahead
+    /// of every allowance. Repeatable.
+    #[arg(long = "http-deny", value_name = "RULE")]
+    pub http_deny: Vec<String>,
+    /// Intercept HTTP on a host, so rules can bound methods and paths and
+    /// credentials can attach. Repeatable.
+    #[arg(long = "http-intercept", value_name = "HOST")]
+    pub http_intercept: Vec<String>,
+    /// Attach a credential to an intercepted host, as `HOST AUTH SOURCE`,
+    /// where AUTH is `bearer` or `header:NAME` and SOURCE is `env:NAME`,
+    /// `file:PATH` or `fd:N`. Repeatable.
+    #[arg(long = "http-credential", value_name = "BINDING")]
+    pub http_credential: Vec<String>,
+    /// The append-only JSONL audit log of the built-in broker's decisions.
+    #[arg(long = "http-log", value_name = "PATH")]
+    pub http_log: Option<String>,
 }
 
 impl QuickGrants {
@@ -115,6 +136,11 @@ impl QuickGrants {
             && self.deny.is_empty()
             && self.allow_connect.is_empty()
             && self.allow_net.is_empty()
+            && self.http_allow.is_empty()
+            && self.http_deny.is_empty()
+            && self.http_intercept.is_empty()
+            && self.http_credential.is_empty()
+            && self.http_log.is_none()
     }
 
     /// The layer these flags describe, as TOML, or `None` when no flag was
@@ -206,8 +232,131 @@ impl QuickGrants {
                 .join(", ");
             out.push_str(&format!("[network]\negress_allow = [{rules}]\n"));
         }
+        out.push_str(&self.http_layer()?);
         Ok(Some(out))
     }
+
+    /// The `[http]` tables the HTTP flags describe, as one TOML layer body.
+    ///
+    /// The flag forms mirror the TOML keys: a rule is
+    /// `[METHOD] HOST[:PORT][/PATH]`, a binding is `HOST AUTH SOURCE`. The
+    /// structural split happens here, so a malformed value is reported
+    /// against the flag it came from; whether the host, method, path and
+    /// source are well-formed stays with the same code that judges TOML, so
+    /// the two spellings cannot drift apart.
+    fn http_layer(&self) -> anyhow::Result<String> {
+        let quoted = crate::strings::quoted;
+        let mut out = String::new();
+        if !self.http_intercept.is_empty() || self.http_log.is_some() {
+            out.push_str("[http]\n");
+            if !self.http_intercept.is_empty() {
+                let hosts = self
+                    .http_intercept
+                    .iter()
+                    .map(|host| quoted(host))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                out.push_str(&format!("intercept = [{hosts}]\n"));
+            }
+            if let Some(log) = &self.http_log {
+                let path = config::expand_flag_path(log)
+                    .map_err(|err| anyhow::anyhow!("--http-log {log}: {err}"))?;
+                out.push_str(&format!("log = {}\n", quoted(&path.to_string_lossy())));
+            }
+        }
+        for (list, values) in [("allow", &self.http_allow), ("deny", &self.http_deny)] {
+            for value in values {
+                let rule = parse_http_rule(value)
+                    .map_err(|reason| anyhow::anyhow!("--http-{list} {value:?}: {reason}"))?;
+                out.push_str(&format!(
+                    "\n[[http.{list}]]\nhost = {}\n",
+                    quoted(&rule.host)
+                ));
+                if let Some(port) = rule.port {
+                    out.push_str(&format!("port = {port}\n"));
+                }
+                if let Some(methods) = rule.methods {
+                    let method_list = methods
+                        .iter()
+                        .map(|method| quoted(method))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    out.push_str(&format!("methods = [{method_list}]\n"));
+                }
+                if let Some(path) = rule.path {
+                    out.push_str(&format!("path = {}\n", quoted(&path)));
+                }
+            }
+        }
+        for value in &self.http_credential {
+            let mut parts = value.splitn(3, char::is_whitespace).map(str::trim);
+            let host = parts.next().unwrap_or_default();
+            let auth = parts.next().unwrap_or_default();
+            let source = parts.next().unwrap_or_default();
+            if host.is_empty() || auth.is_empty() || source.is_empty() {
+                anyhow::bail!("--http-credential {value:?}: expected HOST AUTH SOURCE");
+            }
+            out.push_str(&format!(
+                "\n[[http.credential]]\nhost = {}\nauth = {}\nsource = {}\n",
+                quoted(host),
+                quoted(auth),
+                quoted(source)
+            ));
+        }
+        Ok(out)
+    }
+}
+
+/// One parsed `--http-allow` or `--http-deny` value, before validation.
+struct FlagRule {
+    /// The leading method token, when one was written.
+    methods: Option<Vec<String>>,
+    /// The host part, a name, `*.suffix`, `*` or an address.
+    host: String,
+    /// The `:PORT` suffix, when one was written.
+    port: Option<u16>,
+    /// Everything from the first `/`, kept for the TOML `path` key.
+    path: Option<String>,
+}
+
+/// Split one `--http-allow` or `--http-deny` value into its
+/// `[METHOD] HOST[:PORT][/PATH]` parts, or say what is wrong with it.
+///
+/// Only the shape is decided here. A port is recognized when the host part
+/// carries no colon and the suffix parses as a port, so an IPv6 literal
+/// stays a host. Whether the host, method and path are well-formed is
+/// resolution's judgement, shared with the TOML spelling.
+fn parse_http_rule(value: &str) -> anyhow::Result<FlagRule> {
+    let value = value.trim();
+    let (methods, rest) = match value.split_once(char::is_whitespace) {
+        Some((method, rest)) => (Some(vec![method.trim().to_owned()]), rest.trim()),
+        None => (None, value),
+    };
+    let (host_port, path) = match rest.split_once('/') {
+        Some((host, path)) => (host, Some(format!("/{path}"))),
+        None => (rest, None),
+    };
+    let (host, port) = match host_port.rsplit_once(':') {
+        Some((host, port)) if !host.contains(':') && !port.is_empty() => {
+            let port = port
+                .parse::<u16>()
+                .map_err(|_| anyhow::anyhow!("port {port:?} is not a port"))?;
+            if port == 0 {
+                anyhow::bail!("port 0 is not a port a broker rule bounds");
+            }
+            (host, Some(port))
+        }
+        _ => (host_port, None),
+    };
+    if host.is_empty() {
+        anyhow::bail!("the rule names no host");
+    }
+    Ok(FlagRule {
+        methods,
+        host: host.to_owned(),
+        port,
+        path,
+    })
 }
 
 #[derive(Debug, clap::Args)]
@@ -256,7 +405,8 @@ struct NetworkArgs {
     /// Never use a private network namespace, even where one was available.
     #[arg(long)]
     no_proxy_net: bool,
-    /// Force all egress through a broker reachable only at ADDR:PORT.
+    /// Force all egress through a broker reachable only at ADDR:PORT, or
+    /// `builtin` for bailey's own broker on the handed-off listener.
     ///
     /// Implies `--proxy-net`. The private namespace is given ADDR as the host's
     /// loopback stand-in, and a netfilter rule drops every outbound connection
@@ -264,7 +414,11 @@ struct NetworkArgs {
     /// else. If the rule cannot be applied the run refuses rather than fall
     /// back to open egress. Needs pasta, user namespaces and `nft`; where one
     /// is missing the run is refused.
-    #[arg(long, value_name = "ADDR:PORT", conflicts_with = "no_proxy_net")]
+    #[arg(
+        long,
+        value_name = "ADDR:PORT|builtin",
+        conflicts_with = "no_proxy_net"
+    )]
     egress_proxy: Option<String>,
     /// Publish this sandbox TCP port on host loopback, so a service bound
     /// inside the sandbox is reachable at `127.0.0.1:<PORT>` on the host.
@@ -1165,14 +1319,19 @@ fn apply_network_flags(policy: &mut Policy, args: &NetworkArgs) -> anyhow::Resul
         policy.network.mode_source = "flag --proxy-net".to_owned();
     }
     if let Some(proxy) = &args.egress_proxy {
-        let (addr, port) = parse_egress_proxy(proxy)?;
         // The broker needs the private namespace, so naming one selects the
         // mode as well: it outranks a configured host mode the same way
         // --proxy-net does, while a contradiction written entirely in config
         // stays refused.
         policy.network.mode = crate::policy::NetworkMode::Private;
         policy.network.mode_source = "flag --egress-proxy".to_owned();
-        policy.network.broker = Some(crate::policy::Broker::External(addr, port));
+        let broker = if proxy == "builtin" {
+            crate::policy::Broker::Builtin
+        } else {
+            let (addr, port) = parse_egress_proxy(proxy)?;
+            crate::policy::Broker::External(addr, port)
+        };
+        policy.network.broker = Some(broker);
         policy.network.broker_source = Some("flag --egress-proxy".to_owned());
     }
     Ok(())
@@ -3753,6 +3912,135 @@ mod tests {
         )
         .unwrap();
         assert_eq!(policy.network.publish_ports, vec![4000, 3800]);
+    }
+
+    /// `--egress-proxy builtin` selects the built-in broker, and an external
+    /// ADDR:PORT keeps parsing as before.
+    #[test]
+    fn egress_proxy_accepts_builtin_and_the_external_form() {
+        let builtin = publish_args(&["--egress-proxy", "builtin"]);
+        let mut policy = Policy::default();
+        apply_network_flags(&mut policy, &builtin).unwrap();
+        assert_eq!(policy.network.broker, Some(crate::policy::Broker::Builtin));
+        assert_eq!(policy.network.mode, crate::policy::NetworkMode::Private);
+
+        let mut policy = Policy::default();
+        apply_network_flags(
+            &mut policy,
+            &publish_args(&["--egress-proxy", "169.254.169.1:8443"]),
+        )
+        .unwrap();
+        assert_eq!(
+            policy.network.broker,
+            Some(crate::policy::Broker::External(
+                "169.254.169.1".parse().unwrap(),
+                8443
+            ))
+        );
+
+        assert!(apply_network_flags(&mut policy, &publish_args(&["--egress-proxy", "x"])).is_err());
+        assert!(
+            apply_network_flags(
+                &mut policy,
+                &publish_args(&["--egress-proxy", "10.0.0.1:0"])
+            )
+            .is_err()
+        );
+    }
+
+    /// The HTTP flags describe the same layer their TOML spelling does:
+    /// the generated text resolves to an equal `HttpPolicy`.
+    #[test]
+    fn http_flags_produce_the_policy_their_toml_spelling_does() {
+        let _env = crate::test_support::env_lock();
+        let grants = QuickGrants {
+            http_intercept: vec!["api.anthropic.com".into(), "api.github.com".into()],
+            http_allow: vec![
+                "GET api.github.com:443/repos/myorg/*".into(),
+                "registry.npmjs.org".into(),
+            ],
+            http_deny: vec!["DELETE api.github.com/repos/myorg/secrets*".into()],
+            http_credential: vec![
+                "api.anthropic.com header:x-api-key env:ANTHROPIC_API_KEY".into(),
+            ],
+            http_log: Some("/tmp/bailey-http.jsonl".into()),
+            ..Default::default()
+        };
+        let flags = grants.layer().unwrap().unwrap();
+        let equivalent_toml = "[http]\n\
+             intercept = [\"api.anthropic.com\", \"api.github.com\"]\n\
+             log = \"/tmp/bailey-http.jsonl\"\n\
+             \n\
+             [[http.allow]]\n\
+             host = \"api.github.com\"\n\
+             port = 443\n\
+             methods = [\"GET\"]\n\
+             path = \"/repos/myorg/*\"\n\
+             \n\
+             [[http.allow]]\n\
+             host = \"registry.npmjs.org\"\n\
+             \n\
+             [[http.deny]]\n\
+             host = \"api.github.com\"\n\
+             methods = [\"DELETE\"]\n\
+             path = \"/repos/myorg/secrets*\"\n\
+             \n\
+             [[http.credential]]\n\
+             host = \"api.anthropic.com\"\n\
+             auth = \"header:x-api-key\"\n\
+             source = \"env:ANTHROPIC_API_KEY\"\n";
+        assert_eq!(flags, equivalent_toml);
+
+        let resolve = |text: &str| {
+            crate::config::resolve_with_bases(
+                &[],
+                Path::new("/bin/true"),
+                None,
+                &[("command-line grants", text)],
+            )
+            .unwrap()
+            .policy
+            .http
+        };
+        assert_eq!(resolve(&flags), resolve(equivalent_toml));
+        assert_eq!(resolve(&flags).credentials.len(), 1);
+        assert_eq!(
+            resolve(&flags).log,
+            Some(PathBuf::from("/tmp/bailey-http.jsonl"))
+        );
+    }
+
+    /// Structural problems in a flag value are reported against the flag;
+    /// semantic ones surface from resolution with the layer and rule named,
+    /// exactly as for TOML.
+    #[test]
+    fn malformed_http_flag_values_are_refused() {
+        let grants = |http_allow: &[&str]| QuickGrants {
+            http_allow: http_allow.iter().map(|s| (*s).into()).collect(),
+            ..Default::default()
+        };
+        assert!(grants(&["/only-a-path"]).layer().is_err(), "no host");
+        assert!(grants(&["GET :443/p"]).layer().is_err(), "no host");
+        assert!(grants(&["GET api.example:notaport/p"]).layer().is_err());
+        assert!(grants(&["GET api.example:0/p"]).layer().is_err());
+
+        // Semantic validation stays with resolution, shared with TOML.
+        let err = crate::config::resolve_with_bases(
+            &[],
+            Path::new("/bin/true"),
+            None,
+            &[(
+                "command-line grants",
+                grants(&["get api.example"])
+                    .layer()
+                    .unwrap()
+                    .unwrap()
+                    .as_str(),
+            )],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("uppercase"), "{err}");
     }
 
     /// Each contradictory combination the policy-config delta names, refused
