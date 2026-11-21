@@ -1,0 +1,4 @@
+GET /x HTTP/1.1
+Host: a
+Host: b
+

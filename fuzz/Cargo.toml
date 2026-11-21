@@ -1,0 +1,21 @@
+[package]
+name = "bailey-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[dependencies]
+bailey-broker = { path = "../crates/bailey-broker" }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "fuzz_http_codec"
+path = "fuzz_targets/fuzz_http_codec.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true

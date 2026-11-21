@@ -1,0 +1,7 @@
+GET /x HTTP/1.1
+Host: a
+Connection: keep-alive, X-Secret
+Keep-Alive: timeout=5
+X-Secret: v
+Accept: text/plain
+
