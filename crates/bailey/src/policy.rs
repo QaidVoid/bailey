@@ -115,14 +115,12 @@ impl Destination {
             Self::Block(addr, prefix) => match addr {
                 std::net::IpAddr::V4(v4) => {
                     let bits = u32::from(*v4);
-                    let loopback = u32::from(std::net::Ipv4Addr::LOCALHOST)
-                        & mask(*prefix, 32);
+                    let loopback = u32::from(std::net::Ipv4Addr::LOCALHOST) & mask(*prefix, 32);
                     bits & mask(*prefix, 32) == loopback
                 }
                 std::net::IpAddr::V6(v6) => {
                     let bits = u128::from(*v6);
-                    let loopback = u128::from(std::net::Ipv6Addr::LOCALHOST)
-                        & mask6(*prefix);
+                    let loopback = u128::from(std::net::Ipv6Addr::LOCALHOST) & mask6(*prefix);
                     bits & mask6(*prefix) == loopback
                 }
             },
@@ -315,9 +313,7 @@ impl NetworkPolicy {
     /// DNS denial are all enforced in the private namespace's netfilter
     /// rules; the host's namespace has nothing that carries them.
     pub fn needs_egress_namespace(&self) -> bool {
-        self.dns == DnsSetting::Deny
-            || !self.deny.is_empty()
-            || self.egress_rules_need_namespace()
+        self.dns == DnsSetting::Deny || !self.deny.is_empty() || self.egress_rules_need_namespace()
     }
 
     /// Whether an allow rule names a destination or protocol Landlock
@@ -488,6 +484,251 @@ pub struct SocketRelay {
     pub service: Option<String>,
 }
 
+/// A host an HTTP rule names.
+///
+/// Written as an exact name, `*.suffix` for subdomains only, `*` for any
+/// host, or an IP literal. Compared in lowercase without a trailing dot.
+/// Names must be ASCII, so internationalised names are written in their
+/// `xn--` form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HttpHost {
+    /// Any host: written `*`.
+    Any,
+    /// Subdomains of a suffix at any depth, written `*.suffix`. The bare
+    /// suffix itself is not matched.
+    Wildcard(String),
+    /// One exact name.
+    Exact(String),
+    /// One address literal.
+    Address(std::net::IpAddr),
+}
+
+impl HttpHost {
+    /// Parse the value a config file or flag writes, or `None` for anything
+    /// else, which resolution reports as a bad rule.
+    pub fn parse(value: &str) -> Option<Self> {
+        let lowered = value.to_ascii_lowercase();
+        if !value.is_ascii() {
+            return None;
+        }
+        match lowered.as_str() {
+            "*" => return Some(Self::Any),
+            // `*.` and a bare dot name nothing.
+            "" | "*." => return None,
+            _ => {}
+        }
+        let lowered = lowered.strip_suffix('.').unwrap_or(&lowered);
+        if let Some(suffix) = lowered.strip_prefix("*.") {
+            if suffix.is_empty() || suffix.contains('*') {
+                return None;
+            }
+            return Some(Self::Wildcard(suffix.to_owned()));
+        }
+        if lowered.contains('*') {
+            return None;
+        }
+        if let Ok(addr) = lowered.parse() {
+            return Some(Self::Address(addr));
+        }
+        Some(Self::Exact(lowered.to_owned()))
+    }
+
+    /// Whether the host a request names, already lowercase with any trailing
+    /// dot stripped, is covered.
+    fn matches(&self, host: &str) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Exact(name) => name == host,
+            Self::Wildcard(suffix) => {
+                host != suffix.as_str()
+                    && host
+                        .strip_suffix(suffix.as_str())
+                        .is_some_and(|rest| rest.ends_with('.'))
+            }
+            Self::Address(addr) => host
+                .parse()
+                .is_ok_and(|parsed: std::net::IpAddr| parsed == *addr),
+        }
+    }
+}
+
+impl std::fmt::Display for HttpHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Any => write!(f, "*"),
+            Self::Wildcard(suffix) => write!(f, "*.{suffix}"),
+            Self::Exact(name) => write!(f, "{name}"),
+            Self::Address(addr) => write!(f, "{addr}"),
+        }
+    }
+}
+
+/// The request path a rule bounds: exact, or a prefix when written with a
+/// trailing `*`. No other wildcard. Matched against the path without the
+/// query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HttpPath {
+    /// The whole path, byte for byte.
+    Exact(String),
+    /// Everything that starts with this prefix, written `prefix*`.
+    Prefix(String),
+}
+
+impl HttpPath {
+    /// Parse the value a config file or flag writes, or `None` for anything
+    /// else. A `*` is only ever the last character.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.strip_suffix('*') {
+            Some(prefix) => (!prefix.contains('*')).then(|| Self::Prefix(prefix.to_owned())),
+            None => (!value.contains('*')).then(|| Self::Exact(value.to_owned())),
+        }
+    }
+
+    /// Whether a request path, with the query already stripped, is covered.
+    fn matches(&self, path: &str) -> bool {
+        match self {
+            Self::Exact(exact) => exact == path,
+            Self::Prefix(prefix) => path.starts_with(prefix.as_str()),
+        }
+    }
+}
+
+/// A permitted or dropped HTTP request.
+///
+/// A rule bounds its host always, and the port, the methods and the path only
+/// when it names them: an unset port is any port, an empty method list is any
+/// method, and no path is any path. Methods are written and matched in
+/// uppercase, so a request whose method is anything else never matches an
+/// allow rule and lands in the default refusal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpRule {
+    /// Who the rule names.
+    pub host: HttpHost,
+    /// Destination port, or `None` for any port. The broker applies the
+    /// port defaults before it matches: 443 for a CONNECT, 80 for a
+    /// cleartext request.
+    pub port: Option<u16>,
+    /// Methods the rule bounds, uppercase, or empty for any.
+    pub methods: Vec<String>,
+    /// The path the rule bounds, or `None` for any.
+    pub path: Option<HttpPath>,
+}
+
+impl HttpRule {
+    /// Whether a request is covered.
+    fn matches(&self, req: &HttpRequest<'_>) -> bool {
+        if !self.host.matches(req.host) {
+            return false;
+        }
+        if self.port.is_some_and(|port| port != req.port) {
+            return false;
+        }
+        if !self.methods.is_empty() && !self.methods.iter().any(|m| m == req.method) {
+            return false;
+        }
+        match &self.path {
+            None => true,
+            Some(path) => path.matches(req.path),
+        }
+    }
+}
+
+/// A request the broker matches, with the port defaults applied and the
+/// query already stripped from the path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HttpRequest<'a> {
+    /// The host the request names, lowercase, without a trailing dot.
+    pub host: &'a str,
+    /// The port the request names, after the defaults.
+    pub port: u16,
+    /// The method, uppercase.
+    pub method: &'a str,
+    /// The path, without the query.
+    pub path: &'a str,
+}
+
+/// What the broker decided about one request, and which rule decided it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Decision<'a> {
+    /// A deny rule matched.
+    Denied(&'a HttpRule),
+    /// An allow rule matched.
+    Allowed(&'a HttpRule),
+    /// No rule matched: refused, because nothing is allowed that no rule
+    /// allows.
+    Refused,
+}
+
+/// The shape of an attached credential.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthShape {
+    /// `Authorization: Bearer <value>`.
+    Bearer,
+    /// A named header carrying the value raw.
+    Header(String),
+}
+
+/// Where a credential value comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CredentialSource {
+    /// An environment variable of the caller, read before the sandbox is
+    /// made.
+    Env(String),
+    /// A file of the caller, read before the sandbox is made.
+    File(PathBuf),
+    /// A descriptor bailey already holds, read once.
+    Fd(u32),
+}
+
+/// A credential the broker attaches to requests on an intercepted host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialBinding {
+    /// The host it binds to, covered by an intercept entry.
+    pub host: HttpHost,
+    /// The request shape the value is attached as.
+    pub auth: AuthShape,
+    /// Where the value comes from.
+    pub source: CredentialSource,
+}
+
+/// HTTP-level policy the built-in egress broker enforces.
+///
+/// The broker refuses a request unless an allow rule matches it, and drops
+/// it when a deny rule matches, whatever the allowances say.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HttpPolicy {
+    /// Hosts the broker intercepts: it terminates TLS for them, and decides
+    /// every request inside the tunnel on its own. Written as exact names or
+    /// `*.suffix`; `*` is refused at resolution.
+    pub intercept: Vec<HttpHost>,
+    /// Requests allowed, in order.
+    pub allow: Vec<HttpRule>,
+    /// Requests dropped ahead of every allowance, in order.
+    pub deny: Vec<HttpRule>,
+    /// Credentials bound to intercepted hosts.
+    pub credentials: Vec<CredentialBinding>,
+    /// The append-only JSONL audit log, or `None`. Caller's own config only.
+    pub log: Option<PathBuf>,
+}
+
+impl HttpPolicy {
+    /// The decision for one request, and the rule that made it.
+    pub fn decide(&self, req: &HttpRequest<'_>) -> Decision<'_> {
+        if let Some(rule) = self.deny.iter().find(|rule| rule.matches(req)) {
+            return Decision::Denied(rule);
+        }
+        if let Some(rule) = self.allow.iter().find(|rule| rule.matches(req)) {
+            return Decision::Allowed(rule);
+        }
+        Decision::Refused
+    }
+
+    /// Whether the broker terminates TLS for a host.
+    pub fn is_intercepted(&self, host: &str) -> bool {
+        self.intercept.iter().any(|listed| listed.matches(host))
+    }
+}
+
 /// A host TCP service the target may reach on loopback, one port at a time.
 ///
 /// The target dials `127.0.0.1:port` inside its own network namespace, and
@@ -554,6 +795,8 @@ pub struct Policy {
     pub sockets: Vec<SocketRelay>,
     /// Host TCP ports the target may reach on loopback, in order.
     pub forwards: Vec<PortForward>,
+    /// HTTP-level policy the built-in egress broker enforces.
+    pub http: HttpPolicy,
 }
 
 impl Policy {
@@ -578,5 +821,203 @@ impl Policy {
                 .iter()
                 .any(|rule| denied.starts_with(&rule.path) && **denied != rule.path)
         })
+    }
+}
+
+#[cfg(test)]
+mod http_tests {
+    use super::*;
+
+    fn rule(host: &str) -> HttpRule {
+        HttpRule {
+            host: HttpHost::parse(host).unwrap(),
+            port: None,
+            methods: Vec::new(),
+            path: None,
+        }
+    }
+
+    fn check(path: &str) -> HttpRequest<'_> {
+        HttpRequest {
+            host: "api.github.com",
+            port: 443,
+            method: "GET",
+            path,
+        }
+    }
+
+    #[test]
+    fn nothing_is_allowed_without_rules() {
+        let policy = HttpPolicy::default();
+        assert_eq!(policy.decide(&check("/x")), Decision::Refused);
+    }
+
+    #[test]
+    fn a_deny_rule_wins_over_an_allow_rule() {
+        let mut policy = HttpPolicy::default();
+        policy.allow.push(rule("api.github.com"));
+        policy.deny.push(rule("*"));
+        assert!(matches!(policy.decide(&check("/x")), Decision::Denied(_)));
+    }
+
+    #[test]
+    fn a_deny_rule_wins_over_a_later_allow_rule() {
+        let mut policy = HttpPolicy::default();
+        policy.deny.push(rule("*"));
+        policy.allow.push(rule("api.github.com"));
+        assert!(matches!(policy.decide(&check("/x")), Decision::Denied(_)));
+    }
+
+    #[test]
+    fn a_wildcard_suffix_matches_subdomains_but_not_the_bare_suffix() {
+        let host = HttpHost::parse("*.github.com").unwrap();
+        assert!(host.matches("api.github.com"));
+        assert!(host.matches("a.b.github.com"));
+        assert!(!host.matches("github.com"));
+        assert!(!host.matches("notgithub.com"));
+    }
+
+    #[test]
+    fn an_exact_host_ignores_a_trailing_dot_and_case() {
+        let host = HttpHost::parse("API.GitHub.com.").unwrap();
+        assert_eq!(host, HttpHost::Exact("api.github.com".into()));
+        assert!(host.matches("api.github.com"));
+    }
+
+    #[test]
+    fn a_trailing_star_is_a_prefix() {
+        let mut policy = HttpPolicy::default();
+        let mut allow = rule("api.github.com");
+        allow.path = HttpPath::parse("/repos/myorg/*");
+        policy.allow.push(allow);
+        assert!(matches!(
+            policy.decide(&check("/repos/myorg/x")),
+            Decision::Allowed(_)
+        ));
+        assert!(matches!(
+            policy.decide(&check("/repos/myorg/x/y")),
+            Decision::Allowed(_)
+        ));
+        assert_eq!(
+            policy.decide(&check("/repos/myorgification")),
+            Decision::Refused
+        );
+        assert_eq!(policy.decide(&check("/repos/other/x")), Decision::Refused);
+    }
+
+    #[test]
+    fn an_exact_path_takes_no_wildcard() {
+        assert_eq!(HttpPath::parse("/repos/*/x"), None);
+        assert_eq!(HttpPath::parse("/re*pos"), None);
+        let exact = HttpPath::parse("/repos").unwrap();
+        assert_eq!(exact, HttpPath::Exact("/repos".into()));
+    }
+
+    #[test]
+    fn a_query_is_never_part_of_the_path() {
+        // The codec strips the query before it matches; the
+        // matcher itself must not match through one either way.
+        let mut policy = HttpPolicy::default();
+        let mut allow = rule("api.github.com");
+        allow.path = HttpPath::parse("/repos");
+        policy.allow.push(allow);
+        assert!(matches!(
+            policy.decide(&check("/repos")),
+            Decision::Allowed(_)
+        ));
+        assert_eq!(policy.decide(&check("/repos?x=1")), Decision::Refused);
+        assert_eq!(policy.decide(&check("/reposbing")), Decision::Refused);
+    }
+
+    #[test]
+    fn an_unset_port_matches_every_port_and_a_named_port_only_itself() {
+        let mut policy = HttpPolicy::default();
+        policy.allow.push(rule("api.github.com"));
+        assert!(matches!(policy.decide(&check("/x")), Decision::Allowed(_)));
+        let any_port = HttpRequest {
+            port: 8443,
+            ..check("/x")
+        };
+        assert!(matches!(policy.decide(&any_port), Decision::Allowed(_)));
+
+        let mut policy = HttpPolicy::default();
+        let mut pinned = rule("api.github.com");
+        pinned.port = Some(8443);
+        policy.allow.push(pinned);
+        assert!(matches!(policy.decide(&any_port), Decision::Allowed(_)));
+        assert_eq!(policy.decide(&check("/x")), Decision::Refused);
+    }
+
+    #[test]
+    fn a_lowercase_method_never_matches_an_uppercase_rule() {
+        let mut policy = HttpPolicy::default();
+        let mut allow = rule("api.github.com");
+        allow.methods = vec!["DELETE".into()];
+        policy.allow.push(allow);
+        let lower = HttpRequest {
+            method: "delete",
+            ..check("/x")
+        };
+        assert_eq!(policy.decide(&lower), Decision::Refused);
+        let mixed = HttpRequest {
+            method: "Delete",
+            ..check("/x")
+        };
+        assert_eq!(policy.decide(&mixed), Decision::Refused);
+        let upper = HttpRequest {
+            method: "DELETE",
+            ..check("/x")
+        };
+        assert!(matches!(policy.decide(&upper), Decision::Allowed(_)));
+    }
+
+    #[test]
+    fn a_star_host_covers_everything_and_an_address_matches_a_literal() {
+        let mut policy = HttpPolicy::default();
+        policy.allow.push(rule("*"));
+        let other = HttpRequest {
+            host: "example.org",
+            ..check("/x")
+        };
+        assert!(matches!(policy.decide(&other), Decision::Allowed(_)));
+
+        let mut policy = HttpPolicy::default();
+        let mut by_addr = rule("127.0.0.1");
+        by_addr.port = Some(8080);
+        policy.allow.push(by_addr);
+        let literal = HttpRequest {
+            host: "127.0.0.1",
+            port: 8080,
+            ..check("/x")
+        };
+        assert!(matches!(policy.decide(&literal), Decision::Allowed(_)));
+        assert_eq!(policy.decide(&check("/x")), Decision::Refused);
+    }
+
+    #[test]
+    fn host_parse_rejects_non_ascii_and_mid_globs() {
+        assert_eq!(
+            HttpHost::parse("*.example.com"),
+            Some(HttpHost::Wildcard("example.com".into()))
+        );
+        assert_eq!(HttpHost::parse("*"), Some(HttpHost::Any));
+        assert_eq!(
+            HttpHost::parse("10.0.0.1"),
+            Some(HttpHost::Address("10.0.0.1".parse().unwrap()))
+        );
+        assert_eq!(HttpHost::parse("bücher.example"), None);
+        assert_eq!(HttpHost::parse("a*b.example"), None);
+        assert_eq!(HttpHost::parse("*."), None);
+        assert_eq!(HttpHost::parse(""), None);
+    }
+
+    #[test]
+    fn interception_matches_the_same_host_forms() {
+        let policy = HttpPolicy {
+            intercept: HttpHost::parse("*.anthropic.com").into_iter().collect(),
+            ..Default::default()
+        };
+        assert!(policy.is_intercepted("api.anthropic.com"));
+        assert!(!policy.is_intercepted("anthropic.com"));
     }
 }

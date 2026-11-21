@@ -435,6 +435,9 @@ struct Accumulator {
     self_fuse: Option<(bool, PathBuf)>,
     sockets: Vec<SocketRelay>,
     forwards: Vec<PortForward>,
+    /// HTTP rules and bindings for the built-in egress broker, accumulated
+    /// across layers with the layer path of each rule for errors.
+    http: crate::policy::HttpPolicy,
 }
 
 /// Discover the config layers for `target`, lowest precedence first.
@@ -653,7 +656,8 @@ fn apply_layer(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> 
             if let Some(all) = all {
                 acc.egress_all = Some((all, layer.path.clone()));
             }
-            acc.egress_rules.extend(rules.into_iter().map(|rule| (rule, layer.path.clone())));
+            acc.egress_rules
+                .extend(rules.into_iter().map(|rule| (rule, layer.path.clone())));
         }
         if !network.egress_deny.is_empty() {
             let denies = build_egress_deny(network, &layer.path)?;
@@ -664,9 +668,7 @@ fn apply_layer(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> 
             let Some(dns) = crate::policy::DnsSetting::parse(dns) else {
                 return Err(ConfigError::Invalid {
                     path: layer.path.clone(),
-                    reason: format!(
-                        "network dns `{dns}` is not one of auto, allow, deny"
-                    ),
+                    reason: format!("network dns `{dns}` is not one of auto, allow, deny"),
                 });
             };
             acc.dns = Some((dns, layer.path.clone()));
@@ -1074,7 +1076,12 @@ fn finalize(mut acc: Accumulator) -> Result<Resolved, ConfigError> {
         refuse_unenforceable_network_rules(&acc, mode)?;
         NetworkPolicy {
             egress: if !acc.egress_rules.is_empty() {
-                Egress::Allow(acc.egress_rules.iter().map(|(rule, _)| rule.clone()).collect())
+                Egress::Allow(
+                    acc.egress_rules
+                        .iter()
+                        .map(|(rule, _)| rule.clone())
+                        .collect(),
+                )
             } else if acc.egress_all.as_ref().is_some_and(|(all, _)| *all) {
                 Egress::AllowAll
             } else {
@@ -1093,7 +1100,11 @@ fn finalize(mut acc: Accumulator) -> Result<Resolved, ConfigError> {
                 .broker
                 .as_ref()
                 .map(|(_, path)| path.display().to_string()),
-            deny: acc.egress_denies.iter().map(|(rule, _)| rule.clone()).collect(),
+            deny: acc
+                .egress_denies
+                .iter()
+                .map(|(rule, _)| rule.clone())
+                .collect(),
             dns: acc.dns.map(|(dns, _)| dns).unwrap_or_default(),
         }
     };
@@ -1126,6 +1137,7 @@ fn finalize(mut acc: Accumulator) -> Result<Resolved, ConfigError> {
             fuse: acc.fuse,
             sockets: acc.sockets,
             forwards: acc.forwards,
+            http: acc.http,
         },
         hooks: acc.hooks,
     })
@@ -1246,9 +1258,7 @@ fn build_egress(
         Some(other) if other != "deny" => {
             return Err(ConfigError::Invalid {
                 path: path.to_path_buf(),
-                reason: format!(
-                    "network egress `{other}` is not one of allow, deny"
-                ),
+                reason: format!("network egress `{other}` is not one of allow, deny"),
             });
         }
         _ => None,
@@ -1308,7 +1318,9 @@ fn parse_destination(raw: &str) -> Result<Destination, String> {
     }
     if let Some((addr, prefix)) = raw.rsplit_once('/') {
         let Ok(addr) = addr.parse::<std::net::IpAddr>() else {
-            return Err(format!("`{addr}` in `{raw}` is neither an address nor a hostname"));
+            return Err(format!(
+                "`{addr}` in `{raw}` is neither an address nor a hostname"
+            ));
         };
         let Ok(prefix) = prefix.parse::<u8>() else {
             return Err(format!("`{prefix}` in `{raw}` is not a prefix length"));
@@ -1331,7 +1343,9 @@ fn parse_destination(raw: &str) -> Result<Destination, String> {
             !label.is_empty()
                 && !label.starts_with('-')
                 && !label.ends_with('-')
-                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                && label
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
         });
     if !plausible {
         return Err(format!(
@@ -2522,10 +2536,7 @@ mod tests {
 
     #[test]
     fn host_mode_with_a_dns_denial_is_refused() {
-        let layers = [layer(
-            "/base",
-            "[network]\nmode = \"host\"\ndns = \"deny\"",
-        )];
+        let layers = [layer("/base", "[network]\nmode = \"host\"\ndns = \"deny\"")];
         let err = merge(&layers).unwrap_err().to_string();
         assert!(err.contains("DNS denial"), "{err}");
     }
@@ -2650,10 +2661,7 @@ mod tests {
         assert_eq!(
             resolved.policy.network.egress,
             Egress::Allow(vec![EgressRule {
-                host: Destination::Block(
-                    "203.0.113.0".parse().unwrap(),
-                    24
-                ),
+                host: Destination::Block("203.0.113.0".parse().unwrap(), 24),
                 protocol: Protocol::Tcp,
                 port: Some(443),
             }])
@@ -2708,7 +2716,10 @@ mod tests {
     #[test]
     fn a_deny_rule_resolves_and_accumulates_across_layers() {
         let layers = [
-            layer("/base", "[network]\negress_deny = [{ host = \"169.254.169.254\" }]"),
+            layer(
+                "/base",
+                "[network]\negress_deny = [{ host = \"169.254.169.254\" }]",
+            ),
             layer(
                 "/project",
                 "[network]\negress_deny = [{ host = \"169.254.170.2\", port = 80 }]",
