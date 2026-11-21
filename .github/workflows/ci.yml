@@ -31,7 +31,11 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        # `bailey-ebpf` is a no_std BPF program that only ever builds for the
+        # BPF target, which the helper's build script and the guest job below
+        # drive. `--all-features` would force its `bpf` feature on and try to
+        # compile it for the host, which cannot work.
+        run: cargo clippy --workspace --exclude bailey-ebpf --all-targets --all-features -- -D warnings
 
       - name: Build
         run: cargo build --all-targets
