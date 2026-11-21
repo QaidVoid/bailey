@@ -294,7 +294,12 @@ fn parse_request(head: &str, form: Form) -> Result<RequestHead, RequestError> {
     let method = request
         .method
         .ok_or(RequestError::Line("the request line carries no method"))?;
-    if method.eq_ignore_ascii_case("CONNECT") {
+    if !method.bytes().all(|byte| byte.is_ascii_uppercase()) {
+        return Err(RequestError::Line(
+            "the request method is not uppercase letters",
+        ));
+    }
+    if method == "CONNECT" {
         return Err(RequestError::Line("CONNECT is not served inside a tunnel"));
     }
     let target = request
@@ -662,6 +667,20 @@ mod tests {
         parse(head)
             .map(|_| panic!("{head:?} was accepted"))
             .unwrap_err()
+    }
+
+    /// A method reaches the rules exactly as the request spelled it, and
+    /// the rules name methods in uppercase, so a lowercase or mixed-case
+    /// spelling would never match a method rule and slip past every deny
+    /// that names one. The parser refuses anything that is not uppercase
+    /// letters, which the rules can then match verbatim.
+    #[test]
+    fn a_method_outside_uppercase_letters_is_refused() {
+        refused("connect / HTTP/1.1\r\nHost: example.com\r\n\r\n");
+        refused("Delete /x HTTP/1.1\r\nHost: example.com\r\n\r\n");
+        refused("GE-T /x HTTP/1.1\r\nHost: example.com\r\n\r\n");
+        parse_ok("GET /x HTTP/1.1\r\nHost: example.com\r\n\r\n");
+        parse_ok("PROPFIND /x HTTP/1.1\r\nHost: example.com\r\n\r\n");
     }
 
     /// The corpus of request smuggles the codec refuses, one refusal per
