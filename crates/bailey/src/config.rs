@@ -479,9 +479,17 @@ struct Accumulator {
     self_fuse: Option<(bool, PathBuf)>,
     sockets: Vec<SocketRelay>,
     forwards: Vec<PortForward>,
-    /// HTTP rules and bindings for the built-in egress broker, accumulated
-    /// across layers with the layer path of each rule for errors.
-    http: crate::policy::HttpPolicy,
+    /// HTTP interception, rules, bindings and the log for the built-in egress
+    /// broker, accumulated across layers, each with the layer path that
+    /// contributed it so a refusal can name the layer and the rule.
+    http_intercept: Vec<(crate::policy::HttpHost, PathBuf)>,
+    http_allow: Vec<(crate::policy::HttpRule, PathBuf)>,
+    http_deny: Vec<(crate::policy::HttpRule, PathBuf)>,
+    http_credentials: Vec<(crate::policy::CredentialBinding, PathBuf)>,
+    http_log: Option<(PathBuf, PathBuf)>,
+    /// Where the first HTTP rule or binding came from, so a refusal outside
+    /// the parser can name the layer that asked for it.
+    http_source: Option<PathBuf>,
 }
 
 /// Discover the config layers for `target`, lowest precedence first.
@@ -671,7 +679,12 @@ fn apply_layer(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> 
         acc.broker = None;
         // HTTP rules are the same kind of promise made about what may cross
         // the broker, and credentials are a stronger one still.
-        acc.http = crate::policy::HttpPolicy::default();
+        acc.http_intercept.clear();
+        acc.http_allow.clear();
+        acc.http_deny.clear();
+        acc.http_credentials.clear();
+        acc.http_log = None;
+        acc.http_source = None;
     }
     // After the reset, with this layer's grants: a layer that resets and
     // relocates in one breath means to keep its own placement, and clearing
@@ -1036,6 +1049,29 @@ fn build_socket(raw: &RawSocket, path: &Path, base: &Path) -> Result<SocketRelay
 }
 
 fn finalize(mut acc: Accumulator) -> Result<Resolved, ConfigError> {
+    // The HTTP rule set is checked and assembled before the rest of the
+    // policy is taken apart field by field, so it can borrow `acc` freely.
+    let http_intercept = std::mem::take(&mut acc.http_intercept);
+    let http_allow = std::mem::take(&mut acc.http_allow);
+    let http_deny = std::mem::take(&mut acc.http_deny);
+    let http_credentials = std::mem::take(&mut acc.http_credentials);
+    let http_log = acc.http_log.take();
+    let http_source = acc.http_source.clone();
+    check_http(&http_intercept, &http_allow, &http_deny, &http_credentials)?;
+    let http = crate::policy::HttpPolicy {
+        intercept: http_intercept
+            .iter()
+            .map(|(host, _)| host.clone())
+            .collect(),
+        allow: http_allow.iter().map(|(rule, _)| rule.clone()).collect(),
+        deny: http_deny.iter().map(|(rule, _)| rule.clone()).collect(),
+        credentials: http_credentials
+            .iter()
+            .map(|(binding, _)| binding.clone())
+            .collect(),
+        log: http_log.as_ref().map(|(path, _)| path.clone()),
+        source: http_source.as_ref().map(|path| path.display().to_string()),
+    };
     // Self-serve FUSE hands the target mount power over the run's whole
     // namespace, and two guarantees are enforced by mounts the target could
     // then take down: a read-only island is a read-only bind the target could
@@ -1156,7 +1192,7 @@ fn finalize(mut acc: Accumulator) -> Result<Resolved, ConfigError> {
             dns: acc.dns.map(|(dns, _)| dns).unwrap_or_default(),
         }
     };
-    let relocated = acc.relocated;
+    let relocated = acc.relocated.clone();
     let filesystem = acc
         .filesystem
         .into_iter()
@@ -1185,7 +1221,7 @@ fn finalize(mut acc: Accumulator) -> Result<Resolved, ConfigError> {
             fuse: acc.fuse,
             sockets: acc.sockets,
             forwards: acc.forwards,
-            http: acc.http,
+            http,
         },
         hooks: acc.hooks,
     })
@@ -1389,24 +1425,25 @@ fn apply_http(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> {
                 ),
             });
         };
-        if !acc.http.intercept.contains(&host) {
-            acc.http.intercept.push(host);
+        if !acc.http_intercept.iter().any(|(known, _)| known == &host) {
+            acc.http_intercept.push((host, layer.path.clone()));
         }
     }
     for raw in &http.allow {
-        acc.http
-            .allow
-            .push(build_http_rule(raw, &layer.path, "allow")?);
+        acc.http_allow.push((
+            build_http_rule(raw, &layer.path, "allow")?,
+            layer.path.clone(),
+        ));
     }
     for raw in &http.deny {
-        acc.http
-            .deny
-            .push(build_http_rule(raw, &layer.path, "deny")?);
+        acc.http_deny.push((
+            build_http_rule(raw, &layer.path, "deny")?,
+            layer.path.clone(),
+        ));
     }
     for raw in &http.credential {
-        acc.http
-            .credentials
-            .push(build_credential(raw, &layer.path)?);
+        acc.http_credentials
+            .push((build_credential(raw, &layer.path)?, layer.path.clone()));
     }
     if let Some(log) = &http.log {
         let Some(resolved) = resolve_path(log, &layer.base) else {
@@ -1415,9 +1452,159 @@ fn apply_http(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> {
                 reason: format!("http log `{log}` must be an absolute path"),
             });
         };
-        acc.http.log = Some(resolved);
+        acc.http_log = Some((resolved, layer.path.clone()));
+    }
+    let carried_anything = !http.intercept.is_empty()
+        || !http.allow.is_empty()
+        || !http.deny.is_empty()
+        || !http.credential.is_empty()
+        || http.log.is_some();
+    if carried_anything {
+        acc.http_source.get_or_insert_with(|| layer.path.clone());
     }
     Ok(())
+}
+
+/// Header names a credential may not bind to: the ones the broker strips as
+/// hop-by-hop or owns itself, where an attached value would be dropped,
+/// misframed, or would contradict a header the broker writes.
+const FORBIDDEN_CREDENTIAL_HEADERS: [&str; 10] = [
+    "connection",
+    "content-length",
+    "host",
+    "keep-alive",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
+/// Refuse HTTP rules the accumulated layers cannot all honour, whatever the
+/// enforcement does later. Every error names the layer and the rule.
+///
+/// Checked here, where the whole merged rule set is in hand, rather than per
+/// layer: a rule written before any intercept entry may be covered by one a
+/// later layer adds.
+fn check_http(
+    http_intercept: &[(crate::policy::HttpHost, PathBuf)],
+    http_allow: &[(crate::policy::HttpRule, PathBuf)],
+    http_deny: &[(crate::policy::HttpRule, PathBuf)],
+    http_credentials: &[(crate::policy::CredentialBinding, PathBuf)],
+) -> Result<(), ConfigError> {
+    for (listed, path) in http_intercept {
+        if *listed == crate::policy::HttpHost::Any {
+            return Err(ConfigError::Invalid {
+                path: path.clone(),
+                reason: "http intercept `*` would intercept every host; name \
+                         the hosts instead"
+                    .into(),
+            });
+        }
+    }
+
+    // A rule that bounds the method or the path, and every credential, is
+    // only enforceable on a host the broker intercepts: that is where the
+    // request is visible and the rule can be applied. A bare host rule is a
+    // tunnel, and needs no interception.
+    let covered = |host: &crate::policy::HttpHost| {
+        http_intercept
+            .iter()
+            .any(|(listed, _)| host_covered_by(host, listed))
+    };
+    for (rule, path) in http_allow.iter().chain(http_deny) {
+        if rule.methods.is_empty() && rule.path.is_none() {
+            continue;
+        }
+        if !covered(&rule.host) {
+            return Err(ConfigError::Invalid {
+                path: path.clone(),
+                reason: format!(
+                    "http rule for `{}` bounds a method or a path, which needs \
+                     it in the [http] intercept list",
+                    rule.host
+                ),
+            });
+        }
+    }
+    for (credential, path) in http_credentials {
+        if !covered(&credential.host) {
+            return Err(ConfigError::Invalid {
+                path: path.clone(),
+                reason: format!(
+                    "http credential for `{}` needs it in the [http] \
+                     intercept list",
+                    credential.host
+                ),
+            });
+        }
+        if let crate::policy::AuthShape::Header(name) = &credential.auth {
+            let lowered = name.to_ascii_lowercase();
+            if FORBIDDEN_CREDENTIAL_HEADERS.contains(&lowered.as_str()) {
+                return Err(ConfigError::Invalid {
+                    path: path.clone(),
+                    reason: format!(
+                        "http credential header `{name}` is a framing or \
+                         hop-by-hop name the broker owns"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether an intercept entry covers a rule's host: an exact entry matches
+/// itself, a `*.suffix` entry covers every subdomain of the suffix it names.
+fn host_covered_by(host: &crate::policy::HttpHost, listed: &crate::policy::HttpHost) -> bool {
+    use crate::policy::HttpHost;
+    match (host, listed) {
+        (HttpHost::Any, _) => true,
+        (HttpHost::Exact(name), listed) => listed.matches(name),
+        (HttpHost::Wildcard(suffix), HttpHost::Wildcard(listed_suffix)) => suffix == listed_suffix,
+        (HttpHost::Address(addr), listed) => listed.matches(&addr.to_string()),
+        (HttpHost::Wildcard(_), _) => false,
+    }
+}
+
+/// The refusal for HTTP rules that can never be enforced, checked after the
+/// flags are mapped on so a `--egress-proxy builtin` on the command line
+/// satisfies rules written in config.
+///
+/// With egress allowed and no broker there is nothing that could enforce the
+/// rules, so the run is refused. Under an external broker the rules are not
+/// enforced and the caller is warned, which keeps an invocation that carries
+/// a global config with rules working.
+pub(crate) fn check_http_broker(policy: &Policy) -> anyhow::Result<()> {
+    let http = &policy.http;
+    let Some(source) = http.source.as_deref() else {
+        return Ok(());
+    };
+    let denied = matches!(policy.network.egress, crate::policy::Egress::DenyAll);
+    match policy.network.broker {
+        Some(crate::policy::Broker::Builtin) => Ok(()),
+        Some(crate::policy::Broker::External(addr, port)) => {
+            eprintln!(
+                "bailey: warning: the HTTP rules from {source} are not \
+                 enforced: egress goes through the external broker at \
+                 {addr}:{port}, which applies none of them"
+            );
+            Ok(())
+        }
+        None if denied => {
+            eprintln!(
+                "bailey: warning: the HTTP rules from {source} are not in \
+                 force: egress is denied, so no broker runs"
+            );
+            Ok(())
+        }
+        None => anyhow::bail!(
+            "HTTP rules from {source} need the built-in egress broker: set \
+             [network] broker = \"builtin\" or pass --egress-proxy builtin, \
+             or remove the rules"
+        ),
+    }
 }
 
 fn build_egress(
@@ -2799,7 +2986,7 @@ mod tests {
     fn a_credential_binding_parses_all_three_sources() {
         let layers = [layer(
             "/caller",
-            "[[http.credential]]\nhost = \"api.anthropic.com\"\nauth = \"bearer\"\nsource = \"env:KEY\"\n\n[[http.credential]]\nhost = \"api.github.com\"\nauth = \"header:x-api-key\"\nsource = \"file:/run/secrets/key\"\n\n[[http.credential]]\nhost = \"api.openai.com\"\nauth = \"bearer\"\nsource = \"fd:7\"",
+            "[http]\nintercept = [\"api.anthropic.com\", \"api.github.com\", \"api.openai.com\"]\n\n[[http.credential]]\nhost = \"api.anthropic.com\"\nauth = \"bearer\"\nsource = \"env:KEY\"\n\n[[http.credential]]\nhost = \"api.github.com\"\nauth = \"header:x-api-key\"\nsource = \"file:/run/secrets/key\"\n\n[[http.credential]]\nhost = \"api.openai.com\"\nauth = \"bearer\"\nsource = \"fd:7\"",
         )];
         let resolved = merge(&layers).unwrap();
         let creds = &resolved.policy.http.credentials;
@@ -2810,6 +2997,117 @@ mod tests {
             crate::policy::AuthShape::Header("x-api-key".into())
         );
         assert_eq!(creds[2].source, crate::policy::CredentialSource::Fd(7));
+    }
+
+    #[test]
+    fn a_method_or_path_rule_needs_an_intercept_entry() {
+        let err = merge(&[layer(
+            "/base",
+            "[[http.allow]]\nhost = \"api.github.com\"\nmethods = [\"GET\"]\npath = \"/repos/*\"",
+        )])
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("/base"), "{err}");
+        assert!(err.contains("api.github.com"), "{err}");
+        assert!(err.contains("intercept"), "{err}");
+
+        // A wildcard intercept entry covers the subdomains a rule names.
+        let resolved = merge(&[layer(
+            "/base",
+            "[http]\nintercept = [\"*.github.com\"]\n\n[[http.allow]]\nhost = \"api.github.com\"\nmethods = [\"GET\"]",
+        )])
+        .unwrap();
+        assert_eq!(resolved.policy.http.allow.len(), 1);
+
+        // A bare host rule needs no interception.
+        let resolved = merge(&[layer(
+            "/base",
+            "[[http.allow]]\nhost = \"registry.npmjs.org\"",
+        )])
+        .unwrap();
+        assert_eq!(resolved.policy.http.allow.len(), 1);
+    }
+
+    #[test]
+    fn a_star_in_the_intercept_list_is_refused() {
+        let err = merge(&[layer("/base", "[http]\nintercept = [\"*\"]")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("/base"), "{err}");
+        assert!(err.contains("intercept"), "{err}");
+    }
+
+    #[test]
+    fn a_credential_for_an_uncovered_host_is_refused() {
+        let err = merge(&[layer(
+            "/base",
+            "[http]\nintercept = [\"api.anthropic.com\"]\n\n[[http.credential]]\nhost = \"api.openai.com\"\nauth = \"bearer\"\nsource = \"env:KEY\"",
+        )])
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("/base"), "{err}");
+        assert!(err.contains("api.openai.com"), "{err}");
+    }
+
+    #[test]
+    fn a_credential_on_a_framing_or_hop_by_hop_header_is_refused() {
+        for header in [
+            "transfer-encoding",
+            "content-length",
+            "connection",
+            "TE",
+            "host",
+        ] {
+            let err = merge(&[layer(
+                "/base",
+                &format!(
+                    "[http]\nintercept = [\"api.anthropic.com\"]\n\n[[http.credential]]\nhost = \"api.anthropic.com\"\nauth = \"header:{header}\"\nsource = \"env:KEY\""
+                ),
+            )])
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains(header), "{header}: {err}");
+        }
+    }
+
+    #[test]
+    fn http_rules_with_allowed_egress_and_no_broker_are_refused() {
+        let policy_with_rules = |broker: Option<crate::policy::Broker>| {
+            let mut policy = Policy::default();
+            policy.network.egress = Egress::AllowAll;
+            policy.http.source = Some("/caller/bailey.toml".to_owned());
+            policy.http.allow.push(crate::policy::HttpRule {
+                host: crate::policy::HttpHost::parse("api.anthropic.com").unwrap(),
+                port: None,
+                methods: Vec::new(),
+                path: None,
+            });
+            policy.network.broker = broker;
+            policy
+        };
+
+        let err = crate::config::check_http_broker(&policy_with_rules(None)).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("/caller/bailey.toml"), "{text}");
+        assert!(text.contains("builtin"), "{text}");
+
+        // The builtin broker satisfies the rules.
+        crate::config::check_http_broker(&policy_with_rules(Some(crate::policy::Broker::Builtin)))
+            .unwrap();
+
+        // An external broker warns rather than refusing.
+        crate::config::check_http_broker(&policy_with_rules(Some(
+            crate::policy::Broker::External("169.254.169.1".parse().unwrap(), 8443),
+        )))
+        .unwrap();
+    }
+
+    #[test]
+    fn http_rules_with_denied_egress_and_no_broker_warn_only() {
+        let mut policy = Policy::default();
+        policy.network.egress = Egress::DenyAll;
+        policy.http.source = Some("/caller/bailey.toml".to_owned());
+        crate::config::check_http_broker(&policy).unwrap();
     }
 
     #[test]
@@ -2852,10 +3150,7 @@ mod tests {
         let err = raw_layer("[http]\ncache = true").unwrap_err();
         assert!(err.contains("cache"), "{err}");
 
-        let err = raw_layer(
-            "[[http.allow]]\nhost = \"a.example\"\nheaders = []",
-        )
-        .unwrap_err();
+        let err = raw_layer("[[http.allow]]\nhost = \"a.example\"\nheaders = []").unwrap_err();
         assert!(err.contains("headers"), "{err}");
 
         let err = raw_layer(

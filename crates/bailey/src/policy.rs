@@ -555,7 +555,7 @@ impl HttpHost {
 
     /// Whether the host a request names, already lowercase with any trailing
     /// dot stripped, is covered.
-    fn matches(&self, host: &str) -> bool {
+    pub(crate) fn matches(&self, host: &str) -> bool {
         match self {
             Self::Any => true,
             Self::Exact(name) => name == host,
@@ -729,6 +729,9 @@ pub struct HttpPolicy {
     pub credentials: Vec<CredentialBinding>,
     /// The append-only JSONL audit log, or `None`. Caller's own config only.
     pub log: Option<PathBuf>,
+    /// The config layer or flag that contributed the first HTTP rule, for
+    /// the summary and refusals to name.
+    pub source: Option<String>,
 }
 
 impl HttpPolicy {

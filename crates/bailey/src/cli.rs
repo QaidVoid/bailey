@@ -1807,6 +1807,7 @@ fn prepare_network(
         );
     }
     check_network_contradictions(policy, &forwards, &publishes)?;
+    crate::config::check_http_broker(policy)?;
     // Resolved on the host before anything forks, so the creator and the run
     // see the same addresses and an unresolvable name refuses the run before
     // a namespace is built.
