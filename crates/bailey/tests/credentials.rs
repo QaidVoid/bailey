@@ -175,17 +175,15 @@ fn a_credential_rides_the_broker_and_lands_nowhere_else() {
     // sees of the secret's variable, into a file the test reads after.
     fs::write(
         work.join("hook_probe.py"),
-        format!(
-            "import os, sys\n\
-             try:\n\
-             \x20   os.lseek(7, 0, os.SEEK_SET)\n\
-             \x20   data = os.read(7, 64)\n\
-             \x20   seen = 'LEAKED:' + data.decode(errors='replace')\n\
-             except OSError as e:\n\
-             \x20   seen = 'EBADF' if e.errno == 9 else 'ERRNO:%d' % e.errno\n\
-             env = os.environ.get('BAILEY_TEST_SECRET', 'ABSENT')\n\
-             open(sys.argv[1], 'w').write(seen + ' SECRET=' + env + '\\n')\n"
-        ),
+        "import os, sys\n\
+         try:\n\
+         \x20   os.lseek(7, 0, os.SEEK_SET)\n\
+         \x20   data = os.read(7, 64)\n\
+         \x20   seen = 'LEAKED:' + data.decode(errors='replace')\n\
+         except OSError as e:\n\
+         \x20   seen = 'EBADF' if e.errno == 9 else 'ERRNO:%d' % e.errno\n\
+         env = os.environ.get('BAILEY_TEST_SECRET', 'ABSENT')\n\
+         open(sys.argv[1], 'w').write(seen + ' SECRET=' + env + '\\n')\n",
     )
     .unwrap();
 
