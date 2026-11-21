@@ -2593,9 +2593,17 @@ fn a_failing_builtin_helper_refuses_the_run_before_the_target_starts() {
     let cases: [(&str, Option<&str>, bool); 4] = [
         // (name, the helper's stdout answer, whether a helper exists at all)
         ("a missing helper", None, false),
-        ("a wrong protocol version", Some(wrong_version.as_str()), true),
+        (
+            "a wrong protocol version",
+            Some(wrong_version.as_str()),
+            true,
+        ),
         ("a helper that exits before answering", None, true),
-        ("an answer that is not a ready line", Some("garbage\n"), true),
+        (
+            "an answer that is not a ready line",
+            Some("garbage\n"),
+            true,
+        ),
     ];
     for (name, answer, helper_exists) in cases {
         let dir = tempfile::tempdir().unwrap();
@@ -2620,7 +2628,8 @@ with open({started:?}, "w") as marker:
 "#,
             started = started
         );
-        let config = "[network]\negress_allow = [{ host = \"*\", port = 443 }]\nbroker = \"builtin\"\n";
+        let config =
+            "[network]\negress_allow = [{ host = \"*\", port = 443 }]\nbroker = \"builtin\"\n";
         let config_path = dir.path().join("bailey.toml");
         fs::write(&config_path, config).unwrap();
 

@@ -124,7 +124,11 @@ impl RequestHead {
     pub fn serialise(&self, host: &str, port: u16, default_port: u16) -> Vec<u8> {
         let mut out = Vec::with_capacity(256);
         out.extend_from_slice(
-            format!("{} {} HTTP/1.{}\r\n", self.method, self.target, self.version).as_bytes(),
+            format!(
+                "{} {} HTTP/1.{}\r\n",
+                self.method, self.target, self.version
+            )
+            .as_bytes(),
         );
         // The default port may be omitted; anything else names itself.
         if port == default_port {
@@ -281,10 +285,15 @@ fn parse_request(head: &str, form: Form) -> Result<RequestHead, RequestError> {
     let version = match request.version {
         Some(0) => 0,
         Some(1) => 1,
-        _ => return Err(RequestError::Line("the request is not HTTP/1.0 or HTTP/1.1")),
+        _ => {
+            return Err(RequestError::Line(
+                "the request is not HTTP/1.0 or HTTP/1.1",
+            ));
+        }
     };
-    let method =
-        request.method.ok_or(RequestError::Line("the request line carries no method"))?;
+    let method = request
+        .method
+        .ok_or(RequestError::Line("the request line carries no method"))?;
     if method.eq_ignore_ascii_case("CONNECT") {
         return Err(RequestError::Line("CONNECT is not served inside a tunnel"));
     }
@@ -325,12 +334,15 @@ fn parse_request(head: &str, form: Form) -> Result<RequestHead, RequestError> {
         _ => {
             return Err(RequestError::Framing(
                 "the request declares both Content-Length and Transfer-Encoding",
-            ))
+            ));
         }
     };
 
     // A request asking to upgrade is refused before anything is stripped.
-    if listed.iter().any(|(name, _)| name.eq_ignore_ascii_case("upgrade")) {
+    if listed
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("upgrade"))
+    {
         return Err(RequestError::Header("the request asks to upgrade"));
     }
 
@@ -400,7 +412,9 @@ fn split_absolute(target: &str) -> Result<(&str, u16, String), RequestError> {
         None => (rest, "/"),
     };
     if authority.is_empty() {
-        return Err(RequestError::Line("the request-target carries no authority"));
+        return Err(RequestError::Line(
+            "the request-target carries no authority",
+        ));
     }
     if authority.contains('@') {
         return Err(RequestError::Line("the request-target carries userinfo"));
@@ -422,13 +436,13 @@ fn split_absolute(target: &str) -> Result<(&str, u16, String), RequestError> {
         }
     };
     if host.is_empty() {
-        return Err(RequestError::Line("the request-target carries no authority"));
+        return Err(RequestError::Line(
+            "the request-target carries no authority",
+        ));
     }
     let port = match port {
         None => 80,
-        Some("") => {
-            return Err(RequestError::Line("the request-target port is not a port"))
-        }
+        Some("") => return Err(RequestError::Line("the request-target port is not a port")),
         Some(port) => port
             .parse::<u16>()
             .map_err(|_| RequestError::Line("the request-target port is not a port"))?,
@@ -506,7 +520,9 @@ fn framing_of(headers: &[(String, Vec<u8>)]) -> Result<(Vec<u64>, Vec<String>), 
     }
     // Exactly `chunked`, one coding, however many headers named it.
     if codings.len() > 1
-        || codings.first().is_some_and(|coding| !coding.eq_ignore_ascii_case("chunked"))
+        || codings
+            .first()
+            .is_some_and(|coding| !coding.eq_ignore_ascii_case("chunked"))
     {
         return Err(RequestError::Framing(
             "the transfer coding is not exactly chunked",
@@ -552,7 +568,10 @@ fn relay_chunked(reader: &mut impl Read, writer: &mut impl Write) -> io::Result<
         let line = read_line(reader)?;
         let size_text = line.split(';').next().unwrap_or("").trim();
         let size = u64::from_str_radix(size_text, 16).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "bailey: a chunk size is not a size")
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bailey: a chunk size is not a size",
+            )
         })?;
         if size == 0 {
             // The trailer section: every line before the empty one is a
@@ -654,7 +673,9 @@ mod tests {
         let cases: [(String, Option<&str>); 13] = [
             // Content-Length together with Transfer-Encoding.
             (
-                format!("POST /x HTTP/1.1\r\n{base}Content-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n"),
+                format!(
+                    "POST /x HTTP/1.1\r\n{base}Content-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n"
+                ),
                 Some("both Content-Length and Transfer-Encoding"),
             ),
             // A repeated Content-Length, even with the same value.
@@ -692,7 +713,10 @@ mod tests {
             // HTTP/2.0.
             (format!("GET / HTTP/2.0\r\n{base}\r\n"), None),
             // A fragment in the target.
-            (format!("GET /x#frag HTTP/1.1\r\n{base}\r\n"), Some("fragment")),
+            (
+                format!("GET /x#frag HTTP/1.1\r\n{base}\r\n"),
+                Some("fragment"),
+            ),
             // An absolute-form target inside a tunnel.
             (
                 format!("GET http://example.com/x HTTP/1.1\r\n{base}\r\n"),
@@ -705,7 +729,9 @@ mod tests {
             ),
             // An upgrade attempt.
             (
-                format!("GET /x HTTP/1.1\r\n{base}Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n"),
+                format!(
+                    "GET /x HTTP/1.1\r\n{base}Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+                ),
                 Some("upgrade"),
             ),
         ];
@@ -792,7 +818,10 @@ mod tests {
         assert_eq!(head.acl_path(), "/x");
         assert_eq!(head.authority, Some(("example.com".to_owned(), 80)));
         let forwarded = String::from_utf8(head.serialise("example.com", 80, 80)).unwrap();
-        assert_eq!(forwarded, "GET /x?q=1 HTTP/1.1\r\nHost: example.com\r\n\r\n");
+        assert_eq!(
+            forwarded,
+            "GET /x?q=1 HTTP/1.1\r\nHost: example.com\r\n\r\n"
+        );
 
         // A non-default port names itself, and a target with no path names
         // the root.
@@ -802,12 +831,14 @@ mod tests {
         assert_eq!(head.target, "/");
         assert_eq!(head.authority, Some(("example.com".to_owned(), 8080)));
         let forwarded = String::from_utf8(head.serialise("example.com", 8080, 80)).unwrap();
-        assert_eq!(forwarded, "GET / HTTP/1.1\r\nHost: example.com:8080\r\n\r\n");
+        assert_eq!(
+            forwarded,
+            "GET / HTTP/1.1\r\nHost: example.com:8080\r\n\r\n"
+        );
 
         // An IPv6 literal keeps its brackets, in the authority and in the
         // `Host` agreement.
-        let mut reader =
-            "GET http://[::1]:8080/x HTTP/1.1\r\nHost: [::1]:8080\r\n\r\n".as_bytes();
+        let mut reader = "GET http://[::1]:8080/x HTTP/1.1\r\nHost: [::1]:8080\r\n\r\n".as_bytes();
         let head = read_request(&mut reader, Form::Absolute).unwrap();
         assert_eq!(head.authority, Some(("[::1]".to_owned(), 8080)));
         head.check_host("[::1]", 8080, 80).unwrap();
@@ -855,7 +886,10 @@ mod tests {
             parse_ok("PUT /x HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n");
         assert_eq!(head.body, Body::Chunked);
         let forwarded = String::from_utf8(head.serialise("example.com", 443, 443)).unwrap();
-        assert!(forwarded.contains("Transfer-Encoding: chunked\r\n"), "{forwarded}");
+        assert!(
+            forwarded.contains("Transfer-Encoding: chunked\r\n"),
+            "{forwarded}"
+        );
         let mut reader = "4;ext=1\r\nwiki\r\n0\r\n\r\n".as_bytes();
         let mut sink = Vec::new();
         relay_body(&mut reader, &mut sink, head.body).unwrap();
@@ -883,10 +917,9 @@ mod tests {
         }
         // Two Host headers are refused by the agreement check, not the
         // parse.
-        let two_hosts =
-            parse("GET / HTTP/1.1\r\nHost: example.com\r\nHost: example.com\r\n\r\n")
-                .map(|head| head.check_host("example.com", 443, 443).is_err())
-                .unwrap_or(true);
+        let two_hosts = parse("GET / HTTP/1.1\r\nHost: example.com\r\nHost: example.com\r\n\r\n")
+            .map(|head| head.check_host("example.com", 443, 443).is_err())
+            .unwrap_or(true);
         assert!(two_hosts, "two Host headers were accepted");
         // No Host header at all is refused the same way.
         let no_host = parse("GET / HTTP/1.1\r\nAccept: x\r\n\r\n")
@@ -950,7 +983,10 @@ mod tests {
         );
         head.attach_header("Authorization", "Bearer secret");
         let forwarded = String::from_utf8(head.serialise("x.test", 443, 443)).unwrap();
-        assert!(forwarded.contains("Authorization: Bearer secret\r\n"), "{forwarded}");
+        assert!(
+            forwarded.contains("Authorization: Bearer secret\r\n"),
+            "{forwarded}"
+        );
         assert!(!forwarded.contains("attacker"), "{forwarded}");
         assert!(!forwarded.contains("again"), "{forwarded}");
         assert!(forwarded.contains("X-Trail: kept\r\n"), "{forwarded}");

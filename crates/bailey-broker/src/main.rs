@@ -9,8 +9,8 @@
 use std::io::{self, Write};
 use std::net::TcpListener;
 use std::os::unix::io::{AsRawFd, FromRawFd};
-use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
 use bailey_broker::audit::AuditLog;
 use bailey_broker::{tls, tunnel};
@@ -161,9 +161,7 @@ fn run() -> i32 {
     // decisions still serve, and the counts line still tells the parent
     // how the run went.
     let listener = unsafe { TcpListener::from_raw_fd(3) };
-    let log_file = config
-        .log
-        .then(|| unsafe { std::fs::File::from_raw_fd(4) });
+    let log_file = config.log.then(|| unsafe { std::fs::File::from_raw_fd(4) });
     let audit = Arc::new(AuditLog::new(log_file));
     let config = Arc::new(config);
     let authority = Arc::new(authority);
@@ -312,7 +310,9 @@ fn run() -> i32 {
 fn refuse_over_cap(stream: std::net::TcpStream) {
     use std::io::Write;
     let mut stream = stream;
-    let _ = stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+    let _ = stream.write_all(
+        b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+    );
     let _ = stream.shutdown(std::net::Shutdown::Both);
 }
 
@@ -397,10 +397,7 @@ fn run_selftest_probes(descriptors: &[u32]) {
     );
 
     if let Some(path) = std::env::var_os("BAILEY_BROKER_SELFTEST_UNIX_PATH") {
-        println!(
-            "probe unix-path={}",
-            probe_result(connect_unix_path(&path))
-        );
+        println!("probe unix-path={}", probe_result(connect_unix_path(&path)));
     }
     if let Ok(name) = std::env::var("BAILEY_BROKER_SELFTEST_UNIX_ABSTRACT") {
         println!(
@@ -453,9 +450,8 @@ fn connect_unix_path(path: &std::ffi::OsStr) -> io::Result<()> {
     };
     let bytes = path.as_encoded_bytes();
     let len = bytes.len().min(address.sun_path.len() - 1);
-    address.sun_path[..len].copy_from_slice(unsafe {
-        std::slice::from_raw_parts(bytes.as_ptr().cast(), len)
-    });
+    address.sun_path[..len]
+        .copy_from_slice(unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast(), len) });
     let result = unsafe {
         libc::connect(
             fd,
@@ -484,9 +480,8 @@ fn connect_unix_abstract(name: &str) -> io::Result<()> {
     };
     let bytes = name.as_bytes();
     let len = bytes.len().min(address.sun_path.len() - 1);
-    address.sun_path[1..=len].copy_from_slice(unsafe {
-        std::slice::from_raw_parts(bytes.as_ptr().cast(), len)
-    });
+    address.sun_path[1..=len]
+        .copy_from_slice(unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast(), len) });
     let address_len =
         (std::mem::offset_of!(libc::sockaddr_un, sun_path) + 1 + len) as libc::socklen_t;
     let result = unsafe {

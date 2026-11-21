@@ -448,9 +448,7 @@ impl EnforceBackend {
             NetworkMode::Isolated => report.applied("network namespace"),
             NetworkMode::Private => report.applied("network namespace (private)"),
             NetworkMode::Brokered => match policy.network.broker {
-                Some(crate::policy::Broker::Builtin) => {
-                    report.applied("egress broker (built-in)")
-                }
+                Some(crate::policy::Broker::Builtin) => report.applied("egress broker (built-in)"),
                 Some(crate::policy::Broker::External(..)) => {
                     report.applied("egress broker (external)")
                 }
@@ -688,10 +686,7 @@ impl EnforceBackend {
         };
         // The bundle file inside the per-run directory, what the plan binds
         // and what the CA variables name when nothing covers it.
-        let ca_bundle_file = self
-            .ca_bundle
-            .as_ref()
-            .map(|dir| dir.join("ca-bundle.pem"));
+        let ca_bundle_file = self.ca_bundle.as_ref().map(|dir| dir.join("ca-bundle.pem"));
         let generated_policy;
         let policy = if let Some((_, files)) = &generated_files {
             generated_policy = policy_with_generated(policy, files);
@@ -1946,9 +1941,10 @@ fn build_isolation_plan(
             if conceal.iter().any(|cover| path.starts_with(&cover.path)) {
                 continue;
             }
-            let present = binds.iter().any(|bind| {
-                (bind.is_dir && path.starts_with(&bind.at)) || bind.at == path
-            }) || links.iter().any(|link| link.at == path);
+            let present = binds
+                .iter()
+                .any(|bind| (bind.is_dir && path.starts_with(&bind.at)) || bind.at == path)
+                || links.iter().any(|link| link.at == path);
             if present {
                 if ca_bundle_visible.is_none() {
                     ca_bundle_visible = Some(path.clone());
@@ -3053,9 +3049,7 @@ pub fn confine_broker(http: &crate::policy::HttpPolicy) -> io::Result<crate::bro
             if let Ok(file) = std::fs::File::open(path) {
                 created = created
                     .add_rule(PathBeneath::new(&file, read))
-                    .map_err(|error| {
-                        io::Error::other(format!("landlock grant {path}: {error}"))
-                    })?;
+                    .map_err(|error| io::Error::other(format!("landlock grant {path}: {error}")))?;
             }
         }
         // The upstream TLS sessions verify certificates against the host's
@@ -3067,9 +3061,7 @@ pub fn confine_broker(http: &crate::policy::HttpPolicy) -> io::Result<crate::bro
             if let Ok(file) = std::fs::File::open(path) {
                 created = created
                     .add_rule(PathBeneath::new(&file, AccessFs::ReadFile))
-                    .map_err(|error| {
-                        io::Error::other(format!("landlock grant {path}: {error}"))
-                    })?;
+                    .map_err(|error| io::Error::other(format!("landlock grant {path}: {error}")))?;
             }
             if let Some(dir) = std::path::Path::new(path).parent()
                 && let Ok(handle) = std::fs::File::open(dir)
@@ -3077,10 +3069,7 @@ pub fn confine_broker(http: &crate::policy::HttpPolicy) -> io::Result<crate::bro
                 created = created
                     .add_rule(PathBeneath::new(&handle, read))
                     .map_err(|error| {
-                        io::Error::other(format!(
-                            "landlock grant {}: {error}",
-                            dir.display()
-                        ))
+                        io::Error::other(format!("landlock grant {}: {error}", dir.display()))
                     })?;
             }
         }
@@ -3116,8 +3105,8 @@ pub fn confine_broker(http: &crate::policy::HttpPolicy) -> io::Result<crate::bro
             return Err(io::Error::last_os_error());
         }
     }
-    let program = broker_seccomp_program()
-        .map_err(|error| io::Error::other(format!("seccomp: {error}")))?;
+    let program =
+        broker_seccomp_program().map_err(|error| io::Error::other(format!("seccomp: {error}")))?;
     seccompiler::apply_filter(&program)
         .map_err(|error| io::Error::other(format!("seccomp: {error}")))?;
     layers.seccomp = true;
@@ -3447,7 +3436,8 @@ mod tests {
     /// since only a run holds the guard that removes it.
     fn plan_for(policy: &Policy, implicit: &[PathBuf]) -> IsolationPlan {
         let world = World::derive(Path::new("/bin/true"), policy, true);
-        let plan = build_isolation_plan(policy, NetworkMode::Isolated, &world, implicit, None).unwrap();
+        let plan =
+            build_isolation_plan(policy, NetworkMode::Isolated, &world, implicit, None).unwrap();
         let _ = std::fs::remove_dir(&plan.staging);
         plan
     }
@@ -4041,13 +4031,13 @@ mod tests {
                     }
                 };
                 let mut pair = [0 as libc::c_int; 2];
-                let paired = libc::socketpair(
-                    libc::AF_UNIX,
-                    libc::SOCK_STREAM,
-                    0,
-                    pair.as_mut_ptr(),
-                );
-                let pair_errno = if paired == 0 { 0 } else { *libc::__errno_location() };
+                let paired =
+                    libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, pair.as_mut_ptr());
+                let pair_errno = if paired == 0 {
+                    0
+                } else {
+                    *libc::__errno_location()
+                };
                 if errno_of(libc::AF_UNIX) != libc::EPERM {
                     libc::_exit(1);
                 }
@@ -4365,7 +4355,8 @@ mod tests {
         );
 
         // A concurrent run stages beside this one, never at its name.
-        let other = build_isolation_plan(&policy, NetworkMode::Isolated, &world, &[], None).unwrap();
+        let other =
+            build_isolation_plan(&policy, NetworkMode::Isolated, &world, &[], None).unwrap();
         assert_ne!(plan.staging, other.staging, "the name is fresh per run");
 
         let _ = std::fs::remove_dir(&plan.staging);

@@ -765,11 +765,7 @@ fn conceal_all(new_root: &Path, conceal: &[Conceal]) -> io::Result<()> {
 /// refused, the same rule the read-only islands apply.
 ///
 /// @returns how many paths the bundle landed on.
-fn mount_ca_bundle(
-    new_root: &Path,
-    source: &Path,
-    overlays: &[PathBuf],
-) -> io::Result<usize> {
+fn mount_ca_bundle(new_root: &Path, source: &Path, overlays: &[PathBuf]) -> io::Result<usize> {
     let mut landed = 0;
     for path in overlays {
         let relative = path.strip_prefix("/").unwrap_or(path);
@@ -805,10 +801,7 @@ fn mount_ca_bundle(
             None::<&str>,
             &visible,
             None::<&str>,
-            MsFlags::MS_REMOUNT
-                | MsFlags::MS_BIND
-                | MsFlags::MS_RDONLY
-                | locked_flags(carried),
+            MsFlags::MS_REMOUNT | MsFlags::MS_BIND | MsFlags::MS_RDONLY | locked_flags(carried),
             None::<&str>,
         )
         .map_err(errno)?;

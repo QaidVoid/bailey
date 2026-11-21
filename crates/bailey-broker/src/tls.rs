@@ -15,11 +15,11 @@ use std::time::{Duration, Instant};
 
 use bailey::policy::HttpHost;
 use rcgen::{
-    BasicConstraints, CertificateParams, CidrSubnet, ExtendedKeyUsagePurpose, GeneralSubtree,
-    IsCa, KeyPair, KeyUsagePurpose, NameConstraints, SanType, PKCS_ECDSA_P256_SHA256,
+    BasicConstraints, CertificateParams, CidrSubnet, ExtendedKeyUsagePurpose, GeneralSubtree, IsCa,
+    KeyPair, KeyUsagePurpose, NameConstraints, PKCS_ECDSA_P256_SHA256, SanType,
 };
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use time::OffsetDateTime;
 
 /// How long the CA outlives its run. A leaked key matters only while it is
@@ -227,8 +227,7 @@ impl CertificateAuthority {
         leaves.insert(
             host.to_owned(),
             CachedLeaf {
-                deadline: Instant::now()
-                    + Duration::from_secs(LEAF_LIFETIME_SECS as u64)
+                deadline: Instant::now() + Duration::from_secs(LEAF_LIFETIME_SECS as u64)
                     - REISSUE_MARGIN,
                 server_config: Arc::clone(&server_config),
             },
@@ -252,7 +251,8 @@ impl CertificateAuthority {
         leaf_params.subject_alt_names = match host.parse::<std::net::IpAddr>() {
             Ok(ip) => vec![SanType::IpAddress(ip)],
             Err(_) => vec![SanType::DnsName(
-                host.try_into().map_err(|_| TlsError::NotIntercepted(host.to_owned()))?,
+                host.try_into()
+                    .map_err(|_| TlsError::NotIntercepted(host.to_owned()))?,
             )],
         };
         let mut distinguished_name = rcgen::DistinguishedName::new();
@@ -264,9 +264,7 @@ impl CertificateAuthority {
             .signed_by(&leaf_key, &self.ca_cert, &self.ca_key)
             .map_err(TlsError::Rcgen)?;
 
-        let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-            leaf_key.serialize_der(),
-        ));
+        let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
         ServerConfig::builder_with_provider(ring_provider())
             .with_safe_default_protocol_versions()
             .map_err(TlsError::Rustls)?
@@ -290,10 +288,12 @@ fn host_covered(host: &str, listed: &HttpHost) -> bool {
     match listed {
         HttpHost::Any => true,
         HttpHost::Exact(name) => name == host,
-        HttpHost::Wildcard(suffix) => host != suffix.as_str()
-            && host
-                .strip_suffix(suffix.as_str())
-                .is_some_and(|rest| rest.ends_with('.')),
+        HttpHost::Wildcard(suffix) => {
+            host != suffix.as_str()
+                && host
+                    .strip_suffix(suffix.as_str())
+                    .is_some_and(|rest| rest.ends_with('.'))
+        }
         HttpHost::Address(addr) => host
             .parse()
             .is_ok_and(|parsed: std::net::IpAddr| parsed == *addr),
@@ -404,7 +404,11 @@ mod tests {
     fn the_intercept_test_matches_the_leaf_coverage() {
         let authority = authority();
         for host in ["api.github.com", "registry.npmjs.org", "npmjs.org", "x"] {
-            assert_eq!(authority.is_intercepted(host), authority.server_config(host).is_ok(), "{host}");
+            assert_eq!(
+                authority.is_intercepted(host),
+                authority.server_config(host).is_ok(),
+                "{host}"
+            );
         }
     }
 

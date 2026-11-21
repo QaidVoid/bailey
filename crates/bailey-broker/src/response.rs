@@ -79,9 +79,7 @@ impl ResponseHead {
     /// to close. A close-delimited body ends the connection with the
     /// response, so it never carries another.
     pub fn keep_alive(&self, request_close: bool) -> bool {
-        !matches!(self.body, BodyKind::UntilClose)
-            && !request_close
-            && !self.server_close
+        !matches!(self.body, BodyKind::UntilClose) && !request_close && !self.server_close
     }
 
     /// The forwarded response head: the line as received, the kept
@@ -91,7 +89,11 @@ impl ResponseHead {
     pub fn serialise(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(256);
         out.extend_from_slice(
-            format!("HTTP/1.{} {} {}\r\n", self.version, self.status, self.reason).as_bytes(),
+            format!(
+                "HTTP/1.{} {} {}\r\n",
+                self.version, self.status, self.reason
+            )
+            .as_bytes(),
         );
         for (name, value) in &self.headers {
             out.extend_from_slice(name.as_bytes());
@@ -145,7 +147,11 @@ pub fn read_step(reader: &mut impl Read, method: &str) -> Result<Step, ResponseE
     let version = match response.version {
         Some(0) => 0,
         Some(1) => 1,
-        _ => return Err(ResponseError::Head("the response is not HTTP/1.0 or HTTP/1.1")),
+        _ => {
+            return Err(ResponseError::Head(
+                "the response is not HTTP/1.0 or HTTP/1.1",
+            ));
+        }
     };
 
     let listed = header_list(response.headers);
@@ -277,7 +283,9 @@ fn read_head(reader: &mut impl Read) -> Result<String, ResponseError> {
             .read(&mut byte)
             .map_err(|_| ResponseError::Truncated("the response head could not be read"))?;
         if read == 0 {
-            return Err(ResponseError::Truncated("the response ends before its head"));
+            return Err(ResponseError::Truncated(
+                "the response ends before its head",
+            ));
         }
         head.push(byte[0]);
         if head.ends_with(b"\r\n\r\n") || head.ends_with(b"\n\n") {
@@ -337,9 +345,8 @@ fn relay_chunked(reader: &mut impl Read, writer: &mut impl Write) -> Result<(), 
     loop {
         let line = read_line(reader)?;
         let size_text = line.split(';').next().unwrap_or("").trim();
-        let size = u64::from_str_radix(size_text, 16).map_err(|_| {
-            ResponseError::Framing("a chunk size in the response is not a size")
-        })?;
+        let size = u64::from_str_radix(size_text, 16)
+            .map_err(|_| ResponseError::Framing("a chunk size in the response is not a size"))?;
         if size == 0 {
             // The trailer section belongs to the upstream's own framing
             // and is dropped: the re-encoded body ends with the
@@ -357,9 +364,9 @@ fn relay_chunked(reader: &mut impl Read, writer: &mut impl Write) -> Result<(), 
         let mut buffer = [0u8; 16 * 1024];
         while remaining > 0 {
             let want = buffer.len().min(remaining as usize);
-            let read = reader.read(&mut buffer[..want]).map_err(|_| {
-                ResponseError::Truncated("the upstream failed mid-chunk")
-            })?;
+            let read = reader
+                .read(&mut buffer[..want])
+                .map_err(|_| ResponseError::Truncated("the upstream failed mid-chunk"))?;
             if read == 0 {
                 return Err(ResponseError::Truncated(
                     "the upstream ended before the last chunk",
@@ -387,10 +394,7 @@ fn relay_chunked(reader: &mut impl Read, writer: &mut impl Write) -> Result<(), 
 /// Copy until the upstream ends. A clean end completes the body; an error
 /// is a truncation, the client's own signal being the connection that
 /// never completed.
-fn relay_until_close(
-    reader: &mut impl Read,
-    writer: &mut impl Write,
-) -> Result<(), ResponseError> {
+fn relay_until_close(reader: &mut impl Read, writer: &mut impl Write) -> Result<(), ResponseError> {
     let mut buffer = [0u8; 16 * 1024];
     loop {
         let read = match reader.read(&mut buffer) {
@@ -399,7 +403,7 @@ fn relay_until_close(
             Err(_) => {
                 return Err(ResponseError::Truncated(
                     "the upstream ended the response without completing it",
-                ))
+                ));
             }
         };
         writer
@@ -466,10 +470,7 @@ mod tests {
     /// connection may carry another request.
     #[test]
     fn a_response_to_head_has_no_body() {
-        let head = final_for(
-            "HEAD",
-            "HTTP/1.1 200 OK\r\nContent-Length: 500\r\n\r\n",
-        );
+        let head = final_for("HEAD", "HTTP/1.1 200 OK\r\nContent-Length: 500\r\n\r\n");
         assert_eq!(head.body, BodyKind::None);
         assert!(head.keep_alive(false), "HEAD keeps the connection alive");
         let mut reader = &b""[..];
@@ -571,7 +572,10 @@ mod tests {
     fn a_close_delimited_body_ends_with_the_connection() {
         let head = final_of("HTTP/1.1 200 OK\r\n\r\n");
         assert_eq!(head.body, BodyKind::UntilClose);
-        assert!(!head.keep_alive(false), "a close-delimited body ends the connection");
+        assert!(
+            !head.keep_alive(false),
+            "a close-delimited body ends the connection"
+        );
 
         let mut reader = "body".as_bytes();
         let mut sink = Vec::new();
@@ -606,7 +610,8 @@ mod tests {
 
         let head = final_of("HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\n");
         assert!(head.server_close, "HTTP/1.0 closes unless it keeps alive");
-        let head = final_of("HTTP/1.0 200 OK\r\nContent-Length: 5\r\nConnection: keep-alive\r\n\r\n");
+        let head =
+            final_of("HTTP/1.0 200 OK\r\nContent-Length: 5\r\nConnection: keep-alive\r\n\r\n");
         assert!(!head.server_close);
     }
 

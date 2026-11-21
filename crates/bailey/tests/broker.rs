@@ -18,8 +18,7 @@ fn broker() -> std::path::PathBuf {
         .unwrap_or_else(|_| {
             // The broker lands beside the bailey binary in the same target
             // directory, which is also how bailey finds it beside itself.
-            std::path::Path::new(env!("CARGO_BIN_EXE_bailey"))
-                .with_file_name("bailey-broker")
+            std::path::Path::new(env!("CARGO_BIN_EXE_bailey")).with_file_name("bailey-broker")
         });
     assert!(
         path.exists(),
@@ -123,9 +122,8 @@ fn bind_path_socket(path: &std::path::Path) -> std::io::Result<i32> {
     };
     let bytes = path.as_os_str().as_encoded_bytes();
     let len = bytes.len().min(address.sun_path.len() - 1);
-    address.sun_path[..len].copy_from_slice(unsafe {
-        std::slice::from_raw_parts(bytes.as_ptr().cast(), len)
-    });
+    address.sun_path[..len]
+        .copy_from_slice(unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast(), len) });
     let bound = unsafe {
         libc::bind(
             fd,
@@ -158,9 +156,8 @@ fn bind_abstract_socket(name: &str) -> std::io::Result<i32> {
     };
     let bytes = name.as_bytes();
     let len = bytes.len().min(address.sun_path.len() - 1);
-    address.sun_path[1..=len].copy_from_slice(unsafe {
-        std::slice::from_raw_parts(bytes.as_ptr().cast(), len)
-    });
+    address.sun_path[1..=len]
+        .copy_from_slice(unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast(), len) });
     let address_len =
         (std::mem::offset_of!(libc::sockaddr_un, sun_path) + 1 + len) as libc::socklen_t;
     let bound = unsafe {
@@ -249,7 +246,10 @@ fn a_confined_broker_cannot_reach_the_callers_files_or_unix_sockets() {
     // Pathname and abstract UNIX sockets both fail, even though services are
     // listening on them.
     let path = probe_value(&probes, "unix-path");
-    assert!(path != "ok", "the broker reached a pathname socket: {probes:?}");
+    assert!(
+        path != "ok",
+        "the broker reached a pathname socket: {probes:?}"
+    );
     let abstract_value = probe_value(&probes, "unix-abstract");
     assert!(
         abstract_value != "ok",
@@ -259,7 +259,10 @@ fn a_confined_broker_cannot_reach_the_callers_files_or_unix_sockets() {
     assert_eq!(probe_value(&probes, "inet-socket"), "ok", "{probes:?}");
     // The ungranted TCP port is refused by Landlock, not by the address.
     let tcp = probe_value(&probes, "tcp-connect");
-    assert!(tcp != "ok", "the broker connected to an ungranted port: {probes:?}");
+    assert!(
+        tcp != "ok",
+        "the broker connected to an ungranted port: {probes:?}"
+    );
 
     // Hold the listeners to the end of the test: the probes must answer
     // against services that are listening.

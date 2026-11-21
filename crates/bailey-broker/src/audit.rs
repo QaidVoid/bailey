@@ -5,8 +5,8 @@ use std::fs::File;
 use std::io::Write;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 /// One decision, in the shape the log line carries.
 pub struct AuditEntry<'a> {

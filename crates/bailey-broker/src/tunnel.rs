@@ -15,15 +15,15 @@ use std::io::{self, Read, Write};
 use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
-use bailey::broker::BrokerConfig;
-use bailey::policy::{request_host, Decision, HttpRequest};
 use crate::audit::{AuditEntry, AuditLog};
 use crate::request;
 use crate::response;
+use bailey::broker::BrokerConfig;
+use bailey::policy::{Decision, HttpRequest, request_host};
 use rustls::StreamOwned;
+use rustls::client::ClientConnection;
 use rustls::pki_types::ServerName;
 use rustls::server::ServerConnection;
-use rustls::client::ClientConnection;
 
 /// The request head is read before anything is decided, so it is bounded.
 const MAX_HEAD: usize = 8 * 1024;
@@ -186,9 +186,7 @@ fn serve(
             return Ok(());
         }
         Decision::Allowed(rule) => {
-            let intercepted = authority
-                .as_ref()
-                .is_some_and(|ca| ca.is_intercepted(host));
+            let intercepted = authority.as_ref().is_some_and(|ca| ca.is_intercepted(host));
             record_allowed(
                 audit,
                 "CONNECT",
@@ -234,7 +232,9 @@ fn serve(
     // returns are filtered, and the first survivor is dialled; the name is
     // never resolved again.
     let addresses = (host, request.port).to_socket_addrs()?;
-    let checked = addresses.map(|address| address.ip()).find(|ip| is_dialable(*ip));
+    let checked = addresses
+        .map(|address| address.ip())
+        .find(|ip| is_dialable(*ip));
     let Some(ip) = checked else {
         // A name that resolves only to addresses the broker refuses ends
         // the tunnel.
@@ -338,17 +338,37 @@ fn terminate(
                     "403 Forbidden",
                     &format!("bailey: {reason}\r\n"),
                 )?;
-                record_refused(audit, &head.method, host, port, head.acl_path(), &reason, &rule);
+                record_refused(
+                    audit,
+                    &head.method,
+                    host,
+                    port,
+                    head.acl_path(),
+                    &reason,
+                    &rule,
+                );
                 break;
             }
             Decision::Refused => {
-                let reason = format!("{} {} denied: no rule allows it", head.method, head.acl_path());
+                let reason = format!(
+                    "{} {} denied: no rule allows it",
+                    head.method,
+                    head.acl_path()
+                );
                 write_answer(
                     &mut client_tls,
                     "403 Forbidden",
                     &format!("bailey: {reason}\r\n"),
                 )?;
-                record_refused(audit, &head.method, host, port, head.acl_path(), &reason, "");
+                record_refused(
+                    audit,
+                    &head.method,
+                    host,
+                    port,
+                    head.acl_path(),
+                    &reason,
+                    "",
+                );
                 break;
             }
             Decision::Allowed(rule) => {
@@ -368,7 +388,15 @@ fn terminate(
                 "403 Forbidden",
                 &format!("bailey: {reason}\r\n"),
             )?;
-            record_refused(audit, &head.method, host, port, head.acl_path(), &reason, "");
+            record_refused(
+                audit,
+                &head.method,
+                host,
+                port,
+                head.acl_path(),
+                &reason,
+                "",
+            );
             break;
         }
 
@@ -384,18 +412,17 @@ fn terminate(
         // the certificate verified for the CONNECT name. The
         // dial happens per request, after the request passed.
         let addresses = (host, port).to_socket_addrs()?;
-        let Some(ip) =
-            addresses.map(|address| address.ip()).find(|ip| is_dialable(*ip))
+        let Some(ip) = addresses
+            .map(|address| address.ip())
+            .find(|ip| is_dialable(*ip))
         else {
             // A name that resolves only to addresses the broker refuses
             // ends the tunnel. The request passed, and got no answer.
             record_pending(audit, &mut pending, host, port, true);
             break;
         };
-        let upstream = TcpStream::connect_timeout(
-            &std::net::SocketAddr::new(ip, port),
-            DIAL_TIMEOUT,
-        )?;
+        let upstream =
+            TcpStream::connect_timeout(&std::net::SocketAddr::new(ip, port), DIAL_TIMEOUT)?;
         upstream.set_nodelay(true).ok();
         let client_config = crate::tls::upstream_config()
             .map_err(|error| io::Error::other(format!("the host's trust roots: {error}")))?;
@@ -432,7 +459,8 @@ fn terminate(
 
         // The response, one interim at a time until the final one, relayed
         // under its own state machine.
-        let keep_alive;        loop {
+        let keep_alive;
+        loop {
             match response::read_step(&mut upstream_tls, &head.method) {
                 Ok(response::Step::Interim(raw)) => {
                     if client_tls.write_all(&raw).is_err() {
@@ -537,14 +565,30 @@ fn serve_cleartext(
             None => {
                 let reason = "the request's authority is not a servable name";
                 write_answer(&mut client, "403 Forbidden", &format!("{reason}\r\n"))?;
-                record_refused(audit, &head.method, &raw_host, port, head.acl_path(), reason, "");
+                record_refused(
+                    audit,
+                    &head.method,
+                    &raw_host,
+                    port,
+                    head.acl_path(),
+                    reason,
+                    "",
+                );
                 break;
             }
         };
         if let Err(error) = head.check_host(&host, port, 80) {
             let reason = format!("{error}");
             write_answer(&mut client, "403 Forbidden", &format!("{reason}\r\n"))?;
-            record_refused(audit, &head.method, &host, port, head.acl_path(), &reason, "");
+            record_refused(
+                audit,
+                &head.method,
+                &host,
+                port,
+                head.acl_path(),
+                &reason,
+                "",
+            );
             break;
         }
         let acl_request = HttpRequest {
@@ -558,14 +602,42 @@ fn serve_cleartext(
             Decision::Denied(rule) => {
                 let rule = rule_name("deny", config, &config.http.deny, rule);
                 let reason = format!("{} {} denied by {rule}", head.method, head.acl_path());
-                write_answer(&mut client, "403 Forbidden", &format!("bailey: {reason}\r\n"))?;
-                record_refused(audit, &head.method, &host, port, head.acl_path(), &reason, &rule);
+                write_answer(
+                    &mut client,
+                    "403 Forbidden",
+                    &format!("bailey: {reason}\r\n"),
+                )?;
+                record_refused(
+                    audit,
+                    &head.method,
+                    &host,
+                    port,
+                    head.acl_path(),
+                    &reason,
+                    &rule,
+                );
                 break;
             }
             Decision::Refused => {
-                let reason = format!("{} {} denied: no rule allows it", head.method, head.acl_path());
-                write_answer(&mut client, "403 Forbidden", &format!("bailey: {reason}\r\n"))?;
-                record_refused(audit, &head.method, &host, port, head.acl_path(), &reason, "");
+                let reason = format!(
+                    "{} {} denied: no rule allows it",
+                    head.method,
+                    head.acl_path()
+                );
+                write_answer(
+                    &mut client,
+                    "403 Forbidden",
+                    &format!("bailey: {reason}\r\n"),
+                )?;
+                record_refused(
+                    audit,
+                    &head.method,
+                    &host,
+                    port,
+                    head.acl_path(),
+                    &reason,
+                    "",
+                );
                 break;
             }
             Decision::Allowed(rule) => {
@@ -580,8 +652,20 @@ fn serve_cleartext(
         // about, and what reaches the upstream is what the rule matched.
         if !bailey::policy::is_canonical_path(head.acl_path()) {
             let reason = format!("the path {} is not canonical", head.acl_path());
-            write_answer(&mut client, "403 Forbidden", &format!("bailey: {reason}\r\n"))?;
-            record_refused(audit, &head.method, &host, port, head.acl_path(), &reason, "");
+            write_answer(
+                &mut client,
+                "403 Forbidden",
+                &format!("bailey: {reason}\r\n"),
+            )?;
+            record_refused(
+                audit,
+                &head.method,
+                &host,
+                port,
+                head.acl_path(),
+                &reason,
+                "",
+            );
             break;
         }
 
@@ -594,26 +678,37 @@ fn serve_cleartext(
                 head.method,
                 head.acl_path()
             );
-            write_answer(&mut client, "403 Forbidden", &format!("bailey: {reason}\r\n"))?;
-            record_refused(audit, &head.method, &host, port, head.acl_path(), &reason, "");
+            write_answer(
+                &mut client,
+                "403 Forbidden",
+                &format!("bailey: {reason}\r\n"),
+            )?;
+            record_refused(
+                audit,
+                &head.method,
+                &host,
+                port,
+                head.acl_path(),
+                &reason,
+                "",
+            );
             break;
         }
 
         // The upstream connection, resolved and dialled only after the
         // request passed.
         let addresses = (host.as_str(), port).to_socket_addrs()?;
-        let Some(ip) =
-            addresses.map(|address| address.ip()).find(|ip| is_dialable(*ip))
+        let Some(ip) = addresses
+            .map(|address| address.ip())
+            .find(|ip| is_dialable(*ip))
         else {
             // A name that resolves only to addresses the broker refuses
             // ends the connection. The request passed, and got no answer.
             record_pending(audit, &mut pending, &host, port, false);
             break;
         };
-        let mut upstream = TcpStream::connect_timeout(
-            &std::net::SocketAddr::new(ip, port),
-            DIAL_TIMEOUT,
-        )?;
+        let mut upstream =
+            TcpStream::connect_timeout(&std::net::SocketAddr::new(ip, port), DIAL_TIMEOUT)?;
         upstream.set_nodelay(true).ok();
         upstream.set_write_timeout(Some(DIAL_TIMEOUT))?;
         upstream.set_read_timeout(Some(RESPONSE_TIMEOUT))?;
@@ -705,7 +800,9 @@ fn abort(
 /// The header name and value one resolved credential attaches as.
 fn attached_header(credential: &bailey::broker::BrokerCredential) -> (&str, String) {
     match &credential.auth {
-        bailey::policy::AuthShape::Bearer => ("Authorization", format!("Bearer {}", credential.value)),
+        bailey::policy::AuthShape::Bearer => {
+            ("Authorization", format!("Bearer {}", credential.value))
+        }
         bailey::policy::AuthShape::Header(name) => (name, credential.value.clone()),
     }
 }

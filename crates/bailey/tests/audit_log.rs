@@ -84,10 +84,7 @@ fn a_symlinked_log_refuses_the_run() {
         stderr.contains("not a regular file"),
         "the refusal names the shape: {stderr}"
     );
-    assert!(
-        !target.exists(),
-        "the link's target was never created"
-    );
+    assert!(!target.exists(), "the link's target was never created");
 }
 
 /// A log path whose file belongs to someone else is refused, and nothing is

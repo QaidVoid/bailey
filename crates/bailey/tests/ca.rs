@@ -45,11 +45,7 @@ fn directories_of(pid: u32) -> Vec<std::path::PathBuf> {
 /// printed on stdout, with the run's pid: the bundle directory carries that
 /// pid, so the gone-after-the-run check can name its own run and stay
 /// indifferent to another test's run being in flight.
-fn run(
-    dir: &std::path::Path,
-    config: &str,
-    program: &str,
-) -> (u32, Vec<String>, String) {
+fn run(dir: &std::path::Path, config: &str, program: &str) -> (u32, Vec<String>, String) {
     let config_path = dir.join("bailey.toml");
     std::fs::write(&config_path, config).unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_bailey"))
@@ -65,7 +61,8 @@ fn run(
         .stderr(Stdio::piped())
         .spawn()
         .expect("bailey runs");
-    let pid = child.id();    let output = child.wait_with_output().expect("bailey runs to completion");
+    let pid = child.id();
+    let output = child.wait_with_output().expect("bailey runs to completion");
     let stdout = String::from_utf8_lossy(&output.stdout)
         .lines()
         .map(str::to_owned)
@@ -125,7 +122,10 @@ except OSError as error:
         stderr.contains("egress broker (built-in)"),
         "the run is brokered: {stderr}"
     );
-    assert_eq!(line(&stdout, "ENV"), "ENV /etc/ssl/certs/ca-certificates.crt");
+    assert_eq!(
+        line(&stdout, "ENV"),
+        "ENV /etc/ssl/certs/ca-certificates.crt"
+    );
     assert_eq!(
         line(&stdout, "ENV-REQUESTS"),
         "ENV-REQUESTS /etc/ssl/certs/ca-certificates.crt"
@@ -133,8 +133,12 @@ except OSError as error:
     assert!(line(&stdout, "WRITE-REFUSED").starts_with("WRITE-REFUSED"));
 
     // The combined bundle carries the host's own certificates plus the CA.
-    let sandbox_certs: usize =
-        line(&stdout, "CERTS").split_once(' ').unwrap().1.parse().unwrap();
+    let sandbox_certs: usize = line(&stdout, "CERTS")
+        .split_once(' ')
+        .unwrap()
+        .1
+        .parse()
+        .unwrap();
     let host_certs = std::fs::read_to_string("/etc/ssl/certs/ca-certificates.crt")
         .map(|data| data.matches("BEGIN CERTIFICATE").count())
         .unwrap_or(0);
@@ -205,8 +209,11 @@ fn a_symlinked_bundle_path_is_covered() {
     let etc = dir.path().join("etc");
     std::fs::create_dir_all(etc.join("ssl/certs")).unwrap();
     std::fs::create_dir_all(etc.join("pki/tls/certs")).unwrap();
-    std::fs::write(etc.join("pki/tls/certs/ca-bundle.crt"), "FAKE HOST BUNDLE\n")
-        .unwrap();
+    std::fs::write(
+        etc.join("pki/tls/certs/ca-bundle.crt"),
+        "FAKE HOST BUNDLE\n",
+    )
+    .unwrap();
     #[cfg(unix)]
     std::os::unix::fs::symlink(
         "../../pki/tls/certs/ca-bundle.crt",
@@ -251,7 +258,10 @@ for path in paths:
             line.contains(&expected),
             "{name} shows the host bundle plus the CA ({expected}): {line}"
         );
-        assert!(!line.contains("FAKE"), "{name} still shows the fake bundle: {line}");
+        assert!(
+            !line.contains("FAKE"),
+            "{name} still shows the fake bundle: {line}"
+        );
     }
     assert!(
         directories_of(pid).is_empty(),

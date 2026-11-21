@@ -15,16 +15,15 @@ mod common;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 fn broker() -> std::path::PathBuf {
     let path = std::env::var("CARGO_BIN_EXE_bailey-broker")
         .map(Into::into)
         .unwrap_or_else(|_| {
-            std::path::Path::new(env!("CARGO_BIN_EXE_bailey"))
-                .with_file_name("bailey-broker")
+            std::path::Path::new(env!("CARGO_BIN_EXE_bailey")).with_file_name("bailey-broker")
         });
     assert!(
         path.exists(),
@@ -37,9 +36,7 @@ fn broker() -> std::path::PathBuf {
 
 /// An HTTP rule in the JSON the broker's configuration carries.
 fn name_rule(host: &str) -> String {
-    format!(
-        r#"{{"host": {{"Exact": "{host}"}}, "port": null, "methods": [], "path": null}}"#
-    )
+    format!(r#"{{"host": {{"Exact": "{host}"}}, "port": null, "methods": [], "path": null}}"#)
 }
 
 /// The same, bounded to a path prefix.
@@ -59,16 +56,12 @@ fn name_rule_on_method(host: &str, method: &str) -> String {
 /// The same, for a name on an explicit port: the only shape that both
 /// matches a CONNECT for the name and makes the broker grant the port.
 fn name_rule_on_port(host: &str, port: u16) -> String {
-    format!(
-        r#"{{"host": {{"Exact": "{host}"}}, "port": {port}, "methods": [], "path": null}}"#
-    )
+    format!(r#"{{"host": {{"Exact": "{host}"}}, "port": {port}, "methods": [], "path": null}}"#)
 }
 
 /// An address literal on an explicit port.
 fn address_rule(ip: &str, port: u16) -> String {
-    format!(
-        r#"{{"host": {{"Address": "{ip}"}}, "port": {port}, "methods": [], "path": null}}"#
-    )
+    format!(r#"{{"host": {{"Address": "{ip}"}}, "port": {port}, "methods": [], "path": null}}"#)
 }
 
 /// A configuration carrying the given allowances and denials.
@@ -194,7 +187,8 @@ fn spawn_broker_with_log(
     config: &[u8],
     listener: &TcpListener,
     log_path: &std::path::Path,
-) -> (Broker, std::process::ChildStdout) {    use std::os::unix::io::AsRawFd;
+) -> (Broker, std::process::ChildStdout) {
+    use std::os::unix::io::AsRawFd;
 
     let log_file = std::fs::OpenOptions::new()
         .append(true)
@@ -378,7 +372,10 @@ fn settled_count(upstream: &Upstream) -> usize {
 fn a_denied_connect_is_answered_with_a_reason_and_costs_nothing() {
     let upstream = Upstream::counting();
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    let config = config_with(&[name_rule("allowed.example")], &[name_rule("denied.example")]);
+    let config = config_with(
+        &[name_rule("allowed.example")],
+        &[name_rule("denied.example")],
+    );
     let _child = spawn_broker(&config, &listener);
 
     let (status, reason) = refused(
@@ -596,7 +593,9 @@ fn an_allowed_tunnel_relays_bytes_to_the_upstream() {
         "the tunnel was not granted: {status}"
     );
 
-    client.write_all(&client_hello(&host_ip.to_string())).unwrap();
+    client
+        .write_all(&client_hello(&host_ip.to_string()))
+        .unwrap();
     client.write_all(b"through-the-tunnel").unwrap();
     let marker = b"through-the-tunnel";
     let mut echoed = Vec::new();
@@ -882,13 +881,21 @@ print(json.dumps({
         panic!("the sandbox script failed: {error}");
     }
     assert!(
-        report["denied_status"].as_str().unwrap().starts_with("HTTP/1.1 403"),
-        "{}", stdout
+        report["denied_status"]
+            .as_str()
+            .unwrap()
+            .starts_with("HTTP/1.1 403"),
+        "{}",
+        stdout
     );
     assert_eq!(report["queries_denied"], 0, "{}", stdout);
     assert!(
-        report["allowed_status"].as_str().unwrap().starts_with("HTTP/1.1 200"),
-        "{}", stdout
+        report["allowed_status"]
+            .as_str()
+            .unwrap()
+            .starts_with("HTTP/1.1 200"),
+        "{}",
+        stdout
     );
     let queries_allowed = report["queries_allowed"].as_u64().unwrap();
     assert!(
@@ -898,7 +905,11 @@ print(json.dumps({
     assert_eq!(report["queries_fronted"], 0, "{}", stdout);
     assert_eq!(report["queries_garbage"], 0, "{}", stdout);
     assert!(
-        report["tails"].as_array().unwrap().iter().all(|tail| tail.as_str().unwrap().is_empty()),
+        report["tails"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|tail| tail.as_str().unwrap().is_empty()),
         "the tunnels ended silently: {stdout}"
     );
 }
@@ -1053,9 +1064,7 @@ server.serve_forever()
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let proxy_port = listener.local_addr().unwrap().port();
     let config = config_with(&[name_rule_on_port("allowed.test", tls_port)], &[]);
-    let hosts = format!(
-        "{lan_ip} allowed.test\n127.0.0.1 localhost\n",
-    );
+    let hosts = format!("{lan_ip} allowed.test\n127.0.0.1 localhost\n",);
     let setup = format!(
         "mount -t tmpfs none /etc \
          && printf '{hosts}' > /etc/hosts \
@@ -1180,10 +1189,7 @@ fn config_with_intercept(intercept: &[&str], allow: &[String]) -> Vec<u8> {
 fn a_fronted_sni_on_an_intercepted_host_ends_the_tunnel() {
     let upstream = Upstream::counting();
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    let config = config_with_intercept(
-        &["allowed.example"],
-        &[name_rule("allowed.example")],
-    );
+    let config = config_with_intercept(&["allowed.example"], &[name_rule("allowed.example")]);
     let _child = spawn_broker(&config, &listener);
 
     let end = tunnel_to_end(
@@ -1756,7 +1762,10 @@ print(json.dumps(report), flush=True)
         "the HEAD response was relayed: {head_data:?}"
     );
     assert!(!head_data.contains("ok-body"), "HEAD carried no body");
-    assert_eq!(head_end, "timeout", "the connection stayed open: {head_data:?}");
+    assert_eq!(
+        head_end, "timeout",
+        "the connection stayed open: {head_data:?}"
+    );
     let (second_data, second_end) = get("second");
     assert!(
         second_data.contains("ok-body"),
@@ -1773,7 +1782,10 @@ print(json.dumps(report), flush=True)
             !data.contains("0\r\n\r\n"),
             "{name}: no chunked body followed: {data:?}"
         );
-        assert_eq!(end, "timeout", "{name}: the connection stayed open: {data:?}");
+        assert_eq!(
+            end, "timeout",
+            "{name}: the connection stayed open: {data:?}"
+        );
     }
 
     // The interim response was relayed verbatim before the final one.
@@ -1786,7 +1798,10 @@ print(json.dumps(report), flush=True)
     // cleanly; the broker closed the client connection either way.
     let (data, end) = get("close_clean");
     assert!(data.contains("close-body"), "{data:?}");
-    assert_eq!(end, "clean", "a clean upstream end completes the body: {data:?}");
+    assert_eq!(
+        end, "clean",
+        "a clean upstream end completes the body: {data:?}"
+    );
     let (data, end) = get("close_truncated");
     assert!(data.contains("close-trun"), "{data:?}");
     assert_eq!(
@@ -1796,7 +1811,10 @@ print(json.dumps(report), flush=True)
 
     // Ambiguous framing closes both sides with nothing on the wire.
     let (data, end) = get("both_frames");
-    assert!(data.is_empty(), "an ambiguous response was not relayed: {data:?}");
+    assert!(
+        data.is_empty(),
+        "an ambiguous response was not relayed: {data:?}"
+    );
     assert_eq!(end, "abrupt", "{data:?}");
 
     // A body cut short under each framing reaches the client incomplete:
@@ -1804,7 +1822,10 @@ print(json.dumps(report), flush=True)
     for name in ["trunc_chunked", "trunc_length"] {
         let (data, end) = get(name);
         assert!(data.contains("HTTP/1.1 200"), "{name}: {data:?}");
-        assert_eq!(end, "abrupt", "{name}: the client saw an incomplete response: {data:?}");
+        assert_eq!(
+            end, "abrupt",
+            "{name}: the client saw an incomplete response: {data:?}"
+        );
         if name == "trunc_chunked" {
             assert!(
                 !data.ends_with("0\r\n\r\n"),
@@ -2113,12 +2134,10 @@ print(json.dumps(report), flush=True)
         "the refused requests opened no upstream session"
     );
     assert_eq!(
-        report["seen"]
-            .as_array()
-            .map(|lines| lines
-                .iter()
-                .map(|line| line.as_str().map(str::to_owned))
-                .collect::<Vec<_>>()),
+        report["seen"].as_array().map(|lines| lines
+            .iter()
+            .map(|line| line.as_str().map(str::to_owned))
+            .collect::<Vec<_>>()),
         Some(vec![Some("GET /ok HTTP/1.1".to_owned())]),
         "the upstream saw only the allowed request"
     );
@@ -2160,10 +2179,7 @@ fn cleartext_absolute_form_serves_the_checked_authority() {
     std::fs::write(&ca_path, TERMINATION_CA).unwrap();
     std::fs::write(&leaf_path, TERMINATION_LEAF).unwrap();
     std::fs::write(&key_path, TERMINATION_KEY).unwrap();
-    let config = config_with_intercept(
-        &["allowed.example"],
-        &[name_rule("allowed.example")],
-    );
+    let config = config_with_intercept(&["allowed.example"], &[name_rule("allowed.example")]);
     let config_path = dir.path().join("broker-config.json");
     std::fs::write(&config_path, &config).unwrap();
 
@@ -2424,7 +2440,10 @@ print(json.dumps(report), flush=True)
         mismatch.contains("403 Forbidden") && mismatch.contains("does not agree"),
         "the mismatched Host was refused: {mismatch:?}"
     );
-    assert_eq!(mismatch_end, "closed", "the refusal ended the connection: {mismatch:?}");
+    assert_eq!(
+        mismatch_end, "closed",
+        "the refusal ended the connection: {mismatch:?}"
+    );
 
     // The absolute-form target inside a tunnel was refused.
     let (in_tunnel, in_tunnel_end) = get("in_tunnel");
@@ -2456,8 +2475,14 @@ print(json.dumps(report), flush=True)
     assert_eq!(
         seen,
         vec![
-            ("GET /x HTTP/1.1".to_owned(), "Host: allowed.example".to_owned()),
-            ("GET /y?q=2 HTTP/1.1".to_owned(), "Host: allowed.example".to_owned()),
+            (
+                "GET /x HTTP/1.1".to_owned(),
+                "Host: allowed.example".to_owned()
+            ),
+            (
+                "GET /y?q=2 HTTP/1.1".to_owned(),
+                "Host: allowed.example".to_owned()
+            ),
         ],
         "the upstream saw origin-form targets and the broker's Host"
     );
@@ -2763,8 +2788,7 @@ print(json.dumps(report), flush=True)
         "the allowed request never consulted the resolver: {report}"
     );
     assert_eq!(
-        report["allowed_cost"]["sessions"],
-        1,
+        report["allowed_cost"]["sessions"], 1,
         "the allowed request dialled once: {report}"
     );
 
@@ -2780,13 +2804,11 @@ print(json.dumps(report), flush=True)
         "the refusal ended the tunnel with a close notice: {report}"
     );
     assert_eq!(
-        report["refused_cost"]["queries"],
-        0,
+        report["refused_cost"]["queries"], 0,
         "the refused request made no DNS query: {report}"
     );
     assert_eq!(
-        report["refused_cost"]["sessions"],
-        0,
+        report["refused_cost"]["sessions"], 0,
         "the refused request opened no upstream connection: {report}"
     );
     assert_eq!(
@@ -3078,7 +3100,13 @@ print(json.dumps(report), flush=True)
     }
 
     // Every canonical path was served.
-    for path in ["/ok", "/ok/a/b", "/ok?q=1&x=%20", "/ok%20y", "/ok/z%20w?q=a%20b"] {
+    for path in [
+        "/ok",
+        "/ok/a/b",
+        "/ok?q=1&x=%20",
+        "/ok%20y",
+        "/ok/z%20w?q=a%20b",
+    ] {
         let entry = &report[path];
         assert!(
             entry["ok"].as_bool() == Some(true) && entry["end"] == "timeout",
@@ -3097,8 +3125,7 @@ print(json.dumps(report), flush=True)
 
     // The cleartext absolute-form request was served.
     assert_eq!(
-        report["cleartext"]["ok"],
-        true,
+        report["cleartext"]["ok"], true,
         "the cleartext request was served: {report}"
     );
 
@@ -3132,7 +3159,6 @@ print(json.dumps(report), flush=True)
         "the cleartext upstream saw the matched path byte for byte: {report}"
     );
 }
-
 
 /// Every decision writes one line to the log the caller handed over: what
 /// was decided, which rule decided it, and never a header, a query, or a
@@ -3188,7 +3214,10 @@ fn the_log_records_one_line_per_decision_and_the_counts() {
     let mut counts_text = String::new();
     std::io::Read::read_to_string(&mut stdout, &mut counts_text).unwrap();
     let status = child.0.wait().unwrap();
-    assert!(status.success(), "a stopped broker exits cleanly: {status:?}");
+    assert!(
+        status.success(),
+        "a stopped broker exits cleanly: {status:?}"
+    );
     let counts: serde_json::Value = serde_json::from_str(counts_text.trim())
         .unwrap_or_else(|error| panic!("the counts line is not json: {error}; {counts_text:?}"));
     assert_eq!(counts["allowed"], 1, "{counts_text}");
@@ -3227,15 +3256,17 @@ fn the_log_records_one_line_per_decision_and_the_counts() {
     assert_eq!(lines[1]["verdict"], "refused", "{text}");
     assert_eq!(lines[1]["host"], "refused.test", "{text}");
     assert_eq!(
-        lines[1]["reason"],
-        "CONNECT refused.test denied: no rule allows it",
+        lines[1]["reason"], "CONNECT refused.test denied: no rule allows it",
         "{text}"
     );
     assert_eq!(lines[1]["rule"], "", "no rule decided it: {text}");
     assert_eq!(lines[2]["method"], "GET", "{text}");
     assert_eq!(lines[2]["path"], "/private/thing", "{text}");
     assert_eq!(lines[2]["rule"], "deny rule 1 in the test config", "{text}");
-    assert!(lines[2]["reason"].as_str().unwrap().contains("denied by"), "{text}");
+    assert!(
+        lines[2]["reason"].as_str().unwrap().contains("denied by"),
+        "{text}"
+    );
     assert_eq!(lines[3]["verdict"], "refused", "{text}");
     assert!(
         lines[3]["reason"]
@@ -3371,7 +3402,8 @@ fn the_terminated_log_carries_the_decisions_and_no_secrets() {
     assert_eq!(parsed[0]["verdict"], "allowed");
     assert_eq!(parsed[0]["intercepted"], true);
     assert_eq!(
-        parsed[0]["rule"], "allow rule 1 in the test config",
+        parsed[0]["rule"],
+        "allow rule 1 in the test config",
         "{}",
         lines.join("\n")
     );
@@ -3386,15 +3418,20 @@ fn the_terminated_log_carries_the_decisions_and_no_secrets() {
     assert_eq!(parsed[3]["path"], "/private");
     assert_eq!(parsed[3]["verdict"], "refused");
     assert_eq!(
-        parsed[3]["rule"], "deny rule 1 in the test config",
+        parsed[3]["rule"],
+        "deny rule 1 in the test config",
         "{}",
         lines.join("\n")
     );
     assert_eq!(parsed[4]["method"], "CONNECT");
-    assert_eq!(parsed[4]["verdict"], "allowed", "the evil tunnel was granted on the name");
+    assert_eq!(
+        parsed[4]["verdict"], "allowed",
+        "the evil tunnel was granted on the name"
+    );
     assert_eq!(parsed[5]["verdict"], "refused");
     assert_eq!(
-        parsed[5]["reason"], "the ClientHello named another host",
+        parsed[5]["reason"],
+        "the ClientHello named another host",
         "{}",
         lines.join("\n")
     );

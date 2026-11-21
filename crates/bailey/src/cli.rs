@@ -9,8 +9,8 @@ use std::net::ToSocketAddrs;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use clap::{Parser, Subcommand};
 
@@ -1933,7 +1933,11 @@ fn wrap_builtin_broker(
                 let mut stdout = broker_stdout;
                 let mut counts_text = String::new();
                 let _ = std::io::Read::read_to_string(&mut stdout, &mut counts_text);
-                (flag.load(Ordering::SeqCst), status, broker_counts(&counts_text))
+                (
+                    flag.load(Ordering::SeqCst),
+                    status,
+                    broker_counts(&counts_text),
+                )
             });
             // The child of this fork is the run: reaping it is when the
             // target is done and the broker's work with it.
@@ -1958,16 +1962,12 @@ fn wrap_builtin_broker(
                 );
             }
             // The broker's own numbers, after everything else the run said.
-            if announce
-                && let Some((allowed, refused)) = counts
-            {
+            if announce && let Some((allowed, refused)) = counts {
                 let suffix = match &spawn.log_path {
                     Some(path) => format!(" (log: {})", path.display()),
                     None => String::new(),
                 };
-                eprintln!(
-                    "bailey: http broker: {allowed} allowed, {refused} refused{suffix}"
-                );
+                eprintln!("bailey: http broker: {allowed} allowed, {refused} refused{suffix}");
             }
             Ok((Wrapped::Parent(code), None))
         }
@@ -1990,8 +1990,9 @@ fn write_ca_bundle(bundle: &std::path::Path, ca_pem: &str) -> anyhow::Result<()>
              one to combine its CA with; the run is refused"
         )
     })?;
-    let host_pem = std::fs::read_to_string(&host)
-        .map_err(|error| anyhow::anyhow!("the system trust bundle `{}`: {error}", host.display()))?;
+    let host_pem = std::fs::read_to_string(&host).map_err(|error| {
+        anyhow::anyhow!("the system trust bundle `{}`: {error}", host.display())
+    })?;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -2190,13 +2191,11 @@ fn spawn_builtin_broker(
     spawn: &BuiltinSpawn,
     listener: std::os::unix::io::OwnedFd,
     port: u16,
-) -> anyhow::Result<
-    (
-        std::process::Child,
-        Option<String>,
-        std::process::ChildStdout,
-    ),
-> {
+) -> anyhow::Result<(
+    std::process::Child,
+    Option<String>,
+    std::process::ChildStdout,
+)> {
     use std::os::unix::io::AsRawFd;
     use std::os::unix::process::CommandExt as _;
     use std::process::Stdio;
@@ -2828,8 +2827,7 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
     // The bundle directory is made before the fork, so the creator inherits
     // its path; the broker's CA is written into it after the broker answers.
     let ca_bundle = ca_bundle_for(&resolved.policy);
-    let ca_bundle_file =
-        ca_bundle.as_ref().map(|dir| dir.join("ca-bundle.pem"));
+    let ca_bundle_file = ca_bundle.as_ref().map(|dir| dir.join("ca-bundle.pem"));
 
     let (wrapped, guard_in_place, decision, pins) = prepare_network(
         &mut resolved.policy,

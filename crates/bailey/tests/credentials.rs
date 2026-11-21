@@ -515,8 +515,18 @@ print(json.dumps(report), flush=True)
         "authorization": serde_json::Value::Null,
         "x-api-key": SECRET,
     });
-    assert_eq!(report["records"]["cred.test"], serde_json::json!([attached_bearer]), "records: {}", stdout);
-    assert_eq!(report["records"]["cred2.test"], serde_json::json!([attached_header]), "{}", stdout);
+    assert_eq!(
+        report["records"]["cred.test"],
+        serde_json::json!([attached_bearer]),
+        "records: {}",
+        stdout
+    );
+    assert_eq!(
+        report["records"]["cred2.test"],
+        serde_json::json!([attached_header]),
+        "{}",
+        stdout
+    );
     let target = &report["target"];
     assert!(
         target["cred"].get("error").is_none() && target["cred2"].get("error").is_none(),
@@ -531,19 +541,24 @@ print(json.dumps(report), flush=True)
     assert_eq!(target["env_secret"], "ABSENT", "{}", stdout);
     assert!(
         target["cred"]["status"].as_str().unwrap().contains("200"),
-        "{}", stdout
+        "{}",
+        stdout
     );
     assert_eq!(target["cred"]["payload"], "upstream-ok\n", "{}", stdout);
     assert!(
         target["cred2"]["status"].as_str().unwrap().contains("200"),
-        "{}", stdout
+        "{}",
+        stdout
     );
 
     // The denied path never reached the upstream and never carried the
     // credential: the broker answers, the stub records nothing more, and
     // the answer names the deny rule.
     assert!(
-        target["private"]["status"].as_str().unwrap_or("").contains("403"),
+        target["private"]["status"]
+            .as_str()
+            .unwrap_or("")
+            .contains("403"),
         "the denied path must be refused: {}",
         serde_json::to_string_pretty(target).unwrap()
     );
@@ -552,7 +567,8 @@ print(json.dumps(report), flush=True)
             .as_str()
             .unwrap_or("")
             .contains("denied by deny rule"),
-        "{}", stdout
+        "{}",
+        stdout
     );
 
     // Cleartext to a bound host is refused with its reason, and again no
@@ -618,7 +634,11 @@ fn a_missing_env_source_refuses_the_run_and_names_the_binding() {
     let config = dir.path().join("bailey.toml");
     fs::write(
         &config,
-        policy_toml(dir.path(), &[("cred.test", "bearer", "env:BAILEY_TEST_ABSENT")], false),
+        policy_toml(
+            dir.path(),
+            &[("cred.test", "bearer", "env:BAILEY_TEST_ABSENT")],
+            false,
+        ),
     )
     .unwrap();
     assert_refused(
@@ -706,7 +726,14 @@ fn a_descriptor_named_twice_is_refused() {
     let config = dir.path().join("bailey.toml");
     fs::write(
         &config,
-        policy_toml(dir.path(), &[("cred.test", "bearer", "fd:9"), ("cred2.test", "bearer", "fd:9")], false),
+        policy_toml(
+            dir.path(),
+            &[
+                ("cred.test", "bearer", "fd:9"),
+                ("cred2.test", "bearer", "fd:9"),
+            ],
+            false,
+        ),
     )
     .unwrap();
     let path = std::ffi::CString::new(secret.as_os_str().as_encoded_bytes()).unwrap();
