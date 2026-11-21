@@ -206,8 +206,7 @@ fn serve(
     // neither a DNS query nor an upstream dial.
     write_answer(&mut client, "200 Connection established", "")?;
     let hello = read_client_hello(&mut client)?;
-    let granted_ok = hello_server_name(&hello).is_some_and(|name| name.eq_ignore_ascii_case(host));
-    if !granted_ok {
+    if !hello_names_authority(&hello, host) {
         record_refused(
             audit,
             "CONNECT",
@@ -1009,6 +1008,20 @@ fn read_exact_bounded(client: &mut TcpStream, buffer: &mut [u8]) -> io::Result<(
     Ok(())
 }
 
+/// Whether the ClientHello may open the tunnel the CONNECT asked for.
+///
+/// A hello that names a host must name the CONNECT's own: a target that
+/// fronts another host through a granted one gets nothing. A hello that
+/// names no host is not a mismatch, because the authority the CONNECT
+/// carried is what passed the ACL, and plenty of clients send no name at
+/// all.
+fn hello_names_authority(hello: &[u8], host: &str) -> bool {
+    match hello_server_name(hello) {
+        Some(name) => name.eq_ignore_ascii_case(host),
+        None => true,
+    }
+}
+
 /// The server name the ClientHello carries, if it is a well-formed TLS
 /// ClientHello with a name of the `host_name` type.
 ///
@@ -1154,4 +1167,74 @@ fn copy_until_eof<R: Read, W: Write>(mut reader: R, writer: &mut W) {
         }
     }
     let _ = writer.flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal well-formed ClientHello record carrying the given
+    /// extensions, shaped the way [`hello_server_name`] reads one.
+    fn client_hello(extensions: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]);
+        body.extend_from_slice(&[0x5a; 32]);
+        body.push(0);
+        body.extend_from_slice(&[0x00, 0x02, 0x13, 0x01]);
+        body.push(1);
+        body.push(0);
+        if !extensions.is_empty() {
+            body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+            body.extend_from_slice(extensions);
+        }
+        let mut message = vec![0x01];
+        let length = body.len() as u32;
+        message.extend_from_slice(&length.to_be_bytes()[1..]);
+        message.extend_from_slice(&body);
+        let mut record = vec![0x16, 0x03, 0x01];
+        record.extend_from_slice(&(message.len() as u16).to_be_bytes());
+        record.extend_from_slice(&message);
+        record
+    }
+
+    /// One `server_name` extension carrying a single `host_name` entry.
+    fn server_name(name: &str) -> Vec<u8> {
+        let mut entry = vec![0x00];
+        entry.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        entry.extend_from_slice(name.as_bytes());
+        let mut value = (entry.len() as u16).to_be_bytes().to_vec();
+        value.extend_from_slice(&entry);
+        let mut extension = vec![0x00, 0x00];
+        extension.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        extension.extend_from_slice(&value);
+        extension
+    }
+
+    /// An extension of a kind the broker does not read.
+    fn other_extension() -> Vec<u8> {
+        vec![0xff, 0xff, 0x00, 0x02, 0x01, 0x02]
+    }
+
+    #[test]
+    fn a_hello_without_a_name_is_not_a_mismatch() {
+        assert!(hello_names_authority(&client_hello(&[]), "example.com"));
+        assert!(hello_names_authority(
+            &client_hello(&other_extension()),
+            "example.com"
+        ));
+    }
+
+    #[test]
+    fn a_hello_naming_the_authority_agrees() {
+        let hello = client_hello(&server_name("example.com"));
+        assert!(hello_names_authority(&hello, "example.com"));
+        let hello = client_hello(&server_name("EXAMPLE.com"));
+        assert!(hello_names_authority(&hello, "example.com"));
+    }
+
+    #[test]
+    fn a_hello_naming_another_host_is_a_mismatch() {
+        let hello = client_hello(&server_name("other.example"));
+        assert!(!hello_names_authority(&hello, "example.com"));
+    }
 }
