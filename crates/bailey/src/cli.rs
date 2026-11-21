@@ -9,6 +9,8 @@ use std::net::ToSocketAddrs;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 
@@ -740,6 +742,41 @@ fn cmd_doctor() -> anyhow::Result<i32> {
         );
     }
 
+    // The helper the built-in broker runs from: beside bailey or in a
+    // trusted directory, with the protocol it speaks, or why a run that
+    // names `broker = "builtin"` would be refused.
+    match resolve_broker_helper() {
+        Ok(helper) => {
+            let version = std::process::Command::new(&helper)
+                .arg("--version")
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
+            match version {
+                Some(version) => {
+                    println!(
+                        "  built-in broker: found ({}): {}",
+                        helper.display(),
+                        version
+                    );
+                }
+                None => {
+                    println!(
+                        "  built-in broker: found ({}): its version could not be read",
+                        helper.display()
+                    );
+                }
+            }
+            println!("    runs with `broker = \"builtin\"` serve their HTTP rules through it");
+        }
+        Err(reason) => {
+            println!("  built-in broker: not found ({reason})");
+            println!("    runs with `broker = \"builtin\"` are refused; the helper must sit");
+            println!("    beside bailey or in a directory BAILEY_HELPER_DIRS names");
+        }
+    }
+
     let delegated = &caps.cgroup_delegated;
     let missing: Vec<&str> = ["memory", "pids", "cpu"]
         .into_iter()
@@ -1401,8 +1438,7 @@ fn check_network_contradictions(
     Ok(())
 }
 
-/// The user namespace limit the proxy namespace holds, decided from the
-/// layout table in the change design.
+/// The user namespace limit the proxy namespace holds.
 ///
 /// With the isolation layer running, the run's own namespace nests inside the
 /// proxy namespace and spends its single slot. With the target running in the
@@ -1634,7 +1670,9 @@ fn wrap_in_private_namespace(
     announce: bool,
     guard_limit: u32,
     dns_forward: bool,
-) -> anyhow::Result<Wrapped> {
+) -> anyhow::Result<(Wrapped, Option<u16>)> {
+    debug_assert_ne!(broker, Some(crate::policy::Broker::Builtin));
+
     // The decision above this call refused the run when a prerequisite was
     // missing, so the lookups here cannot fail honestly. Resolving again in
     // an error would be a race with the decision, not a second opinion.
@@ -1703,7 +1741,7 @@ fn wrap_in_private_namespace(
                 eprintln!("bailey: the private namespace was never configured; the run is refused");
                 std::process::exit(1);
             }
-            Ok(Wrapped::Creator)
+            Ok((Wrapped::Creator, None))
         }
         child => {
             let ready = ready.into_reader();
@@ -1735,8 +1773,243 @@ fn wrap_in_private_namespace(
             }
             release.send()?;
             drop(release);
-            Ok(Wrapped::Parent(reap(child)))
+            Ok((Wrapped::Parent(reap(child)), None))
         }
+    }
+}
+
+/// Everything the parent needs to spawn the built-in broker once the
+/// namespace's listener arrives.
+struct BuiltinSpawn {
+    /// The broker's configuration, credential values included. Built before
+    /// the namespace is made, so a secret that cannot be read refuses the
+    /// run before anything starts.
+    config: crate::broker::BrokerConfig,
+    /// The audit log to open as the broker's descriptor 4.
+    log_path: Option<PathBuf>,
+}
+
+/// The built-in broker's wrap: the same fork and namespace as the pasta
+/// path, with the listener handed to this process over a socket pair
+/// instead of pasta configuring the namespace from its pid.
+///
+/// The child binds `127.0.0.1:0` inside the namespace and sends the
+/// listening socket out; this process spawns the broker on it, and only
+/// when the broker has answered its ready line does the child proceed into
+/// confinement. The namespace has no route, so nothing but the listener
+/// answers.
+fn wrap_builtin_broker(
+    spawn: BuiltinSpawn,
+    announce: bool,
+    guard_limit: u32,
+    bundle: Option<&std::path::Path>,
+) -> anyhow::Result<(Wrapped, Option<u16>)> {
+    if announce {
+        eprintln!("bailey: egress runs through the built-in egress broker");
+    }
+    let (child_side, parent_side) = std::os::unix::net::UnixStream::pair()?;
+    let ready = Relay::new()?;
+    let release = Relay::new()?;
+
+    // Safety: the child runs after `fork` in a process that is single threaded
+    // at this point, so the heap and every lock it inherits are consistent and
+    // it may go on running ordinary code rather than only what is
+    // async-signal-safe.
+    match unsafe { libc::fork() } {
+        -1 => Err(io::Error::last_os_error().into()),
+        0 => {
+            let ready = ready.into_writer();
+            let release = release.into_reader();
+            drop(parent_side);
+            if let Err(error) = network::enter_proxy_namespace(guard_limit) {
+                eprintln!("bailey: could not create the private namespace: {error}");
+                std::process::exit(1);
+            }
+            if ready.send().is_err() {
+                std::process::exit(1);
+            }
+            drop(ready);
+
+            // The listener belongs to this namespace, so a process in the
+            // host's cannot reach it whatever it dials. The port is
+            // ephemeral, chosen here, and reported to the parent with the
+            // socket.
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).or_else(
+                |_| -> std::io::Result<std::net::TcpListener> {
+                    network::bring_loopback_up()?;
+                    std::net::TcpListener::bind(("127.0.0.1", 0))
+                },
+            );
+            let listener = match listener {
+                Ok(listener) => listener,
+                Err(error) => {
+                    eprintln!("bailey: the broker listener could not bind: {error}");
+                    std::process::exit(1);
+                }
+            };
+            let port = listener
+                .local_addr()
+                .expect("a bound listener has an address")
+                .port();
+            if send_fd_and_port(&child_side, listener.as_raw_fd(), port).is_err() {
+                eprintln!("bailey: the broker listener could not be handed over");
+                std::process::exit(1);
+            }
+            // The socket now lives with the parent; the namespace keeps no
+            // copy, so only the broker can accept on it.
+            drop(listener);
+            drop(child_side);
+
+            // A closed pipe means this process gave up, which is the failure
+            // case: the broker never started, so nothing in the namespace
+            // has a route and the run must not continue into it.
+            if release.wait().is_err() {
+                eprintln!(
+                    "bailey: the built-in egress broker did not start; the \
+                     run is refused"
+                );
+                std::process::exit(1);
+            }
+            Ok((Wrapped::Creator, Some(port)))
+        }
+        child => {
+            let ready = ready.into_reader();
+            let release = release.into_writer();
+            drop(child_side);
+            if ready.wait().is_err() {
+                reap(child);
+                anyhow::bail!("the private namespace could not be created; the run is refused");
+            }
+            let (listener, port) = match recv_fd_and_port(&parent_side) {
+                Ok(received) => received,
+                Err(error) => {
+                    drop(release);
+                    reap(child);
+                    anyhow::bail!(
+                        "the broker listener could not be received from the \
+                         namespace: {error}"
+                    );
+                }
+            };
+            drop(parent_side);
+            let (broker, ca_pem) = match spawn_builtin_broker(&spawn, listener, port) {
+                Ok(answer) => answer,
+                Err(error) => {
+                    // Dropping the release end tells the child to stop, as it
+                    // does today when pasta fails.
+                    drop(release);
+                    reap(child);
+                    anyhow::bail!("the built-in egress broker could not start: {error}");
+                }
+            };
+            // The bundle reaches the creator through the path they agreed on
+            // before the fork; the file itself is here before the release, so
+            // the plan that mounts it never races the write.
+            if let Some(pem) = ca_pem {
+                let Some(bundle) = bundle else {
+                    drop(release);
+                    reap(child);
+                    anyhow::bail!(
+                        "the broker generated an interception CA, but this run \n                         has no bundle directory to hold it"
+                    );
+                };
+                if let Err(error) = write_ca_bundle(bundle, &pem) {
+                    drop(release);
+                    reap(child);
+                    anyhow::bail!("the CA bundle could not be written: {error}");
+                }
+            }
+            release.send()?;
+            drop(release);
+            let broker_pid = broker.id();
+            let asked_to_stop = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&asked_to_stop);
+            let watcher = std::thread::spawn(move || {
+                let mut broker = broker;
+                let status = broker.wait().ok();
+                (flag.load(Ordering::SeqCst), status)
+            });
+            // The child of this fork is the run: reaping it is when the
+            // target is done and the broker's work with it.
+            let code = reap(child);
+            asked_to_stop.store(true, Ordering::SeqCst);
+            unsafe { libc::kill(broker_pid as libc::pid_t, libc::SIGTERM) };
+            let (was_asked, status) = watcher.join().unwrap_or((true, None));
+            // The bundle outlived its use: the mounts died with the
+            // namespace, so the file is only a leftover now.
+            if let Some(bundle) = bundle
+                && let Some(dir) = bundle.parent()
+            {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+            if let (false, Some(status)) = (was_asked, status)
+                && announce
+            {
+                eprintln!(
+                    "bailey: the egress broker exited early ({}); egress was \
+                     unavailable from then on",
+                    describe_exit(&status)
+                );
+            }
+            Ok((Wrapped::Parent(code), None))
+        }
+    }
+}
+
+/// Write the combined trust bundle the target will see.
+///
+/// The host's own system bundle comes first, so every certificate the run's
+/// host trusted stays trusted, and the run's CA certificate follows. Both are
+/// public material; the CA's key stays in the broker. The file is the
+/// caller's alone, in a directory only the caller can enter.
+fn write_ca_bundle(bundle: &std::path::Path, ca_pem: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let host = crate::broker::system_ca_bundle().ok_or_else(|| {
+        anyhow::anyhow!(
+            "no system trust bundle was found, and an intercepted run needs \
+             one to combine its CA with; the run is refused"
+        )
+    })?;
+    let host_pem = std::fs::read_to_string(&host)
+        .map_err(|error| anyhow::anyhow!("the system trust bundle `{}`: {error}", host.display()))?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(bundle)
+        .map_err(|error| anyhow::anyhow!("`{}`: {error}", bundle.display()))?;
+    file.write_all(host_pem.as_bytes())
+        .and_then(|_| file.write_all(ca_pem.as_bytes()))
+        .and_then(|_| file.flush())
+        .map_err(|error| anyhow::anyhow!("`{}`: {error}", bundle.display()))
+}
+
+/// The per-run private directory the combined CA bundle is written into.
+///
+/// Made before the fork, so the creator inherits its path and the plan that
+/// mounts the bundle needs no other channel. The name carries the pid and a
+/// random suffix the way the staging directories do, so a sweep can tell
+/// whose a leftover was and another user cannot claim the name in advance.
+fn create_ca_bundle_dir() -> anyhow::Result<std::path::PathBuf> {
+    let path = std::env::temp_dir().join(format!(
+        ".bailey-ca.{}.{}",
+        std::process::id(),
+        crate::backend::random_suffix()
+    ));
+    std::fs::create_dir(&path).map_err(|error| anyhow::anyhow!("`{}`: {error}", path.display()))?;
+    Ok(path)
+}
+
+/// How a broker's exit reads to a user.
+fn describe_exit(status: &std::process::ExitStatus) -> String {
+    use std::os::unix::process::ExitStatusExt;
+
+    if let Some(code) = status.code() {
+        format!("exit code {code}")
+    } else {
+        format!("killed by signal {}", status.signal().unwrap_or(0))
     }
 }
 
@@ -1796,6 +2069,373 @@ impl Writer {
             Err(io::Error::last_os_error())
         }
     }
+}
+
+/// Send a listening socket and its port to the parent over a socket pair.
+///
+/// The port travels as data because `local_addr` is only meaningful in the
+/// namespace that bound the socket; the parent needs it to write the proxy
+/// variables the target reads.
+fn send_fd_and_port(
+    stream: &std::os::unix::net::UnixStream,
+    fd: std::os::unix::io::RawFd,
+    port: u16,
+) -> io::Result<()> {
+    use std::io::IoSlice;
+    use std::os::unix::io::AsRawFd;
+
+    let payload = port.to_ne_bytes();
+    let iov = [IoSlice::new(&payload)];
+    let mut cmsg = [0u8; unsafe { libc::CMSG_SPACE(4) } as usize];
+    // Zeroed rather than built as a literal: musl's `msghdr` carries private
+    // padding fields that must stay zero, and its sizes are `socklen_t` where
+    // glibc's are `usize`.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = iov.as_ptr() as *mut libc::iovec;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_controllen = unsafe { libc::CMSG_SPACE(4) } as _;
+    unsafe {
+        let header = libc::CMSG_FIRSTHDR(&msg);
+        (*header).cmsg_level = libc::SOL_SOCKET;
+        (*header).cmsg_type = libc::SCM_RIGHTS;
+        (*header).cmsg_len = libc::CMSG_LEN(4) as _;
+        std::ptr::copy_nonoverlapping(
+            &fd as *const std::os::unix::io::RawFd as *const u8,
+            libc::CMSG_DATA(header),
+            4,
+        );
+        if libc::sendmsg(stream.as_raw_fd(), &msg, 0) < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Receive a listening socket and its port from the namespace's child.
+fn recv_fd_and_port(
+    stream: &std::os::unix::net::UnixStream,
+) -> io::Result<(std::os::unix::io::OwnedFd, u16)> {
+    use std::io::IoSliceMut;
+    use std::os::unix::io::{FromRawFd, OwnedFd};
+
+    let mut payload = [0u8; 2];
+    let iov = [IoSliceMut::new(&mut payload)];
+    let mut cmsg = [0u8; unsafe { libc::CMSG_SPACE(4) } as usize];
+    // Zeroed rather than built as a literal, for the same musl reasons as
+    // the send side above.
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_iov = iov.as_ptr() as *mut libc::iovec;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_controllen = unsafe { libc::CMSG_SPACE(4) } as _;
+    let received = unsafe { libc::recvmsg(stream.as_raw_fd(), &mut msg, 0) };
+    if received < 2 {
+        // Zero bytes means the child died before sending anything.
+        return Err(io::Error::last_os_error());
+    }
+    unsafe {
+        let header = libc::CMSG_FIRSTHDR(&msg);
+        if header.is_null()
+            || (*header).cmsg_level != libc::SOL_SOCKET
+            || (*header).cmsg_type != libc::SCM_RIGHTS
+        {
+            return Err(io::Error::other("no descriptor arrived"));
+        }
+        let mut fd = 0 as std::os::unix::io::RawFd;
+        std::ptr::copy_nonoverlapping(
+            libc::CMSG_DATA(header) as *const std::os::unix::io::RawFd,
+            &mut fd,
+            1,
+        );
+        Ok((OwnedFd::from_raw_fd(fd), u16::from_ne_bytes(payload)))
+    }
+}
+
+/// Spawn the broker binary on the namespace's listener.
+///
+/// The listener becomes its descriptor 3, the log its descriptor 4, its
+/// configuration arrives as one JSON document on stdin, and its only
+/// argument is this process's pid, which it pins its parent check to.
+/// Secrets travel in the stdin document alone.
+fn spawn_builtin_broker(
+    spawn: &BuiltinSpawn,
+    listener: std::os::unix::io::OwnedFd,
+    port: u16,
+) -> anyhow::Result<(std::process::Child, Option<String>)> {
+    use std::os::unix::io::AsRawFd;
+    use std::os::unix::process::CommandExt as _;
+    use std::process::Stdio;
+
+    let helper = resolve_broker_helper().map_err(|error| {
+        anyhow::anyhow!("the built-in broker helper was not found in a trusted location: {error}")
+    })?;
+    let log = spawn
+        .log_path
+        .as_ref()
+        .map(|path| open_broker_log(path))
+        .transpose()?;
+
+    let mut command = std::process::Command::new(&helper);
+    command
+        .arg(std::process::id().to_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    let listener_fd = listener.as_raw_fd();
+    let log_fd = log.as_ref().map(|file| file.as_raw_fd());
+    // Safety: runs in the forked child before exec, where only
+    // async-signal-safe calls are made. Each descriptor is first copied
+    // above the fixed targets, so the dup2 calls cannot read a descriptor
+    // the other has overwritten, nor hit the identity call that clears no
+    // close-on-exec flag.
+    unsafe {
+        command.pre_exec(move || {
+            let listener_copy = libc::fcntl(listener_fd, libc::F_DUPFD_CLOEXEC, 5);
+            if listener_copy < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let log_copy = log_fd.map(|fd| libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 5));
+            if log_copy == Some(-1) {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::dup2(listener_copy, 3) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if let Some(copy) = log_copy
+                && libc::dup2(copy, 4) < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut broker = command
+        .spawn()
+        .map_err(|error| anyhow::anyhow!("{} could not be run: {error}", helper.display()))?;
+    // The child holds its own copies on descriptors 3 and 4 now.
+    drop(listener);
+    drop(log);
+
+    let mut stdin = broker.stdin.take().expect("the broker's stdin is piped");
+    use std::io::Write as _;
+    stdin.write_all(&spawn.config.encode()?)?;
+    drop(stdin);
+
+    let mut stdout = broker.stdout.take().expect("the broker's stdout is piped");
+    let ready = match crate::broker::BrokerReady::decode(&mut stdout) {
+        Ok(ready) => ready,
+        Err(error) => {
+            let _ = broker.kill();
+            let _ = broker.wait();
+            return Err(anyhow::anyhow!(
+                "the broker on 127.0.0.1:{port} did not answer a ready line: {error}"
+            ));
+        }
+    };
+    if ready.version != crate::broker::BROKER_PROTOCOL_VERSION {
+        let _ = broker.kill();
+        let _ = broker.wait();
+        anyhow::bail!(
+            "the broker speaks protocol version {}, this bailey speaks {}",
+            ready.version,
+            crate::broker::BROKER_PROTOCOL_VERSION
+        );
+    }
+    Ok((broker, ready.ca_pem))
+}
+
+/// Open the broker's audit log.
+///
+/// Append-only, created for the caller alone, never through a symbolic link,
+/// and only onto a regular file the caller owns. Anything else is refused
+/// rather than written to.
+fn open_broker_log(path: &Path) -> anyhow::Result<std::os::unix::io::OwnedFd> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if !meta.is_file() {
+            anyhow::bail!(
+                "the http log `{}` exists and is not a regular file",
+                path.display()
+            );
+        }
+        if meta.uid() != unsafe { libc::geteuid() } {
+            anyhow::bail!(
+                "the http log `{}` exists and is not owned by you",
+                path.display()
+            );
+        }
+    }
+    let file = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .read(false)
+        .custom_flags(libc::O_NOFOLLOW)
+        .mode(0o600)
+        .open(path)
+        .map_err(|error| anyhow::anyhow!("the http log `{}`: {error}", path.display()))?;
+    // What was checked before the open could have been swapped for what was
+    // opened, so the descriptor itself is asked.
+    let meta = file
+        .metadata()
+        .map_err(|error| anyhow::anyhow!("the http log `{}`: {error}", path.display()))?;
+    if !meta.is_file() {
+        anyhow::bail!(
+            "the http log `{}` opened as something that is not a regular file",
+            path.display()
+        );
+    }
+    if meta.uid() != unsafe { libc::geteuid() } {
+        anyhow::bail!(
+            "the http log `{}` opened as a file you do not own",
+            path.display()
+        );
+    }
+    let fd = file.into();
+    Ok(fd)
+}
+
+/// Read every credential's value, once, before anything forks.
+///
+/// A missing or empty source, or one holding a newline or NUL, refuses the
+/// run before it starts, because a half-read secret would surface later as a
+/// garbled header rather than as an error. A descriptor source
+/// is consumed: checked open, made close-on-exec, read to the end, and
+/// closed, so a target that inherited it cannot seek back and read it too.
+fn resolve_credential_values(
+    policy: &crate::policy::Policy,
+) -> anyhow::Result<Vec<crate::broker::BrokerCredential>> {
+    use std::collections::BTreeSet;
+
+    let mut seen_fds: BTreeSet<u32> = BTreeSet::new();
+    let mut values = Vec::new();
+    let mut consumed: Vec<String> = Vec::new();
+    for binding in &policy.http.credentials {
+        let mut env_name = None;
+        let value = match &binding.source {
+            crate::policy::CredentialSource::Env(name) => {
+                env_name = Some(name.clone());
+                std::env::var(name).map_err(|_| {
+                    anyhow::anyhow!(
+                        "the credential for {} names ${name}, which is not set; \
+                         set it or drop the binding",
+                        binding.host
+                    )
+                })?
+            }
+            crate::policy::CredentialSource::File(path) => {
+                std::fs::read_to_string(path).map_err(|error| {
+                    anyhow::anyhow!(
+                        "the credential for {} reads {}: {error}",
+                        binding.host,
+                        path.display()
+                    )
+                })?
+            }
+            crate::policy::CredentialSource::Fd(number) => {
+                if number <= &2 {
+                    anyhow::bail!(
+                        "the credential for {} names descriptor {number}, \
+                         which is one of the target's own streams",
+                        binding.host
+                    );
+                }
+                if !seen_fds.insert(*number) {
+                    anyhow::bail!(
+                        "the credential for {} names descriptor {number}, \
+                         which another binding already named",
+                        binding.host
+                    );
+                }
+                read_credential_fd(*number, binding.host.to_string())?
+            }
+        };
+        let secret = value.trim_end_matches(['\n', '\r']);
+        if secret.is_empty() {
+            anyhow::bail!("the credential for {} reads an empty value", binding.host);
+        }
+        if secret.contains(['\n', '\r', '\0']) {
+            anyhow::bail!(
+                "the credential for {} reads a value with a line break in it, \
+                 which no header can carry",
+                binding.host
+            );
+        }
+        values.push(crate::broker::BrokerCredential {
+            host: binding.host.clone(),
+            auth: binding.auth.clone(),
+            value: secret.to_owned(),
+        });
+        if let Some(name) = env_name {
+            consumed.push(name);
+        }
+    }
+    // Every source resolved, so the variables leave bailey's own
+    // environment: hooks and the target run with this environment, and the
+    // value travels to the broker alone.
+    for name in consumed {
+        unsafe { std::env::remove_var(&name) };
+    }
+    Ok(values)
+}
+
+/// Read one descriptor source to EOF and close it.
+fn read_credential_fd(number: u32, host: String) -> anyhow::Result<String> {
+    use std::io::Read;
+
+    let fd = number as libc::c_int;
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        anyhow::bail!(
+            "the credential for {host} names descriptor {number}, which is \
+             not open"
+        );
+    }
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        anyhow::bail!(
+            "the credential for {host} could not make descriptor {number} \
+             close-on-exec: {}",
+            io::Error::last_os_error()
+        );
+    }
+    let mut value = String::new();
+    // Safety: the descriptor is read to EOF and then closed; the type is
+    // named so the ownership is plain.
+    let mut file: std::fs::File = unsafe { std::os::unix::io::FromRawFd::from_raw_fd(fd) };
+    file.read_to_string(&mut value).map_err(|error| {
+        anyhow::anyhow!("the credential for {host} could not read descriptor {number}: {error}")
+    })?;
+    // Read once; dropping the file closes the descriptor with it.
+    drop(file);
+    Ok(value)
+}
+
+/// Aim every proxy-aware client at the broker's listener.
+///
+/// The variable set is the proxy in every spelling a client
+/// looks for, `NO_PROXY` emptied so an inherited exclusion cannot route
+/// around the broker, and Node's opt-in, without which Node ignores proxy
+/// variables outright.
+fn set_proxy_variables(policy: &mut crate::policy::Policy, port: u16) {
+    let proxy = format!("http://127.0.0.1:{port}");
+    for name in [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        policy.env.set.insert(name.into(), proxy.clone());
+    }
+    for name in ["NO_PROXY", "no_proxy"] {
+        policy.env.set.insert(name.into(), String::new());
+    }
+    policy
+        .env
+        .set
+        .insert("NODE_USE_ENV_PROXY".into(), "1".into());
 }
 
 /// Wait for the child and report the status a shell would.
@@ -1920,6 +2560,7 @@ fn prepare_network(
     args: &NetworkArgs,
     no_isolate: bool,
     announce: bool,
+    bundle: Option<&std::path::Path>,
 ) -> anyhow::Result<(Wrapped, bool, Option<network::NetworkDecision>, Vec<Pin>)> {
     apply_network_flags(policy, args)?;
     // --no-isolate promises a run of Landlock and seccomp alone, so automatic
@@ -1967,6 +2608,37 @@ fn prepare_network(
     }
     check_network_contradictions(policy, &forwards, &publishes)?;
     crate::config::check_http_broker(policy)?;
+    // A credential's `env:` name leaves with the value alone: it is denied
+    // from the target's environment whatever a `pass` says, and a `pass`
+    // that would have forwarded one says so.
+    for binding in &policy.http.credentials {
+        if let crate::policy::CredentialSource::Env(name) = &binding.source {
+            if policy.env.passes(name) {
+                eprintln!(
+                    "bailey: env pass would forward {name}, the credential \
+                     for {}; it is denied",
+                    binding.host
+                );
+            }
+            policy.env.deny.push(name.clone());
+        }
+    }
+    // A secret that cannot be read refuses the run before anything forks,
+    // exactly as a policy that cannot resolve does.
+    let builtin_spawn = if policy.network.broker == Some(crate::policy::Broker::Builtin) {
+        let credentials = resolve_credential_values(policy)?;
+        Some(BuiltinSpawn {
+            config: crate::broker::BrokerConfig {
+                version: crate::broker::BROKER_PROTOCOL_VERSION,
+                http: policy.http.clone(),
+                credentials,
+                log: policy.http.log.is_some(),
+            },
+            log_path: policy.http.log.clone(),
+        })
+    } else {
+        None
+    };
     // Resolved on the host before anything forks, so the creator and the run
     // see the same addresses and an unresolvable name refuses the run before
     // a namespace is built.
@@ -1981,19 +2653,39 @@ fn prepare_network(
     let dns_forward = policy.network.dns_allowed();
     let made_the_namespace = match decision.mode {
         network::NetworkMode::Private | network::NetworkMode::Brokered => {
-            match wrap_in_private_namespace(
-                policy.network.broker,
-                &forwards,
-                &publishes,
-                announce,
-                guard_limit,
-                dns_forward,
-            )? {
-                Wrapped::Parent(code) => {
+            // The built-in broker needs the namespace and nothing else: no
+            // pasta, no nft, so it works where neither exists. Its path
+            // replaces both.
+            let wrapped = if let Some(spawn) = builtin_spawn {
+                wrap_builtin_broker(spawn, announce, guard_limit, bundle)?
+            } else {
+                wrap_in_private_namespace(
+                    policy.network.broker,
+                    &forwards,
+                    &publishes,
+                    announce,
+                    guard_limit,
+                    dns_forward,
+                )?
+            };
+            match wrapped {
+                (Wrapped::Parent(code), _) => {
                     return Ok((Wrapped::Parent(code), false, Some(decision), pins));
                 }
-                Wrapped::Creator => true,
-                Wrapped::Unwrapped => false,
+                (Wrapped::Creator, builtin_port) => {
+                    // The broker was released only after it answered ready,
+                    // so its listener is live before the target exists.
+                    if let Some(port) = builtin_port {
+                        // Landlock gates egress by port, and the broker does
+                        // not listen on the policy's ports: permitting its
+                        // port widens nothing, it only lets the one allowed
+                        // hop connect.
+                        permit_egress_port(policy, port);
+                        set_proxy_variables(policy, port);
+                    }
+                    true
+                }
+                (Wrapped::Unwrapped, _) => false,
             }
         }
         network::NetworkMode::Isolated | network::NetworkMode::LandlockOnly => false,
@@ -2002,66 +2694,74 @@ fn prepare_network(
     // Inside the namespace now, whether by the wrap above or a re-exec into it.
     // The lockdown goes on before the target is confined and run, so there is
     // no window in which the target has both a network and no egress rule.
-    if let Some((addr, port)) = policy
-        .network
-        .broker
-        .and_then(crate::policy::Broker::external)
-    {
-        // Only the process that created the namespace installs a rule in it.
-        // This is not a check on something a caller said; it is which branch of
-        // the fork above this process took, and a caller cannot choose that.
-        if !made_the_namespace {
-            anyhow::bail!(
-                "--egress-proxy installs its firewall rule in a network namespace of \
-                 this run's own, and none was created; the run is refused"
-            );
+    match policy.network.broker {
+        Some(crate::policy::Broker::Builtin) => {
+            // The built-in path did its own permitting and proxy variables
+            // inside the wrap match above, where the handoff's port was in
+            // hand. The namespace has no route, so there is no rule to
+            // install and no firewall to depend on.
         }
-        lock_egress_to_broker(addr, port)?;
-        // Landlock gates egress by port, and the broker does not listen on the
-        // policy's ports. The netfilter rule already holds egress to the broker
-        // address, so permitting its port here widens nothing a session can
-        // reach; it only stops Landlock from refusing the one allowed hop.
-        permit_egress_port(policy, port);
-    } else if made_the_namespace {
-        // The rules are the boundary in this mode, so a table that cannot be
-        // installed refuses the run: what the policy allows would otherwise
-        // be whatever nft's absence leaves open.
-        let ruleset = egress_ruleset(&pins, &policy.network, &forwards, &publishes);
-        if let Err(err) = run_nft(&ruleset) {
-            anyhow::bail!("the egress rules could not be installed, so the run is refused: {err}");
-        }
-        for forward in &forwards {
-            permit_egress_port(policy, forward.port);
-            if announce {
-                eprintln!(
-                    "bailey: forward 127.0.0.1:{} to host port {} through pasta",
-                    forward.port, forward.host_port
+        Some(crate::policy::Broker::External(addr, port)) => {
+            // Only the process that created the namespace installs a rule in it.
+            // This is not a check on something a caller said; it is which branch of
+            // the fork above this process took, and a caller cannot choose that.
+            if !made_the_namespace {
+                anyhow::bail!(
+                    "--egress-proxy installs its firewall rule in a network namespace of \
+                     this run's own, and none was created; the run is refused"
                 );
             }
+            lock_egress_to_broker(addr, port)?;
+            // Landlock gates egress by port, and the broker does not listen on the
+            // policy's ports. The netfilter rule already holds egress to the broker
+            // address, so permitting its port here widens nothing a session can
+            // reach; it only stops Landlock from refusing the one allowed hop.
+            permit_egress_port(policy, port);
         }
-        for port in &publishes {
-            if announce {
-                eprintln!(
-                    "bailey: publish host 127.0.0.1:{port} to sandbox port {port} through pasta"
+        None if made_the_namespace => {
+            // The rules are the boundary in this mode, so a table that cannot be
+            // installed refuses the run: what the policy allows would otherwise
+            // be whatever nft's absence leaves open.
+            let ruleset = egress_ruleset(&pins, &policy.network, &forwards, &publishes);
+            if let Err(err) = run_nft(&ruleset) {
+                anyhow::bail!(
+                    "the egress rules could not be installed, so the run is refused: {err}"
                 );
             }
-        }
-        if !forwards.is_empty() {
-            policy.forwards.clear();
-        }
-        if !publishes.is_empty() {
-            // Publishing implies the sandbox may bind the port. An empty bind
-            // list means binds are unrestricted already, so only a list that
-            // already restricts them needs the published port added.
-            if !policy.network.bind_ports.is_empty() {
-                for port in &publishes {
-                    if !policy.network.bind_ports.contains(port) {
-                        policy.network.bind_ports.push(*port);
-                    }
+            for forward in &forwards {
+                permit_egress_port(policy, forward.port);
+                if announce {
+                    eprintln!(
+                        "bailey: forward 127.0.0.1:{} to host port {} through pasta",
+                        forward.port, forward.host_port
+                    );
                 }
             }
-            policy.network.publish_ports.clear();
+            for port in &publishes {
+                if announce {
+                    eprintln!(
+                        "bailey: publish host 127.0.0.1:{port} to sandbox port {port} through pasta"
+                    );
+                }
+            }
+            if !forwards.is_empty() {
+                policy.forwards.clear();
+            }
+            if !publishes.is_empty() {
+                // Publishing implies the sandbox may bind the port. An empty bind
+                // list means binds are unrestricted already, so only a list that
+                // already restricts them needs the published port added.
+                if !policy.network.bind_ports.is_empty() {
+                    for port in &publishes {
+                        if !policy.network.bind_ports.contains(port) {
+                            policy.network.bind_ports.push(*port);
+                        }
+                    }
+                }
+                policy.network.publish_ports.clear();
+            }
         }
+        None => {}
     }
 
     Ok((
@@ -2089,11 +2789,18 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
     report_untrusted(&program, args.config.as_deref());
     warn_if_target_denied(&resolved.policy, &program);
 
+    // The bundle directory is made before the fork, so the creator inherits
+    // its path; the broker's CA is written into it after the broker answers.
+    let ca_bundle = ca_bundle_for(&resolved.policy);
+    let ca_bundle_file =
+        ca_bundle.as_ref().map(|dir| dir.join("ca-bundle.pem"));
+
     let (wrapped, guard_in_place, decision, pins) = prepare_network(
         &mut resolved.policy,
         &args.network,
         args.no_isolate,
         !args.quiet && !args.json,
+        ca_bundle_file.as_deref(),
     )?;
     if let Wrapped::Parent(code) = wrapped {
         return Ok(code);
@@ -2124,6 +2831,7 @@ fn cmd_run(args: RunArgs) -> anyhow::Result<i32> {
         guard_in_place,
         audit_listener: None,
         pins,
+        ca_bundle,
     };
     let code = backend.run(&resolved.policy, &target)?;
     if let Err(err) = resolved.hooks.run_post_exit(code) {
@@ -2171,8 +2879,15 @@ fn cmd_shell(args: ShellArgs) -> anyhow::Result<i32> {
         .set
         .insert("BAILEY_SANDBOX_DIR".into(), dir.display().to_string());
 
-    let (wrapped, guard_in_place, decision, pins) =
-        prepare_network(&mut resolved.policy, &args.network, args.no_isolate, true)?;
+    let ca_bundle = ca_bundle_for(&resolved.policy);
+    let ca_bundle_file = ca_bundle.as_ref().map(|dir| dir.join("ca-bundle.pem"));
+    let (wrapped, guard_in_place, decision, pins) = prepare_network(
+        &mut resolved.policy,
+        &args.network,
+        args.no_isolate,
+        true,
+        ca_bundle_file.as_deref(),
+    )?;
     if let Wrapped::Parent(code) = wrapped {
         return Ok(code);
     }
@@ -2197,12 +2912,28 @@ fn cmd_shell(args: ShellArgs) -> anyhow::Result<i32> {
         guard_in_place,
         audit_listener: None,
         pins,
+        ca_bundle,
     };
     let code = backend.run(&resolved.policy, &target)?;
     if let Err(err) = resolved.hooks.run_post_exit(code) {
         eprintln!("bailey: post-exit hook failed: {err}");
     }
     Ok(code)
+}
+
+/// The directory for the combined CA bundle, when this run intercepts.
+///
+/// `None` when no host is intercepted: no CA is generated, and nothing is
+/// mounted. Made here, before any fork, so both the parent that writes the
+/// bundle and the creator that mounts it can name the path.
+fn ca_bundle_for(policy: &crate::policy::Policy) -> Option<std::path::PathBuf> {
+    if policy.network.broker == Some(crate::policy::Broker::Builtin)
+        && !policy.http.intercept.is_empty()
+    {
+        Some(create_ca_bundle_dir().expect("the CA bundle directory is created"))
+    } else {
+        None
+    }
 }
 
 /// The shell to confine: the one the user asked for, the one they chose for
@@ -2858,6 +3589,33 @@ pub fn resolve_helper(name: &str) -> anyhow::Result<PathBuf> {
         "`{name}` was found at {} but is writable by someone other than its owner; refusing to run it",
         rejected.join(", ")
     )
+}
+
+/// Find `bailey-broker` beside bailey's own executable, then in the trusted
+/// helper directories.
+///
+/// Beside the executable covers a release archive carried as one directory
+/// and a `cargo build` workspace, where the helper and bailey land together
+/// and no system directory is involved. The trust test applies to a hit
+/// there as much as to one in `HELPER_DIRS`. An explicit
+/// `BAILEY_HELPER_DIRS` replaces the search whole, beside the executable
+/// included, so a run can be pointed at a helper of the operator's or the
+/// tests' choosing.
+fn resolve_broker_helper() -> anyhow::Result<PathBuf> {
+    const NAME: &str = "bailey-broker";
+    if std::env::var_os("BAILEY_HELPER_DIRS").is_none()
+        && let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let candidate = dir.join(NAME);
+        if let Ok(meta) = std::fs::metadata(&candidate)
+            && meta.is_file()
+            && crate::backend::probe::runnable_as_caller(&meta)
+        {
+            return Ok(candidate);
+        }
+    }
+    resolve_helper(NAME)
 }
 
 fn resolve_target(name: &str) -> anyhow::Result<PathBuf> {
@@ -4227,7 +4985,7 @@ mod tests {
             protocol: Protocol::Tcp,
             port: Some(443),
         }]);
-        let err = prepare_network(&mut policy, &NetworkArgs::default(), true, false)
+        let err = prepare_network(&mut policy, &NetworkArgs::default(), true, false, None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("--no-isolate"), "{err}");
@@ -4244,7 +5002,7 @@ mod tests {
         let mut policy = Policy::default();
         policy.network.mode = crate::policy::NetworkMode::Private;
         policy.network.egress = Egress::AllowAll;
-        let err = prepare_network(&mut policy, &NetworkArgs::default(), true, false)
+        let err = prepare_network(&mut policy, &NetworkArgs::default(), true, false, None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("--no-isolate"), "{err}");
@@ -4254,7 +5012,7 @@ mod tests {
         let mut policy = Policy::default();
         policy.network.mode = crate::policy::NetworkMode::Private;
         policy.network.dns = crate::policy::DnsSetting::Deny;
-        prepare_network(&mut policy, &NetworkArgs::default(), true, false).unwrap();
+        prepare_network(&mut policy, &NetworkArgs::default(), true, false, None).unwrap();
     }
 
     /// The resolver is libc's, asked on the host before anything forks, so a

@@ -18,23 +18,34 @@
 #
 # What this egress rule enforces depends on the network mode. Automatic mode
 # (the default) places an egress-allowing run in the private network namespace,
-# which hides the host's address and the host's loopback services, and needs
-# pasta and user namespaces. `mode = "host"` in a config shares the host's
-# namespace instead, where only TCP ports are enforced: the agent reaches any
-# host on 443, and UDP, DNS and the host's loopback are unrestricted there.
-# `broker = "ADDR:PORT"` or `--egress-proxy ADDR:PORT` confines egress further,
-# to a broker on the host that admits only the destinations it allows. The
-# modes and their reasons are in the network guide, docs/guide/network.md.
+# which hides the host's address and the host's loopback services. With a
+# destination rule in place the built-in egress broker serves the run: the
+# broker admits only the destinations the policy allows, and an `[http]`
+# section can intercept hosts and attach credentials from your environment,
+# so the agent's key stays out of its reach. `broker = "ADDR:PORT"` or
+# `--egress-proxy ADDR:PORT` names an external broker instead. The modes and
+# their reasons are in the network guide, docs/guide/network.md.
 #
 # The rule stays `*` because a profile cannot know which API you use. To pin
-# the agent to its model's endpoint, replace the rule with the host you use,
-# and bailey resolves it once and admits only the addresses it returned:
+# the agent to its model's endpoint and keep its key out of the sandbox,
+# replace the rule with the host you use and bind the key to it, and bailey
+# resolves the host once and admits only the addresses it returned:
 #
 #     [network]
-#     egress_allow = [{ host = "api.openai.com", port = 443 }]
+#     egress_allow = [{ host = "api.anthropic.com", port = 443 }]
 #
-# The destination rules need the private namespace (and `nft`), so a config
-# that also sets `mode = "host"` is refused rather than enforced by port alone.
+#     [http]
+#     intercept = ["api.anthropic.com"]
+#
+#     [[http.credential]]
+#     host = "api.anthropic.com"
+#     auth = "header:x-api-key"
+#     source = "env:ANTHROPIC_API_KEY"
+#
+# A credential binding is accepted from a caller's own layer (a profile, the
+# global config or `--config`), not from a project's discovered bailey.toml,
+# and the variable it names is denied to the agent's environment whatever a
+# `pass` says.
 #
 # For an agent that must not reach the network, use the `untrusted` floor,
 # which denies it outright.

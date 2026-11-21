@@ -127,6 +127,15 @@ pub struct IsolationPlan {
     /// Host directory the new root is staged in, created exclusively by the
     /// parent before the run and removed by it after.
     pub staging: PathBuf,
+    /// The per-run combined trust bundle, bound read-only over each path in
+    /// [`Self::ca_bundle_overlays`]. `None` when no host is
+    /// intercepted.
+    pub ca_bundle_source: Option<PathBuf>,
+    /// The paths in the root the bundle is bound over, in preference order.
+    pub ca_bundle_overlays: Vec<PathBuf>,
+    /// The overlay path the CA variables name: the first one the root
+    /// carries.
+    pub ca_bundle_visible: Option<PathBuf>,
 }
 
 /// Whether namespace isolation actually works on this host.
@@ -521,6 +530,16 @@ fn setup_root(plan: &IsolationPlan) -> io::Result<()> {
     }
 
     conceal_all(&new_root, &plan.conceal)?;
+    if let Some(source) = &plan.ca_bundle_source {
+        let landed = mount_ca_bundle(&new_root, source, &plan.ca_bundle_overlays)?;
+        if landed == 0 {
+            return Err(io::Error::other(
+                "the CA bundle could not be placed: none of the system trust \
+                 paths reached the sandbox root, so intercepted hosts would be \
+                 untrusted; the run is refused",
+            ));
+        }
+    }
     remount_read_only(&new_root, &plan.read_only)?;
 
     // A fresh /proc, meaningful because we are in a new PID namespace.
@@ -733,6 +752,69 @@ fn conceal_all(new_root: &Path, conceal: &[Conceal]) -> io::Result<()> {
         let _ = fs::remove_file(&placeholder);
     }
     Ok(())
+}
+
+/// Bind the per-run trust bundle read-only over each system trust path the
+/// root carries.
+///
+/// The bundle is public material: the host's own certificates and the run's
+/// CA. The mount is the only way it enters the target's view, so a swapped
+/// path cannot change what the target reads. A symlink at a covered path is
+/// mounted through, which lands the bundle on its destination, the way a
+/// distribution lays its bundle out; a symlink that leaves the sandbox is
+/// refused, the same rule the read-only islands apply.
+///
+/// @returns how many paths the bundle landed on.
+fn mount_ca_bundle(
+    new_root: &Path,
+    source: &Path,
+    overlays: &[PathBuf],
+) -> io::Result<usize> {
+    let mut landed = 0;
+    for path in overlays {
+        let relative = path.strip_prefix("/").unwrap_or(path);
+        let Some((target, _held)) = resolve_beneath(new_root, relative)? else {
+            continue;
+        };
+        let visible = new_root.join(relative);
+        if let Ok(to) = std::fs::read_link(&visible)
+            && !resolves_inside(new_root, &visible, &to)
+        {
+            return Err(io::Error::other(format!(
+                "the trust bundle path {} is a symlink to {}, which leaves \
+                 the sandbox, and the CA bundle cannot be placed on one",
+                path.display(),
+                to.display()
+            )));
+        }
+        mount(
+            Some(source),
+            &target,
+            None::<&str>,
+            MsFlags::MS_BIND,
+            None::<&str>,
+        )
+        .map_err(errno)?;
+        // Named by its real path rather than the descriptor, for the same
+        // reason `conceal_all` names its target that way. The mount inherits
+        // its flags from the host filesystem the bundle sits on, so the
+        // remount repeats what `locked_flags` says the kernel refuses to see
+        // dropped, exactly as `remount_read_only` does for its grants.
+        let carried = statvfs(&visible).map_err(errno)?.flags().bits();
+        mount(
+            None::<&str>,
+            &visible,
+            None::<&str>,
+            MsFlags::MS_REMOUNT
+                | MsFlags::MS_BIND
+                | MsFlags::MS_RDONLY
+                | locked_flags(carried),
+            None::<&str>,
+        )
+        .map_err(errno)?;
+        landed += 1;
+    }
+    Ok(landed)
 }
 
 /// Resolve an existing path beneath `root` without following a symlink.

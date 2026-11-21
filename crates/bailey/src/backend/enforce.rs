@@ -314,6 +314,10 @@ pub struct EnforceBackend {
     /// client resolves inside the sandbox to the addresses the netfilter
     /// rules admit. Empty when the policy names no hostname.
     pub pins: Vec<crate::cli::Pin>,
+    /// The per-run directory holding the combined trust bundle, when the run
+    /// intercepts. The isolation plan binds the bundle file inside it over
+    /// the system bundle paths, and the run removes the directory at the end.
+    pub ca_bundle: Option<PathBuf>,
 }
 
 /// How a run reports what it enforced.
@@ -443,7 +447,15 @@ impl EnforceBackend {
         match mode {
             NetworkMode::Isolated => report.applied("network namespace"),
             NetworkMode::Private => report.applied("network namespace (private)"),
-            NetworkMode::Brokered => report.applied("egress broker"),
+            NetworkMode::Brokered => match policy.network.broker {
+                Some(crate::policy::Broker::Builtin) => {
+                    report.applied("egress broker (built-in)")
+                }
+                Some(crate::policy::Broker::External(..)) => {
+                    report.applied("egress broker (external)")
+                }
+                None => report.applied("egress broker"),
+            },
             NetworkMode::LandlockOnly => match inherited {
                 network::Inherited::IsolatedNamespace | network::Inherited::PrivateNamespace => {
                     report.applied("network namespace (inherited)")
@@ -674,6 +686,12 @@ impl EnforceBackend {
         } else {
             None
         };
+        // The bundle file inside the per-run directory, what the plan binds
+        // and what the CA variables name when nothing covers it.
+        let ca_bundle_file = self
+            .ca_bundle
+            .as_ref()
+            .map(|dir| dir.join("ca-bundle.pem"));
         let generated_policy;
         let policy = if let Some((_, files)) = &generated_files {
             generated_policy = policy_with_generated(policy, files);
@@ -693,7 +711,13 @@ impl EnforceBackend {
         let isolation = if self.isolate {
             if userns {
                 report.applied("namespace isolation");
-                let plan = build_isolation_plan(policy, mode, &world, &self.implicit_write)?;
+                let plan = build_isolation_plan(
+                    policy,
+                    mode,
+                    &world,
+                    &self.implicit_write,
+                    ca_bundle_file.as_deref(),
+                )?;
                 // The bind source has to exist before it is bound at /tmp. It
                 // is created empty, which is what /tmp starts as anyway.
                 if let Some(dir) = &plan.tmp_dir {
@@ -724,6 +748,27 @@ impl EnforceBackend {
             report_unenforceable_denials(policy, nested);
             report_widened_grants(policy, &self.implicit_write, nested);
         }
+
+        // The trust bundle an intercepted run sees: under isolation the
+        // covered system path, without it the per-run file itself. Either
+        // way the target needs a Landlock read grant for the path it is
+        // handed, and the CA variables name it.
+        let ca_visible = isolation
+            .as_ref()
+            .and_then(|plan| plan.ca_bundle_visible.clone())
+            .or_else(|| ca_bundle_file.clone().filter(|_| isolation.is_none()));
+        if let Some(path) = &ca_visible
+            && let Some(bits) = fs_access_bits(policy::Access::READ)
+        {
+            plan.filesystem.push((path.clone(), bits));
+        }
+        let ca_policy;
+        let policy = if let Some(path) = &ca_visible {
+            ca_policy = policy_with_ca_variables(policy, path);
+            &ca_policy
+        } else {
+            policy
+        };
 
         // Without the isolation layer, the network namespace is entered on its
         // own, so a plain `bailey run` still gets real egress denial.
@@ -825,7 +870,10 @@ impl EnforceBackend {
                 .collect(),
             plain: generated_files
                 .map(|(dir, _)| vec![dir])
-                .unwrap_or_default(),
+                .unwrap_or_default()
+                .into_iter()
+                .chain(self.ca_bundle.clone())
+                .collect(),
         };
         let stop_before_exec = self.stop_before_exec;
         let create_guard = creates_guard(self.guard_in_place);
@@ -899,7 +947,8 @@ impl EnforceBackend {
                     std::fs::write(procs, "0")?;
                 }
                 if let Some(isolation) = &isolation {
-                    isolation::enter(isolation, create_guard)?;
+                    isolation::enter(isolation, create_guard)
+                        .map_err(|error| io::Error::other(format!("enter: {error}")))?;
                 } else if network_only {
                     network::enter_isolated(create_guard)?;
                 }
@@ -1102,6 +1151,30 @@ fn policy_with_generated(policy: &Policy, generated: &[(PathBuf, PathBuf)]) -> P
             at: Some(at.clone()),
         });
         extended.read_only.push(at.clone());
+    }
+    extended
+}
+
+/// Name the covered trust path in every variable a TLS client reads.
+///
+/// `SSL_CERT_FILE` alone would miss requests, which keeps its own bundle and
+/// ignores the system path unless `REQUESTS_CA_BUNDLE` is set, so that
+/// variable is load-bearing rather than convenient.
+fn policy_with_ca_variables(policy: &Policy, path: &Path) -> Policy {
+    let mut extended = policy.clone();
+    let value = path.display().to_string();
+    for name in [
+        "SSL_CERT_FILE",
+        "REQUESTS_CA_BUNDLE",
+        "CURL_CA_BUNDLE",
+        "GIT_SSL_CAINFO",
+        "PIP_CERT",
+        "NODE_EXTRA_CA_CERTS",
+        "DENO_CERT",
+        "CARGO_HTTP_CAINFO",
+        "AWS_CA_BUNDLE",
+    ] {
+        extended.env.set.insert(name.into(), value.clone());
     }
     extended
 }
@@ -1719,6 +1792,7 @@ fn build_isolation_plan(
     mode: NetworkMode,
     world: &World,
     implicit_write: &[PathBuf],
+    ca_bundle: Option<&Path>,
 ) -> Result<IsolationPlan, BackendError> {
     sweep_stale_staging();
 
@@ -1850,6 +1924,57 @@ fn build_isolation_plan(
     read_only.sort_by(|a, b| a.visible.cmp(&b.visible));
     read_only.dedup_by(|a, b| a.visible == b.visible);
 
+    // The interception bundle: bound read-only over every
+    // system trust path the reconstructed root carries, and the host's own
+    // bundle added as a bind of its own when the root carries none, so
+    // there is always one to cover. A path a denial covers over is
+    // skipped: the cover would hide the bundle again.
+    let mut ca_bundle_source = None;
+    let mut ca_bundle_overlays = Vec::new();
+    let mut ca_bundle_visible = None;
+    if !policy.http.intercept.is_empty() {
+        let Some(bundle) = ca_bundle else {
+            return Err(BackendError::Command(
+                "the policy intercepts hosts, which needs the CA bundle \
+                 directory this run did not create; the run is refused"
+                    .into(),
+            ));
+        };
+        ca_bundle_source = Some(bundle.to_path_buf());
+        for listed in crate::broker::CA_BUNDLE_PATHS {
+            let path = PathBuf::from(listed);
+            if conceal.iter().any(|cover| path.starts_with(&cover.path)) {
+                continue;
+            }
+            let present = binds.iter().any(|bind| {
+                (bind.is_dir && path.starts_with(&bind.at)) || bind.at == path
+            }) || links.iter().any(|link| link.at == path);
+            if present {
+                if ca_bundle_visible.is_none() {
+                    ca_bundle_visible = Some(path.clone());
+                }
+                ca_bundle_overlays.push(path);
+            }
+        }
+        if ca_bundle_overlays.is_empty() {
+            let host = crate::broker::system_ca_bundle().ok_or_else(|| {
+                BackendError::Command(
+                    "no system trust bundle exists on this host, and an \
+                     intercepted run has nothing to bind its CA over; the \
+                     run is refused"
+                        .into(),
+                )
+            })?;
+            binds.push(BindMount {
+                source: host.clone(),
+                at: host.clone(),
+                is_dir: false,
+            });
+            ca_bundle_visible = Some(host.clone());
+            ca_bundle_overlays.push(host);
+        }
+    }
+
     Ok(IsolationPlan {
         binds,
         links,
@@ -1869,6 +1994,9 @@ fn build_isolation_plan(
         runtime_dir: world::runtime_dir_inside(policy),
         cwd: world.cwd.clone(),
         staging: staging_dir()?,
+        ca_bundle_source,
+        ca_bundle_overlays,
+        ca_bundle_visible,
     })
 }
 
@@ -3319,7 +3447,7 @@ mod tests {
     /// since only a run holds the guard that removes it.
     fn plan_for(policy: &Policy, implicit: &[PathBuf]) -> IsolationPlan {
         let world = World::derive(Path::new("/bin/true"), policy, true);
-        let plan = build_isolation_plan(policy, NetworkMode::Isolated, &world, implicit).unwrap();
+        let plan = build_isolation_plan(policy, NetworkMode::Isolated, &world, implicit, None).unwrap();
         let _ = std::fs::remove_dir(&plan.staging);
         plan
     }
@@ -3882,6 +4010,83 @@ mod tests {
         }
     }
 
+    /// Installs the broker's filter in a forked child and probes the IPC
+    /// boundary: `socket` and `socketpair` for `AF_UNIX` are
+    /// refused with `EPERM`, the internet families pass.
+    #[test]
+    fn the_broker_filter_refuses_unix_sockets_in_a_child() {
+        let program = broker_seccomp_program().expect("the filter builds");
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            unsafe {
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                    libc::_exit(PROBE_PRCTL_FAILED);
+                }
+                let fprog = libc::sock_fprog {
+                    len: program.len() as u16,
+                    filter: program.as_ptr().cast::<libc::sock_filter>().cast_mut(),
+                };
+                if libc::syscall(libc::SYS_seccomp, libc::SECCOMP_SET_MODE_FILTER, 0, &fprog) != 0 {
+                    libc::_exit(PROBE_SECCOMP_FAILED);
+                }
+                let errno_of = |family: i32| {
+                    let fd = libc::socket(family, libc::SOCK_STREAM, 0);
+                    if fd >= 0 {
+                        libc::close(fd);
+                        0
+                    } else {
+                        *libc::__errno_location()
+                    }
+                };
+                let mut pair = [0 as libc::c_int; 2];
+                let paired = libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_STREAM,
+                    0,
+                    pair.as_mut_ptr(),
+                );
+                let pair_errno = if paired == 0 { 0 } else { *libc::__errno_location() };
+                if errno_of(libc::AF_UNIX) != libc::EPERM {
+                    libc::_exit(1);
+                }
+                if pair_errno != libc::EPERM {
+                    libc::_exit(2);
+                }
+                if errno_of(libc::AF_INET) != 0 {
+                    libc::_exit(3);
+                }
+                if errno_of(libc::AF_INET6) != 0 {
+                    libc::_exit(4);
+                }
+                libc::_exit(0);
+            }
+        }
+
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(
+            waited,
+            pid,
+            "waitpid failed: {}",
+            std::io::Error::last_os_error()
+        );
+        assert!(libc::WIFEXITED(status), "the probe child did not exit");
+        match libc::WEXITSTATUS(status) {
+            0 => {}
+            code if code == PROBE_SECCOMP_FAILED => {
+                skip("this host will not install an unprivileged seccomp filter")
+            }
+            code if code == PROBE_PRCTL_FAILED => skip("this host will not set no_new_privs"),
+            1 => panic!("socket(AF_UNIX) was not refused with EPERM"),
+            2 => panic!("socketpair(AF_UNIX) was not refused with EPERM"),
+            3 => panic!("socket(AF_INET) was refused by the broker filter"),
+            4 => panic!("socket(AF_INET6) was refused by the broker filter"),
+            other => panic!("the probe child exited with unexpected code {other}"),
+        }
+    }
+
     /// The layout table in the change design, asserted for all four rows: a
     /// run that builds namespaces from the host creates a fresh guard, and a
     /// proxied run runs beneath the guard the proxy namespace already is.
@@ -4087,7 +4292,7 @@ mod tests {
             at: None,
         });
         let world = World::derive(Path::new("/bin/true"), &policy, true);
-        let err = match build_isolation_plan(&policy, NetworkMode::Isolated, &world, &[]) {
+        let err = match build_isolation_plan(&policy, NetworkMode::Isolated, &world, &[], None) {
             Err(err) => err,
             Ok(_) => {
                 if unsafe { libc::geteuid() } == 0 {
@@ -4128,7 +4333,7 @@ mod tests {
         let policy = Policy::default();
         let world = World::derive(Path::new("/bin/true"), &policy, true);
 
-        let plan = build_isolation_plan(&policy, NetworkMode::Isolated, &world, &[]).unwrap();
+        let plan = build_isolation_plan(&policy, NetworkMode::Isolated, &world, &[], None).unwrap();
         let meta = std::fs::metadata(&plan.staging)
             .expect("the staging directory exists once the plan is built");
         assert_eq!(
@@ -4160,7 +4365,7 @@ mod tests {
         );
 
         // A concurrent run stages beside this one, never at its name.
-        let other = build_isolation_plan(&policy, NetworkMode::Isolated, &world, &[]).unwrap();
+        let other = build_isolation_plan(&policy, NetworkMode::Isolated, &world, &[], None).unwrap();
         assert_ne!(plan.staging, other.staging, "the name is fresh per run");
 
         let _ = std::fs::remove_dir(&plan.staging);

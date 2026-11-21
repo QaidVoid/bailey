@@ -9,7 +9,7 @@
 //! through the stdin pipe, never in arguments or environment.
 
 use serde::{Deserialize, Serialize};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 
 /// The protocol version both sides must agree on.
 ///
@@ -161,14 +161,38 @@ impl BrokerReady {
     }
 
     /// Decode the ready line: one line, then nothing may follow.
+    /// Decode the ready line: exactly one line, then the channel stays open
+    /// for the counts line the broker writes when it is asked to stop.
+    ///
+    /// Waiting for EOF here would deadlock: the broker holds its stdout for
+    /// as long as it serves.
     pub fn decode(reader: &mut impl Read) -> Result<Self, WireError> {
-        let mut text = Vec::new();
-        reader.read_to_end(&mut text)?;
-        let text = std::str::from_utf8(&text).map_err(|source| {
+        const MAX_LINE: usize = 64 * 1024;
+        let mut line = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            let read = reader.read(&mut byte)?;
+            if read == 0 {
+                return Err(WireError::Io(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "the connection closed before a complete line arrived",
+                )));
+            }
+            if byte[0] == b'\n' {
+                break;
+            }
+            line.push(byte[0]);
+            if line.len() > MAX_LINE {
+                return Err(WireError::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "the line exceeds 64 KiB",
+                )));
+            }
+        }
+        let text = std::str::from_utf8(&line).map_err(|source| {
             WireError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, source))
         })?;
-        let line = text.trim_end_matches(['\r', '\n']);
-        let ready: Self = serde_json::from_str(line)?;
+        let ready: Self = serde_json::from_str(text)?;
         if ready.version != BROKER_PROTOCOL_VERSION {
             return Err(WireError::Version {
                 found: ready.version,

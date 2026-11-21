@@ -186,8 +186,25 @@ pub fn decide(
         });
     }
 
-    if let Some(crate::policy::Broker::External(addr, port)) = policy.network.broker {
+    if let Some(broker) = policy.network.broker {
         let source = policy.network.broker_source.as_deref().unwrap_or("unknown");
+        let crate::policy::Broker::External(addr, port) = broker else {
+            // The built-in broker is served from outside the namespace but
+            // hears only the listener handed out of it, so it needs the
+            // namespace and nothing else: no pasta, no nft.
+            if !caps.user_namespaces {
+                anyhow::bail!(
+                    "the built-in egress broker ({source}) needs the private \
+                     namespace, which needs user namespaces, which are \
+                     unavailable; the run is refused"
+                );
+            }
+            return Ok(NetworkDecision {
+                mode: NetworkMode::Brokered,
+                source: source.to_owned(),
+                reason: "egress broker (built-in)".to_owned(),
+            });
+        };
         if !caps.user_namespaces || !caps.pasta {
             anyhow::bail!(
                 "the broker at {addr}:{port} ({source}) needs the private \

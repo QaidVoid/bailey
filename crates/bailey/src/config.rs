@@ -1379,6 +1379,7 @@ fn build_http_rule(
 fn build_credential(
     raw: &RawCredential,
     path: &Path,
+    base: &Path,
 ) -> Result<crate::policy::CredentialBinding, ConfigError> {
     let invalid = |reason: String| ConfigError::Invalid {
         path: path.to_path_buf(),
@@ -1392,8 +1393,18 @@ fn build_credential(
     let auth = if raw.auth == "bearer" {
         crate::policy::AuthShape::Bearer
     } else if let Some(name) = raw.auth.strip_prefix("header:") {
+        // A credential cannot ride a header the broker strips or writes
+        // itself: the attachment would be silently dropped or would
+        // corrupt the framing.
+        let lowered = name.to_ascii_lowercase();
         if !is_token(name) {
             return Err(invalid(format!("auth `{}` is not a header name", raw.auth)));
+        }
+        if crate::policy::HOP_BY_HOP_HEADERS.contains(&lowered.as_str()) {
+            return Err(invalid(format!(
+                "auth `{}` names a header the broker writes or strips itself",
+                raw.auth
+            )));
         }
         crate::policy::AuthShape::Header(name.to_owned())
     } else {
@@ -1408,7 +1419,13 @@ fn build_credential(
         if file.is_empty() {
             return Err(invalid("`file:` needs a path".into()));
         }
-        crate::policy::CredentialSource::File(PathBuf::from(file))
+        // Absolute, or relative to the config file, `~` expanded: the parent
+        // reads the value long after this layer is gone, so the path must be
+        // settled here, where the layer's base is still known.
+        let Some(resolved) = resolve_path(file, base) else {
+            return Err(invalid(format!("`file:` path `{file}` must resolve")));
+        };
+        crate::policy::CredentialSource::File(resolved)
     } else if let Some(fd) = raw.source.strip_prefix("fd:") {
         let fd = fd
             .parse::<u32>()
@@ -1464,8 +1481,16 @@ fn apply_http(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> {
                 "binds one of the caller's secrets to a host",
             ));
         }
-        acc.http_credentials
-            .push((build_credential(raw, &layer.path)?, layer.path.clone()));
+        let built = build_credential(raw, &layer.path, &layer.base)?;
+        // The value leaves the machine when the broker attaches it, so the
+        // variable that holds it must not reach the target's environment
+        // whatever a pass or set says.
+        if let crate::policy::CredentialSource::Env(name) = &built.source
+            && !acc.env.deny.contains(name)
+        {
+            acc.env.deny.push(name.clone());
+        }
+        acc.http_credentials.push((built, layer.path.clone()));
     }
     if let Some(log) = &http.log {
         if !layer.origin.may_hold_secrets() {

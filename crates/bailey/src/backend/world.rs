@@ -649,6 +649,27 @@ mod tests {
         assert!(!env.contains_key("TERM"));
     }
 
+    /// A credential's `env:` name is denied however it is passed or set:
+    /// the value travels to the broker alone.
+    #[test]
+    fn a_credential_env_name_is_denied_when_passed_and_set() {
+        unsafe { std::env::set_var("BAILEY_CRED_SOURCE", "secret-value") };
+        let mut policy = policy_granting(&["/usr"]);
+        policy.env.pass = vec!["BAILEY_*".into()];
+        policy.env.deny = vec!["BAILEY_CRED_SOURCE".into()];
+
+        let world = World::derive(Path::new("/opt/game/game"), &policy, false);
+        let env: BTreeMap<_, _> = environment(
+            &policy,
+            &world,
+            Some(Inherited::publish(NetworkMode::Isolated)),
+        )
+        .into_iter()
+        .collect();
+
+        assert_eq!(env.get("BAILEY_CRED_SOURCE"), None);
+    }
+
     #[test]
     fn the_sandbox_marker_is_in_the_base_set_and_can_be_denied() {
         let policy = policy_granting(&["/usr"]);
