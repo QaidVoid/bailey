@@ -1506,10 +1506,7 @@ except OSError:
         "the named-destination run must succeed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(
-        stdout_of(&output),
-        "tcp-ok\ndns-dropped\ntcp-dns-dropped"
-    );
+    assert_eq!(stdout_of(&output), "tcp-ok\ndns-dropped\ntcp-dns-dropped");
 }
 
 /// A deny inside an allowed range wins over the range, per family: the

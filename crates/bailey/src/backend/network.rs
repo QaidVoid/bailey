@@ -211,8 +211,10 @@ pub fn decide(
         // policy that does not apply.
         let mut reason = format!("egress is held to the broker at {addr}:{port}");
         if policy.network.needs_egress_namespace() {
-            reason.push_str("; the destination rules and DNS setting are \
-                             superseded by the broker");
+            reason.push_str(
+                "; the destination rules and DNS setting are \
+                             superseded by the broker",
+            );
         }
         return Ok(NetworkDecision {
             mode: NetworkMode::Brokered,
@@ -698,7 +700,9 @@ mod tests {
             decide(&named, &full, false, &[], &[]).unwrap().mode,
             NetworkMode::Private
         );
-        let err = decide(&named, &no_caps, false, &[], &[]).unwrap_err().to_string();
+        let err = decide(&named, &no_caps, false, &[], &[])
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("destination, UDP and deny rules"), "{err}");
 
         let udp = policy_with(NetworkPolicy {

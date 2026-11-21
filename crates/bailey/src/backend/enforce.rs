@@ -823,7 +823,9 @@ impl EnforceBackend {
                 .map(|plan| plan.staging.clone())
                 .into_iter()
                 .collect(),
-            plain: generated_files.map(|(dir, _)| vec![dir]).unwrap_or_default(),
+            plain: generated_files
+                .map(|(dir, _)| vec![dir])
+                .unwrap_or_default(),
         };
         let stop_before_exec = self.stop_before_exec;
         let create_guard = creates_guard(self.guard_in_place);
@@ -1143,7 +1145,10 @@ fn write_generated_files(
     }
     if dns_forward {
         let file = dir.join("resolv.conf");
-        std::fs::write(&file, format!("nameserver {}\n", crate::cli::DNS_FORWARDER_V4))?;
+        std::fs::write(
+            &file,
+            format!("nameserver {}\n", crate::cli::DNS_FORWARDER_V4),
+        )?;
         generated.push((file, PathBuf::from("/etc/resolv.conf")));
     }
     Ok(Some((dir, generated)))
@@ -1670,11 +1675,7 @@ fn generated_file_names(dir: &Path) -> Option<Vec<&'static str>> {
         }
         names.push(name);
     }
-    if names.is_empty() {
-        None
-    } else {
-        Some(names)
-    }
+    if names.is_empty() { None } else { Some(names) }
 }
 
 /// The host path behind one the target sees, following a relocated grant.
@@ -4043,16 +4044,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         // The exact shape a dead run's generated-files staging has.
-        let healed = dir
-            .path()
-            .join(format!("{STAGING_PREFIX}987654321.c0ffee"));
+        let healed = dir.path().join(format!("{STAGING_PREFIX}987654321.c0ffee"));
         std::fs::create_dir_all(&healed).unwrap();
         std::fs::write(healed.join("hosts"), "127.0.0.1 pinned\n").unwrap();
         std::fs::write(healed.join("resolv.conf"), "nameserver 10.0.2.3\n").unwrap();
         // The same shape plus one name the generated staging never writes.
-        let lookalike = dir
-            .path()
-            .join(format!("{STAGING_PREFIX}987654320.c0ffee"));
+        let lookalike = dir.path().join(format!("{STAGING_PREFIX}987654320.c0ffee"));
         std::fs::create_dir_all(&lookalike).unwrap();
         std::fs::write(lookalike.join("hosts"), "127.0.0.1 pinned\n").unwrap();
         std::fs::write(lookalike.join("kept"), "not ours").unwrap();
@@ -4223,7 +4220,10 @@ mod tests {
         );
         assert_eq!(files[0].1, PathBuf::from("/etc/hosts"));
         let resolv = String::from_utf8(std::fs::read(&files[1].0).unwrap()).unwrap();
-        assert_eq!(resolv, format!("nameserver {}\n", crate::cli::DNS_FORWARDER_V4));
+        assert_eq!(
+            resolv,
+            format!("nameserver {}\n", crate::cli::DNS_FORWARDER_V4)
+        );
         assert_eq!(files[1].1, PathBuf::from("/etc/resolv.conf"));
         let _ = std::fs::remove_dir(&dir);
 
@@ -4259,10 +4259,7 @@ mod tests {
         let extended = policy_with_generated(&policy, &generated);
         assert_eq!(extended.filesystem.len(), 1);
         assert_eq!(extended.filesystem[0].access, Access::READ);
-        assert_eq!(
-            extended.filesystem[0].at,
-            Some(PathBuf::from("/etc/hosts"))
-        );
+        assert_eq!(extended.filesystem[0].at, Some(PathBuf::from("/etc/hosts")));
         assert!(extended.read_only.contains(&PathBuf::from("/etc/hosts")));
     }
 

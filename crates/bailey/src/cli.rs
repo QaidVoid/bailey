@@ -1085,9 +1085,7 @@ fn egress_ruleset(
     // whose port the policy also allows must not become a route to the host
     // service behind it through any other address.
     for port in publishes {
-        ruleset.push_str(&format!(
-            "\t\tip daddr 127.0.0.1 tcp dport {port} accept\n"
-        ));
+        ruleset.push_str(&format!("\t\tip daddr 127.0.0.1 tcp dport {port} accept\n"));
     }
     for forward in forwards {
         ruleset.push_str(&format!(
@@ -1119,10 +1117,7 @@ fn egress_ruleset(
     ruleset.push_str("\t\toif \"lo\" accept\n");
 
     for (protocol, port) in &allowed_any {
-        ruleset.push_str(&format!(
-            "\t\t{} dport {port} accept\n",
-            protocol.name()
-        ));
+        ruleset.push_str(&format!("\t\t{} dport {port} accept\n", protocol.name()));
     }
     for (port, protocol, addresses) in &allowed_sets {
         let proto = protocol.name();
@@ -1760,12 +1755,7 @@ fn prepare_network(
     args: &NetworkArgs,
     no_isolate: bool,
     announce: bool,
-) -> anyhow::Result<(
-    Wrapped,
-    bool,
-    Option<network::NetworkDecision>,
-    Vec<Pin>,
-)> {
+) -> anyhow::Result<(Wrapped, bool, Option<network::NetworkDecision>, Vec<Pin>)> {
     apply_network_flags(policy, args)?;
     // --no-isolate promises a run of Landlock and seccomp alone, so automatic
     // mode does not hand back a namespace with it. A policy or flag that asks
@@ -1868,9 +1858,7 @@ fn prepare_network(
         // be whatever nft's absence leaves open.
         let ruleset = egress_ruleset(&pins, &policy.network, &forwards, &publishes);
         if let Err(err) = run_nft(&ruleset) {
-            anyhow::bail!(
-                "the egress rules could not be installed, so the run is refused: {err}"
-            );
+            anyhow::bail!("the egress rules could not be installed, so the run is refused: {err}");
         }
         for forward in &forwards {
             permit_egress_port(policy, forward.port);
@@ -2892,17 +2880,13 @@ fn print_policy_to(
                 writeln!(out, "  egress: denied (no rules set)")
                     .expect("writing the policy report");
             } else {
-                writeln!(out, "  egress: allowed to:")
-                    .expect("writing the policy report");
+                writeln!(out, "  egress: allowed to:").expect("writing the policy report");
                 for rule in rules {
                     match rule.port {
-                        Some(port) => writeln!(
-                            out,
-                            "    {} {}:{port}",
-                            rule.protocol.name(),
-                            rule.host
-                        )
-                        .expect("writing the policy report"),
+                        Some(port) => {
+                            writeln!(out, "    {} {}:{port}", rule.protocol.name(), rule.host)
+                                .expect("writing the policy report")
+                        }
                         None => writeln!(out, "    {} {}", rule.protocol.name(), rule.host)
                             .expect("writing the policy report"),
                     };
@@ -2912,11 +2896,10 @@ fn print_policy_to(
     }
     for rule in &policy.network.deny {
         match rule.port {
-            Some(port) => writeln!(out, "  deny {}:{port}", rule.host)
-                .expect("writing the policy report"),
-            None => {
-                writeln!(out, "  deny {}", rule.host).expect("writing the policy report")
+            Some(port) => {
+                writeln!(out, "  deny {}:{port}", rule.host).expect("writing the policy report")
             }
+            None => writeln!(out, "  deny {}", rule.host).expect("writing the policy report"),
         };
     }
     writeln!(
@@ -3586,7 +3569,9 @@ mod tests {
             ..Default::default()
         };
         let rules = egress_ruleset(&[], &network, &[], &[]);
-        assert!(rules.contains("set denied4_80 { type ipv4_addr; flags interval; elements = { 10.0.0.5 } }"));
+        assert!(rules.contains(
+            "set denied4_80 { type ipv4_addr; flags interval; elements = { 10.0.0.5 } }"
+        ));
         assert!(rules.contains("ip daddr @denied4_80 tcp dport 80 drop"));
         assert!(rules.contains("ip daddr @denied4_80 udp dport 80 drop"));
     }
@@ -3618,7 +3603,7 @@ mod tests {
     /// shapes sit ahead of every allowance.
     #[test]
     fn port_53_follows_the_dns_setting_alone() {
-        use crate::policy::{Destination, EgressRule, DnsSetting, NetworkPolicy, Protocol};
+        use crate::policy::{Destination, DnsSetting, EgressRule, NetworkPolicy, Protocol};
         let wildcard = |dns| NetworkPolicy {
             egress: Egress::Allow(vec![EgressRule {
                 host: Destination::Any,
@@ -4092,18 +4077,13 @@ mod tests {
                 port: Some(443),
             },
             EgressRule {
-                host: Destination::Block(
-                    std::net::IpAddr::V4("203.0.113.0".parse().unwrap()),
-                    24,
-                ),
+                host: Destination::Block(std::net::IpAddr::V4("203.0.113.0".parse().unwrap()), 24),
                 protocol: Protocol::Udp,
                 port: Some(53),
             },
         ]);
         policy.network.deny = vec![DenyRule {
-            host: Destination::Address(
-                std::net::IpAddr::V4("169.254.169.254".parse().unwrap()),
-            ),
+            host: Destination::Address(std::net::IpAddr::V4("169.254.169.254".parse().unwrap())),
             port: Some(80),
         }];
         policy.network.dns = DnsSetting::Allow;
@@ -4116,10 +4096,7 @@ mod tests {
         print_policy_to(&mut out, &resolved, &target, &NetworkArgs::default());
         let report = String::from_utf8(out).unwrap();
 
-        assert!(
-            report.contains("  egress: allowed to:"),
-            "{report}"
-        );
+        assert!(report.contains("  egress: allowed to:"), "{report}");
         assert!(report.contains("    tcp api.example.com:443"), "{report}");
         assert!(report.contains("    udp 203.0.113.0/24:53"), "{report}");
         assert!(report.contains("  deny 169.254.169.254:80"), "{report}");
