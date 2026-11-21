@@ -35,7 +35,7 @@ needs" into a profile you can read.
 | Layer | Mechanism | What it does |
 | --- | --- | --- |
 | Filesystem | Landlock | Deny-by-default rules on path hierarchies |
-| Network | Network namespace, Landlock, pasta | Denied egress means no route at all; a partial allowance is enforced by TCP port; automatic mode runs allowed egress behind a private namespace, so the host address and MAC are not exposed |
+| Network | Network namespace, Landlock, pasta | Denied egress means no route at all; a partial allowance is enforced by TCP port; automatic mode runs allowed egress behind a private namespace, so the host address and MAC are not exposed; a broker holds the allowed traffic to named hosts, methods and paths, and refuses the rest with its reason |
 | Syscalls | seccomp | Removes syscalls a normal program never needs |
 | Resources | cgroup v2 | Caps memory, process count, and CPU |
 | World | user, mount, PID, UTS namespaces | Rebuilds the root from the policy, so ungranted paths are absent rather than merely denied, host processes are invisible, and the target is not told the machine's name |

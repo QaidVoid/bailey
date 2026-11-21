@@ -47,6 +47,12 @@ the detail.
 - **One TCP port at a time.** A `[[forward]]` entry carries a host port onto
   the sandbox's own loopback, so a tool that dials a local daemon reaches it
   while the network namespace keeps refusing everything else.
+- **HTTP egress held to named requests.** A `broker = "builtin"` run grants
+  tunnels to hosts the `[[http.allow]]` rules open, refuses the rest with the
+  deciding rule named in the refusal, terminates the TLS of intercepted hosts
+  to decide every request against the same lists, and attaches credentials to
+  passed requests only, on their TLS leg. Every decision lands as one JSON
+  line in the configured log, and the counts close the run's summary.
 
 ## Planned
 

@@ -50,6 +50,7 @@ sandbox helps.
 | Cannot see or signal host processes | PID namespace | Enforced unless `--no-isolate` |
 | Cannot open ungranted TCP connections | Landlock network rules, plus the seccomp refusal of MPTCP and SMC sockets | Enforced on Linux 6.7+; the seccomp part needs seccomp filters |
 | Cannot reach a destination the policy does not name, TCP or UDP | nftables in the private network namespace, from addresses resolved before the target starts | Enforced where the private namespace runs; needs `nft` in a trusted location. Under a broker the broker is the boundary instead |
+| Cannot send a request an HTTP rule does not allow, through the broker | The broker's CONNECT ACL on the named authority, and on an intercepted host every request against the allow and deny lists before anything is dialled | Enforced with `network.broker` set; a refusal is answered with its reason and written to the decision log |
 | Cannot reach host abstract UNIX sockets | Landlock scoping, network namespace | Enforced on Linux 6.12+ |
 | Cannot connect to a pathname UNIX socket the policy does not list | Landlock socket connect right, `connect` entries | Enforced on Linux 7.1+; on older kernels a read grant on the socket's directory is enough, and under `--no-isolate` no grant is needed |
 | Cannot signal processes outside the sandbox | Landlock scoping, PID namespace | Enforced on Linux 6.12+ |
