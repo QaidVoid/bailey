@@ -205,10 +205,19 @@ pub fn decide(
                  not in a trusted location; the run is refused"
             );
         }
+        // The broker's namespace is built for the broker alone, so
+        // per-host destination rules have nothing to attach to: say so
+        // where the mode is reported instead of silently carrying a
+        // policy that does not apply.
+        let mut reason = format!("egress is held to the broker at {addr}:{port}");
+        if policy.network.needs_egress_namespace() {
+            reason.push_str("; the destination rules and DNS setting are \
+                             superseded by the broker");
+        }
         return Ok(NetworkDecision {
             mode: NetworkMode::Brokered,
             source: source.to_owned(),
-            reason: format!("egress is held to the broker at {addr}:{port}"),
+            reason,
         });
     }
 
@@ -268,7 +277,7 @@ pub fn decide(
                 }
             );
         }
-        require_nft_for_allowed_egress(policy, &caps, &source)?;
+        require_nft_for_allowed_egress(policy, caps, &source)?;
         return Ok(NetworkDecision {
             mode: NetworkMode::Private,
             source,
@@ -276,22 +285,37 @@ pub fn decide(
         });
     }
 
-    // Automatic mode: the private namespace wherever the host provides it.
+    // Automatic mode: the private namespace wherever the host provides it
+    // and can enforce the rules that make it the boundary. Without `nft` a
+    // policy that needs nothing the namespace alone provides falls back to
+    // the host's namespace below, which confines more than a tableless
+    // private one would, and one that needs the namespace is refused,
+    // naming `nft` as what is missing.
     if caps.user_namespaces && caps.pasta {
-        require_nft_for_allowed_egress(policy, &caps, &source)?;
-        return Ok(NetworkDecision {
-            mode: NetworkMode::Private,
-            source,
-            reason: "the host provides the private namespace, which automatic \
-                     mode prefers"
-                .to_owned(),
-        });
+        if caps.nft {
+            return Ok(NetworkDecision {
+                mode: NetworkMode::Private,
+                source,
+                reason: "the host provides the private namespace, which automatic \
+                         mode prefers"
+                    .to_owned(),
+            });
+        }
+        if needs_private_namespace(policy, forwards, publishes) {
+            anyhow::bail!(
+                "the egress rules are enforced by netfilter in the private \
+                 namespace, which needs nft, which is not in a trusted \
+                 location; the run is refused (mode {source})"
+            );
+        }
     }
     if needs_private_namespace(policy, forwards, publishes) {
-        let missing = if caps.user_namespaces {
+        let missing = if !caps.user_namespaces {
+            "unprivileged user namespaces, which are unavailable"
+        } else if !caps.pasta {
             "pasta, which is not in a trusted location"
         } else {
-            "unprivileged user namespaces, which are unavailable"
+            "nft, which is not in a trusted location"
         };
         let needed = if !publishes.is_empty() {
             "the published ports"
@@ -307,10 +331,12 @@ pub fn decide(
              the run is refused"
         );
     }
-    let missing = if caps.user_namespaces {
+    let missing = if !caps.user_namespaces {
+        "unprivileged user namespaces are unavailable"
+    } else if !caps.pasta {
         "pasta is not in a trusted location"
     } else {
-        "unprivileged user namespaces are unavailable"
+        "nft is not in a trusted location"
     };
     Ok(NetworkDecision {
         mode: NetworkMode::LandlockOnly,
@@ -709,6 +735,41 @@ mod tests {
             NetworkMode::Private
         );
         assert!(decide(&no_dns, &no_caps, false, &[], &[]).is_err());
+    }
+
+    /// Automatic mode falls back to the host's namespace when `nft` is
+    /// missing and nothing needs the private one: a tableless private
+    /// namespace would enforce less than the fallback does, so the fallback
+    /// is the answer. A policy that needs the namespace is still refused,
+    /// naming `nft` as what is missing.
+    #[test]
+    fn a_missing_nft_falls_back_when_nothing_needs_the_namespace() {
+        let no_nft = caps(true, true, false);
+
+        // A plain allowance needs no namespace: the fallback bounds TCP by
+        // port, which a tableless namespace would not.
+        let plain = policy_with(NetworkPolicy {
+            egress: Egress::AllowAll,
+            ..NetworkPolicy::default()
+        });
+        let decision = decide(&plain, &no_nft, false, &[], &[]).unwrap();
+        assert_eq!(decision.mode, NetworkMode::LandlockOnly);
+        assert!(decision.reason.contains("nft"), "{decision:?}");
+
+        // Destination rules are netfilter work: they are refused, not
+        // silently dropped on the fallback.
+        let named = policy_with(NetworkPolicy {
+            egress: Egress::Allow(vec![EgressRule {
+                host: Destination::Name("api.example.com".to_owned()),
+                protocol: Protocol::Tcp,
+                port: Some(443),
+            }]),
+            ..NetworkPolicy::default()
+        });
+        let err = decide(&named, &no_nft, false, &[], &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nft"), "{err}");
     }
 
     /// A deny rule or DNS denial beside denied egress still needs the

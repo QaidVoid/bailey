@@ -148,6 +148,46 @@ fn loopback_works_inside_the_sandbox() {
     );
 }
 
+/// A TCP server the target binds to its own loopback answers inside a
+/// private-mode sandbox: the namespace's loopback is the target's own, and
+/// nothing in the egress table drops it.
+#[test]
+fn sandbox_loopback_works_in_private_mode() {
+    if python().is_none() || !proxy_net_available() {
+        common::skip("needs python3 and pasta");
+        return;
+    }
+    let output = run_python(
+        "[network]\negress = \"allow\"\n",
+        r#"import socket, threading
+server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server.bind(('127.0.0.1', 0))
+server.listen(4)
+port = server.getsockname()[1]
+def serve():
+    connection, _ = server.accept()
+    connection.sendall(b'loopback-tcp')
+    connection.close()
+worker = threading.Thread(target=serve)
+worker.start()
+with socket.create_connection(('127.0.0.1', port), timeout=3) as c:
+    assert c.recv(64) == b'loopback-tcp'
+worker.join(3)
+print('loopback-tcp-ok')
+"#,
+    );
+    assert!(
+        output.status.success(),
+        "the private-mode run must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        stdout_of(&output),
+        "loopback-tcp-ok",
+        "a loopback-bound server must answer inside the sandbox"
+    );
+}
+
 #[test]
 fn only_loopback_is_visible() {
     if !netns_available() {
@@ -424,60 +464,93 @@ impl EchoServer {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let udp = UdpSocket::bind(("127.0.0.1", port)).unwrap();
-        listener.set_nonblocking(true).unwrap();
-        udp.set_read_timeout(Some(Duration::from_millis(50)))
-            .unwrap();
+        Self::serve(listener, udp)
+    }
+
+    /// The same echo service on the wildcard addresses: a private namespace
+    /// reaches it at one of the host's own addresses, which loopback binds
+    /// never answer. A dual-stack `::` bind serves v4 dials as well, which
+    /// the v6 destination tests lean on; a host without v6 falls back to v4.
+    fn start_wildcard() -> Self {
+        if let Ok(listener) = TcpListener::bind(("::", 0)) {
+            let port = listener.local_addr().unwrap().port();
+            let udp = UdpSocket::bind(("::", port)).unwrap();
+            return Self::serve(listener, udp);
+        }
+        let listener = TcpListener::bind(("0.0.0.0", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let udp = UdpSocket::bind(("0.0.0.0", port)).unwrap();
+        Self::serve(listener, udp)
+    }
+
+    fn serve(listener: TcpListener, udp: UdpSocket) -> Self {
+        let port = listener.local_addr().unwrap().port();
         let stop = Arc::new(AtomicBool::new(false));
-        let tcp_stop = Arc::clone(&stop);
-        let tcp = std::thread::spawn(move || {
-            while !tcp_stop.load(Ordering::Relaxed) {
-                match listener.accept() {
-                    Ok((mut client, _)) => {
-                        client
-                            .set_read_timeout(Some(Duration::from_secs(2)))
-                            .unwrap();
-                        client
-                            .set_write_timeout(Some(Duration::from_secs(2)))
-                            .unwrap();
-                        let mut buf = [0; 64];
-                        if let Ok(n) = client.read(&mut buf) {
-                            let _ = client.write_all(&buf[..n]);
-                        }
-                    }
-                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(5));
-                    }
-                    Err(err) => panic!("host TCP listener failed: {err}"),
-                }
-            }
-        });
-        let udp_stop = Arc::clone(&stop);
         let udp_received = Arc::new(AtomicUsize::new(0));
-        let received = Arc::clone(&udp_received);
-        let udp = std::thread::spawn(move || {
-            let mut buf = [0; 64];
-            while !udp_stop.load(Ordering::Relaxed) {
-                match udp.recv_from(&mut buf) {
-                    Ok((n, peer)) => {
-                        received.fetch_add(1, Ordering::Relaxed);
-                        let _ = udp.send_to(&buf[..n], peer);
-                    }
-                    Err(err)
-                        if matches!(
-                            err.kind(),
-                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                        ) => {}
-                    Err(err) => panic!("host UDP listener failed: {err}"),
-                }
-            }
-        });
+        let workers = vec![
+            tcp_worker(listener, Arc::clone(&stop)),
+            udp_worker(udp, Arc::clone(&stop), Arc::clone(&udp_received)),
+        ];
         Self {
             port,
             stop,
             udp_received,
-            workers: vec![tcp, udp],
+            workers,
         }
     }
+}
+
+fn tcp_worker(listener: TcpListener, stop: Arc<AtomicBool>) -> JoinHandle<()> {
+    listener.set_nonblocking(true).unwrap();
+    std::thread::spawn(move || {
+        while !stop.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut client, _)) => {
+                    client
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    client
+                        .set_write_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let mut buf = [0; 64];
+                    if let Ok(n) = client.read(&mut buf) {
+                        let _ = client.write_all(&buf[..n]);
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(err) => panic!("host TCP listener failed: {err}"),
+            }
+        }
+    })
+}
+
+fn udp_worker(
+    socket: UdpSocket,
+    stop: Arc<AtomicBool>,
+    received: Arc<AtomicUsize>,
+) -> JoinHandle<()> {
+    socket
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    std::thread::spawn(move || {
+        let mut buf = [0; 64];
+        while !stop.load(Ordering::Relaxed) {
+            match socket.recv_from(&mut buf) {
+                Ok((n, peer)) => {
+                    received.fetch_add(1, Ordering::Relaxed);
+                    let _ = socket.send_to(&buf[..n], peer);
+                }
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(err) => panic!("host UDP listener failed: {err}"),
+            }
+        }
+    })
 }
 
 impl Drop for EchoServer {
@@ -960,6 +1033,672 @@ except OSError:
     assert!(
         stderr.contains(&format!("10.0.0.1:{}", broker.port)),
         "the summary must name the broker's address: {stderr}"
+    );
+}
+
+/// A loopback port that is free on the host, for a listener the target
+/// opens inside its own namespace.
+fn free_loopback_port() -> u16 {
+    std::net::TcpListener::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// The host's global-scope IPv6 address, found the way bailey itself looks:
+/// `/proc/net/if_inet6`, scope `00`, any device but `lo`.
+fn non_loopback_host_v6() -> Option<std::net::Ipv6Addr> {
+    let contents = fs::read_to_string("/proc/net/if_inet6").ok()?;
+    for line in contents.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 6 {
+            continue;
+        }
+        let (hex, scope, device) = (fields[0], fields[3], fields[5]);
+        if scope == "00"
+            && device != "lo"
+            && let Some(address) = parse_ipv6_hex(hex)
+            && !address.is_loopback()
+        {
+            return Some(address);
+        }
+    }
+    None
+}
+
+/// `/proc/net/if_inet6` writes addresses as 32 hex digits without colons.
+fn parse_ipv6_hex(hex: &str) -> Option<std::net::Ipv6Addr> {
+    if hex.len() != 32 {
+        return None;
+    }
+    let high = u64::from_str_radix(&hex[..16], 16).ok()?;
+    let low = u64::from_str_radix(&hex[16..], 16).ok()?;
+    Some(std::net::Ipv6Addr::new(
+        (high >> 48) as u16,
+        (high >> 32) as u16,
+        (high >> 16) as u16,
+        high as u16,
+        (low >> 48) as u16,
+        (low >> 32) as u16,
+        (low >> 16) as u16,
+        low as u16,
+    ))
+}
+
+/// A name in an allow rule is pinned before the run: with DNS denied, the
+/// generated /etc/hosts still answers the name, and the target reaches its
+/// own loopback listener through the pinned address.
+#[test]
+fn pinned_name_resolves_without_dns() {
+    if !proxy_net_available() {
+        return;
+    }
+    let port = free_loopback_port();
+    let output = run_python(
+        &format!(
+            "[network]\n\
+             egress_allow = [{{ host = \"localhost\", port = {port} }}]\n\
+             bind_ports = [{port}]\n\
+             dns = \"deny\"\n"
+        ),
+        &format!(
+            r#"import socket
+found = sorted(set([info[4][0] for info in socket.getaddrinfo('localhost', {port}, socket.AF_INET)]))
+assert found == ['127.0.0.1'], found
+server = socket.socket()
+server.bind(('127.0.0.1', {port}))
+server.listen(1)
+with socket.create_connection(('localhost', {port}), timeout=5) as client:
+    client.sendall(b'pin')
+    conn, _ = server.accept()
+    conn.sendall(conn.recv(64))
+    conn.close()
+server.close()
+print('pinned-ok')
+"#
+        ),
+    );
+    assert!(
+        output.status.success(),
+        "the pinned-name run must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(stdout_of(&output), "pinned-ok");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("network mode: private ("),
+        "a named destination must pick the private namespace: {stderr}"
+    );
+}
+
+/// A named destination carries TCP and UDP to the allowed host only: the
+/// same port on another host is dropped inside the namespace, never
+/// reaching the wire.
+#[test]
+fn an_allowed_destination_is_reached_and_other_hosts_dropped() {
+    if !proxy_net_available() {
+        return;
+    }
+    let Some(host) = non_loopback_host_address() else {
+        common::skip("no non-loopback host address");
+        return;
+    };
+    if host.to_string() == "10.0.2.15" {
+        common::skip("the host's address is the sandbox's own (QEMU slirp)");
+        return;
+    }
+    let echo = EchoServer::start_wildcard();
+    let output = run_python(
+        &format!(
+            "[network]\n\
+             egress_allow = [\n\
+             \x20 {{ host = \"{host}\", port = {port} }},\n\
+             \x20 {{ host = \"{host}\", port = {port}, protocol = \"udp\" }},\n\
+             ]\n",
+            host = host,
+            port = echo.port
+        ),
+        &format!(
+            r#"import socket
+with socket.create_connection(('{host}', {port}), timeout=3) as s:
+    s.sendall(b'tcp-dest')
+    assert s.recv(64) == b'tcp-dest'
+print('allowed-tcp-ok')
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+    s.settimeout(3)
+    s.sendto(b'udp-dest', ('{host}', {port}))
+    assert s.recvfrom(64)[0] == b'udp-dest'
+print('allowed-udp-ok')
+try:
+    with socket.create_connection(('203.0.113.9', {port}), timeout=2):
+        print('reached-other')
+except OSError:
+    print('other-dropped')
+"#,
+            host = host,
+            port = echo.port
+        ),
+    );
+    assert!(
+        output.status.success(),
+        "the destination run must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        stdout_of(&output),
+        "allowed-tcp-ok\nallowed-udp-ok\nother-dropped"
+    );
+}
+
+/// An allow-all policy carries egress, with a deny still winning: the
+/// namespace's table admits everything the deny, DNS and loopback rules do
+/// not name, so `egress = "allow"` is usable on its own and a denied
+/// address still drops, TCP and UDP alike.
+#[test]
+fn allow_all_with_a_deny_carries_egress_and_holds_the_deny() {
+    if !proxy_net_available() {
+        return;
+    }
+    let Some(host) = non_loopback_host_address() else {
+        common::skip("no non-loopback host address");
+        return;
+    };
+    if host.to_string() == "10.0.2.15" {
+        common::skip("the host's address is the sandbox's own (QEMU slirp)");
+        return;
+    }
+    let echo = EchoServer::start_wildcard();
+    let output = run_python(
+        &format!(
+            "[network]\n\
+             egress = \"allow\"\n\
+             egress_deny = [{{ host = \"203.0.113.0/24\", port = {port} }}]\n",
+            port = echo.port
+        ),
+        &format!(
+            r#"import socket
+with socket.create_connection(('{host}', {port}), timeout=3) as s:
+    s.sendall(b'allow-all')
+    assert s.recv(64) == b'allow-all'
+print('tcp-ok')
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+    s.settimeout(3)
+    s.sendto(b'allow-all', ('{host}', {port}))
+    assert s.recvfrom(64)[0] == b'allow-all'
+print('udp-ok')
+try:
+    with socket.create_connection(('203.0.113.9', {port}), timeout=2):
+        print('tcp-denied-reached')
+except OSError:
+    print('tcp-denied-dropped')
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+    s.settimeout(2)
+    try:
+        s.sendto(b'x', ('203.0.113.9', {port}))
+    except OSError:
+        print('udp-denied-dropped')
+        raise SystemExit(0)
+    try:
+        s.recvfrom(64)
+        print('udp-denied-replied')
+    except OSError:
+        print('udp-denied-dropped')
+"#,
+            host = host,
+            port = echo.port
+        ),
+    );
+    assert!(
+        output.status.success(),
+        "the allow-all run must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        stdout_of(&output),
+        "tcp-ok\nudp-ok\ntcp-denied-dropped\nudp-denied-dropped"
+    );
+}
+
+/// An allow naming a block carries every address inside it that routes: a
+/// /24 and a /64 whose only reachable members are this host's own
+/// addresses both answer, and an address outside both blocks drops. This
+/// is the CIDR form of the destination contract.
+#[test]
+fn a_cidr_allow_carries_the_block_it_names() {
+    if !proxy_net_available() {
+        return;
+    }
+    let Some(v4) = non_loopback_host_address() else {
+        common::skip("no non-loopback host address");
+        return;
+    };
+    if v4.to_string() == "10.0.2.15" {
+        common::skip("the host's address is the sandbox's own (QEMU slirp)");
+        return;
+    }
+    let Some(v6) = non_loopback_host_v6() else {
+        common::skip("no global IPv6 address for the v6 block");
+        return;
+    };
+    let echo = EchoServer::start_wildcard();
+    let output = run_python(
+        &format!(
+            "[network]\n\
+             egress_allow = [\n\
+             \x20 {{ host = \"{v4}/24\", port = {port} }},\n\
+             \x20 {{ host = \"{v6}/64\", port = {port} }},\n\
+             ]\n",
+            v4 = v4,
+            v6 = v6,
+            port = echo.port
+        ),
+        &format!(
+            r#"import socket
+with socket.create_connection(('{v4}', {port}), timeout=3) as s:
+    s.sendall(b'cidr-v4')
+    assert s.recv(64) == b'cidr-v4'
+print('cidr-v4-ok')
+with socket.create_connection(('{v6}', {port}), timeout=3) as s:
+    s.sendall(b'cidr-v6')
+    assert s.recv(64) == b'cidr-v6'
+print('cidr-v6-ok')
+try:
+    with socket.create_connection(('203.0.113.9', {port}), timeout=2):
+        print('outside-reached')
+except OSError:
+    print('outside-dropped')
+"#,
+            v4 = v4,
+            v6 = v6,
+            port = echo.port
+        ),
+    );
+    assert!(
+        output.status.success(),
+        "the CIDR run must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        stdout_of(&output),
+        "cidr-v4-ok\ncidr-v6-ok\noutside-dropped"
+    );
+}
+
+/// An address the rules do not name drops even when it is another real
+/// address of this very host, at the same port the allowance carries: the
+/// drop cannot be confused with an unreachable address, because the same
+/// port on the allowed address answers, TCP and UDP alike.
+#[test]
+fn another_real_host_on_the_same_port_drops() {
+    if !proxy_net_available() {
+        return;
+    }
+    let Some(v4) = non_loopback_host_address() else {
+        common::skip("no non-loopback host address");
+        return;
+    };
+    if v4.to_string() == "10.0.2.15" {
+        common::skip("the host's address is the sandbox's own (QEMU slirp)");
+        return;
+    }
+    let Some(v6) = non_loopback_host_v6() else {
+        common::skip("no global IPv6 address to play the other host");
+        return;
+    };
+    let echo = EchoServer::start_wildcard();
+    let output = run_python(
+        &format!(
+            "[network]\n\
+             egress_allow = [\n\
+             \x20 {{ host = \"{v4}\", port = {port} }},\n\
+             \x20 {{ host = \"{v4}\", port = {port}, protocol = \"udp\" }},\n\
+             ]\n",
+            v4 = v4,
+            port = echo.port
+        ),
+        &format!(
+            r#"import socket
+with socket.create_connection(('{v4}', {port}), timeout=3) as s:
+    s.sendall(b'allowed-v4')
+    assert s.recv(64) == b'allowed-v4'
+print('allowed-tcp-ok')
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+    s.settimeout(3)
+    s.sendto(b'allowed-udp', ('{v4}', {port}))
+    assert s.recvfrom(64)[0] == b'allowed-udp'
+print('allowed-udp-ok')
+try:
+    with socket.create_connection(('{v6}', {port}), timeout=2):
+        print('other-tcp-reached')
+except OSError:
+    print('other-tcp-dropped')
+with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as s:
+    s.settimeout(2)
+    try:
+        s.sendto(b'other-udp', ('{v6}', {port}))
+    except OSError:
+        print('other-udp-dropped')
+        raise SystemExit(0)
+    try:
+        s.recvfrom(64)
+        print('other-udp-replied')
+    except OSError:
+        print('other-udp-dropped')
+"#,
+            v4 = v4,
+            v6 = v6,
+            port = echo.port
+        ),
+    );
+    assert!(
+        output.status.success(),
+        "the single-destination run must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        stdout_of(&output),
+        "allowed-tcp-ok\n\
+         allowed-udp-ok\n\
+         other-tcp-dropped\n\
+         other-udp-dropped"
+    );
+}
+
+/// With a wildcard rule the resolver may ask: pasta's forwarder answers UDP
+/// DNS, so names resolve without any other network being open.
+#[test]
+fn dns_only_reaches_the_forwarder() {
+    if !proxy_net_available() {
+        return;
+    }
+    let output = run_python(
+        "[network]\negress_allow = [{ host = \"*\", port = 443 }]\n",
+        r#"import socket
+socket.gethostbyname('example.com')
+print('dns-ok')
+"#,
+    );
+    assert!(
+        output.status.success(),
+        "the resolver must be reached through pasta: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(stdout_of(&output), "dns-ok");
+}
+
+/// The forwarder answers DNS over TCP as well, which a truncated or large
+/// answer drives the resolver to: the netfilter allowance must carry it.
+#[test]
+fn dns_over_tcp_reaches_the_forwarder() {
+    if !proxy_net_available() {
+        return;
+    }
+    let output = run_python(
+        "[network]\negress_allow = [{ host = \"*\", port = 443 }]\n",
+        r#"import socket, struct
+question = (b'\xab\xcd\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00'
+            b'\x07example\x03com\x00\x00\x01\x00\x01')
+with socket.create_connection(('10.0.2.3', 53), timeout=5) as s:
+    s.sendall(struct.pack('!H', len(question)) + question)
+    header = s.recv(2)
+    assert len(header) == 2, header
+    remaining = struct.unpack('!H', header)[0]
+    answer = b''
+    while len(answer) < remaining:
+        answer += s.recv(remaining - len(answer))
+assert answer[3] & 0xF == 0, 'rcode ' + str(answer[3] & 0xF)
+print('dns-tcp-ok')
+"#,
+    );
+    assert!(
+        output.status.success(),
+        "DNS over TCP must reach the forwarder: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(stdout_of(&output), "dns-tcp-ok");
+}
+
+/// Without a wildcard rule the resolver is configured but unreachable: UDP
+/// and TCP DNS questions are dropped, so name lookup fails instead of
+/// leaking a query to the host's network.
+#[test]
+fn dns_dropped_without_a_wildcard_rule() {
+    if !proxy_net_available() {
+        return;
+    }
+    let Some(host) = non_loopback_host_address() else {
+        common::skip("no non-loopback host address");
+        return;
+    };
+    if host.to_string() == "10.0.2.15" {
+        common::skip("the host's address is the sandbox's own (QEMU slirp)");
+        return;
+    }
+    let echo = EchoServer::start_wildcard();
+    let output = run_python(
+        &format!(
+            "[network]\negress_allow = [{{ host = \"{host}\", port = {port} }}]\n",
+            host = host,
+            port = echo.port
+        ),
+        &format!(
+            r#"import socket
+with socket.create_connection(('{host}', {port}), timeout=3) as s:
+    print('tcp-ok')
+try:
+    socket.gethostbyname('example.com')
+    print('dns-leaked')
+except OSError:
+    print('dns-dropped')
+try:
+    socket.create_connection(('10.0.2.3', 53), timeout=5)
+    print('tcp-dns-leaked')
+except OSError:
+    print('tcp-dns-dropped')
+"#,
+            host = host,
+            port = echo.port
+        ),
+    );
+    assert!(
+        output.status.success(),
+        "the named-destination run must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        stdout_of(&output),
+        "tcp-ok\ndns-dropped\ntcp-dns-dropped"
+    );
+}
+
+/// A deny inside an allowed range wins over the range, per family: the
+/// allowed block still carries a sibling address and port beside the denied
+/// one, and the denied address and port drops, TCP and UDP alike. The allow
+/// and the deny name the same family here, so the range itself is what is
+/// under test.
+#[test]
+fn deny_inside_an_allowed_range() {
+    if !proxy_net_available() {
+        return;
+    }
+    let Some(v4) = non_loopback_host_address() else {
+        common::skip("no non-loopback host address");
+        return;
+    };
+    if v4.to_string() == "10.0.2.15" {
+        common::skip("the host's address is the sandbox's own (QEMU slirp)");
+        return;
+    }
+    let Some(v6) = non_loopback_host_v6() else {
+        common::skip("no global IPv6 address to allow beside the denied one");
+        return;
+    };
+    let carried = EchoServer::start_wildcard();
+    let denied = EchoServer::start_wildcard();
+    let output = run_python(
+        &format!(
+            "[network]\n\
+             egress_allow = [\n\
+             \x20 {{ host = \"{v4}/24\", port = {carried} }},\n\
+             \x20 {{ host = \"{v4}/24\", port = {denied} }},\n\
+             \x20 {{ host = \"{v6}/64\", port = {carried} }},\n\
+             \x20 {{ host = \"{v6}/64\", port = {denied} }},\n\
+             ]\n\
+             egress_deny = [\n\
+             \x20 {{ host = \"{v4}\", port = {denied} }},\n\
+             \x20 {{ host = \"{v6}\", port = {denied} }},\n\
+             ]\n",
+            v4 = v4,
+            v6 = v6,
+            carried = carried.port,
+            denied = denied.port
+        ),
+        &format!(
+            r#"import socket
+with socket.create_connection(('{v4}', {carried}), timeout=3) as s:
+    s.sendall(b'carried-v4')
+    assert s.recv(64) == b'carried-v4'
+print('carried-v4-ok')
+with socket.create_connection(('{v6}', {carried}), timeout=3) as s:
+    s.sendall(b'carried-v6')
+    assert s.recv(64) == b'carried-v6'
+print('carried-v6-ok')
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+    s.settimeout(3)
+    s.sendto(b'carried-udp', ('{v4}', {carried}))
+    assert s.recvfrom(64)[0] == b'carried-udp'
+print('carried-udp-ok')
+try:
+    with socket.create_connection(('{v4}', {denied}), timeout=2):
+        print('deny-bypassed')
+except OSError:
+    print('denied-v4-dropped')
+try:
+    with socket.create_connection(('{v6}', {denied}), timeout=2):
+        print('deny-bypassed')
+except OSError:
+    print('denied-v6-dropped')
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+    s.settimeout(2)
+    try:
+        s.sendto(b'denied-udp', ('{v4}', {denied}))
+    except OSError:
+        print('denied-udp-dropped')
+        raise SystemExit(0)
+    try:
+        s.recvfrom(64)
+        print('deny-bypassed')
+    except OSError:
+        print('denied-udp-dropped')
+"#,
+            v4 = v4,
+            v6 = v6,
+            carried = carried.port,
+            denied = denied.port
+        ),
+    );
+    assert!(
+        output.status.success(),
+        "the deny run must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        stdout_of(&output),
+        "carried-v4-ok\n\
+         carried-v6-ok\n\
+         carried-udp-ok\n\
+         denied-v4-dropped\n\
+         denied-v6-dropped\n\
+         denied-udp-dropped"
+    );
+}
+
+/// A private namespace that cannot install the egress rules must refuse the
+/// run before the target starts: the rules are the boundary, and starting
+/// without them would run wider than the policy.
+#[test]
+fn a_failing_nft_refuses_the_run_before_the_target_starts() {
+    if python().is_none() || !netns_available() {
+        common::skip("needs python3 and user namespaces");
+        return;
+    }
+    let Ok(pasta) = bailey::cli::resolve_helper("pasta") else {
+        common::skip("needs trusted pasta");
+        return;
+    };
+    let helpers = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(&pasta, helpers.path().join("pasta")).unwrap();
+    let nft = helpers.path().join("nft");
+    fs::write(&nft, "#!/bin/sh\nexit 1\n").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&nft, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let output = run_with_env(
+        "[network]\negress_allow = [{ host = \"*\", port = 443 }]\n",
+        &[],
+        &[("BAILEY_HELPER_DIRS", helpers.path())],
+        &[python().unwrap(), "-c", "print('started')"],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "a failing nft must refuse the run: {stderr}"
+    );
+    assert!(
+        stderr.contains("the egress rules could not be installed"),
+        "the refusal must name the failed installation: {stderr}"
+    );
+    assert_ne!(stdout_of(&output), "started", "the target must never start");
+}
+
+/// A broker supersedes destination rules: the run still starts, held to the
+/// broker alone, and the summary names the supersession so the policy's
+/// narrower rules are not mistaken for the enforcement in place.
+#[test]
+fn a_brokered_run_names_destination_rules_superseded() {
+    if !proxy_net_available() {
+        return;
+    }
+    let broker = EchoServer::start();
+    let outside = EchoServer::start();
+    let output = run_python(
+        &format!(
+            "[network]\nbroker = \"10.0.0.1:{broker}\"\n\
+             egress_allow = [{{ host = \"localhost\", port = 443 }}]\n",
+            broker = broker.port
+        ),
+        &format!(
+            r#"import socket
+with socket.create_connection(('10.0.0.1', {broker}), timeout=3) as s:
+    s.sendall(b'to-broker')
+    assert s.recv(64) == b'to-broker'
+print('broker-ok')
+try:
+    socket.create_connection(('10.0.0.1', {outside}), timeout=2)
+    print('reached-outside')
+except OSError:
+    print('outside-dropped')
+"#,
+            broker = broker.port,
+            outside = outside.port
+        ),
+    );
+    assert!(
+        output.status.success(),
+        "the brokered run must start despite destination rules: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(stdout_of(&output), "broker-ok\noutside-dropped");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("network mode: brokered"),
+        "the summary must name the brokered mode: {stderr}"
+    );
+    assert!(
+        stderr.contains("superseded by the broker"),
+        "the summary must say the destination rules are superseded: {stderr}"
     );
 }
 

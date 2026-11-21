@@ -1162,7 +1162,7 @@ fn refuse_unenforceable_network_rules(
             });
         }
     }
-    for (rule, layer) in &acc.egress_denies {
+    if let Some((rule, layer)) = acc.egress_denies.first() {
         return Err(ConfigError::Invalid {
             path: layer.clone(),
             reason: format!(

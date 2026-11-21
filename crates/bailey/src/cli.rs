@@ -770,10 +770,10 @@ fn pin_destinations(policy: &crate::policy::Policy) -> anyhow::Result<Vec<Pin>> 
     use crate::policy::{Destination, Egress};
     let mut names: Vec<String> = Vec::new();
     let mut wanted = |host: &Destination| {
-        if let Destination::Name(name) = host {
-            if !names.contains(name) {
-                names.push(name.clone());
-            }
+        if let Destination::Name(name) = host
+            && !names.contains(name)
+        {
+            names.push(name.clone());
         }
     };
     if let Egress::Allow(rules) = &policy.network.egress {
@@ -3346,8 +3346,10 @@ mod tests {
         // The forward port is not in the egress rules, so nothing protects
         // against it widening: the policy drop already denies it remotely.
         assert!(!rules.contains("ip daddr 10.0.2.15 tcp dport 8081 drop"));
-        let mut policy = Policy::default();
-        policy.network = network;
+        let mut policy = Policy {
+            network,
+            ..Policy::default()
+        };
         permit_egress_port(&mut policy, 8081);
         assert!(
             matches!(policy.network.egress, Egress::Allow(ref ports) if ports.iter().any(|rule| rule.port == Some(8081)))
@@ -3377,7 +3379,7 @@ mod tests {
                 rules.contains(&format!("\t\ttcp dport {port} accept\n")),
                 "the allowance keeps its accept rule: {rules}"
             );
-            assert!(!rules.contains(&format!("\t\ttcp dport 8081 drop\n")));
+            assert!(!rules.contains("\t\ttcp dport 8081 drop\n"));
         }
     }
 
