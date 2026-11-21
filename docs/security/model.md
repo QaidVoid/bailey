@@ -49,10 +49,12 @@ sandbox helps.
 | Cannot see ungranted paths | Mount namespace, `pivot_root` | Enforced unless `--no-isolate` |
 | Cannot see or signal host processes | PID namespace | Enforced unless `--no-isolate` |
 | Cannot open ungranted TCP connections | Landlock network rules, plus the seccomp refusal of MPTCP and SMC sockets | Enforced on Linux 6.7+; the seccomp part needs seccomp filters |
+| Cannot reach a destination the policy does not name, TCP or UDP | nftables in the private network namespace, from addresses resolved before the target starts | Enforced where the private namespace runs; needs `nft` in a trusted location. Under a broker the broker is the boundary instead |
 | Cannot reach host abstract UNIX sockets | Landlock scoping, network namespace | Enforced on Linux 6.12+ |
 | Cannot connect to a pathname UNIX socket the policy does not list | Landlock socket connect right, `connect` entries | Enforced on Linux 7.1+; on older kernels a read grant on the socket's directory is enough, and under `--no-isolate` no grant is needed |
 | Cannot signal processes outside the sandbox | Landlock scoping, PID namespace | Enforced on Linux 6.12+ |
-| Cannot send UDP, QUIC, or DNS | Network namespace | Enforced when egress is denied |
+| Cannot send UDP, QUIC, or DNS to destinations the policy does not name | nftables in the private network namespace | Enforced where the private namespace runs; in the host's namespace, non-TCP traffic is unrestricted |
+| Cannot send UDP, QUIC, or DNS anywhere | Network namespace | Enforced when egress is denied, and when the `dns` setting drops DNS |
 | Cannot load kernel modules, trace processes, or create namespaces | seccomp, capability drop, kernel limit | Enforced: `unshare`, `setns`, and `clone` with a `CLONE_NEW*` flag are refused, `clone3` is refused with the error libcs fall back from, and on any run that builds a user namespace a kernel limit leaves nothing beneath it for the target |
 | Cannot exceed memory, process, or CPU limits | cgroup v2 | Best-effort, and see the caveat below. Without a cgroup, `open_files` and `file_max` still hold as rlimits, and `address_space` bounds each process where `memory` cannot be carried |
 | Cannot read your environment variables | Built environment | Enforced; only named variables cross |
@@ -60,10 +62,11 @@ sandbox helps.
 
 ## Where the guarantees end
 
-**Non-TCP traffic under a partial allowance.** Allowing any egress drops the
-network namespace, leaving only TCP port rules. Every other protocol, UDP and
-SCTP among them, is unrestricted there. There is no mode that allows some UDP
-and denies the rest.
+**Non-TCP traffic in the host's namespace.** Allowing egress prefers the
+private namespace, where UDP is governed per destination like TCP. Where the
+host cannot provide it, the run falls back to the host's namespace and only
+Landlock's TCP port rules apply: UDP, SCTP and the rest are unrestricted there,
+and the run says so.
 
 **Variables you pass.** `pass` forwards a variable verbatim, so passing one that
 holds a credential puts that credential in the sandbox.
@@ -82,8 +85,11 @@ input and window contents. No filesystem policy fixes that; use Wayland.
 drivers are a large kernel attack surface. Every grant is a decision, and the
 device grants are the expensive ones.
 
-**A partial egress allowance.** Allowing any egress drops the network namespace,
-so non-TCP traffic and the host's loopback are both reachable.
+**A partial egress allowance.** A partial allowance reaches the internet. What
+it reaches is limited in the private namespace by the named destinations and
+the addresses they resolved to, but whatever shares an admitted address is
+admitted with it, and a hostname's addresses are whatever resolution returned
+when the run started.
 
 The full list with details is in [known limitations](/security/limitations).
 

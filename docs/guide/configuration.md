@@ -123,8 +123,11 @@ Every key is documented in the [configuration reference](/reference/config).
 egress_allow = [{ host = "*", port = 443 }]
 ```
 
-Landlock matches on TCP port, so the `host` field is advisory. Bailey warns when
-you set a host other than `*`, because the rule will not restrict by host. An
+A rule naming a host, address or block is enforced in the private network
+namespace per destination, TCP and UDP alike; the host part is resolved once
+before the target starts and the addresses it returned are what the firewall
+admits. See [network confinement](/guide/network) for the whole picture, and
+[known limitations](/security/limitations) for what an address admits. An
 entry with no `port` is a resolution error naming the layer, rather than a rule
 that silently becomes a full deny.
 

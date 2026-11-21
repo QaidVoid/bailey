@@ -26,6 +26,16 @@
 # to a broker on the host that admits only the destinations it allows. The
 # modes and their reasons are in the network guide, docs/guide/network.md.
 #
+# The rule stays `*` because a profile cannot know which API you use. To pin
+# the agent to its model's endpoint, replace the rule with the host you use,
+# and bailey resolves it once and admits only the addresses it returned:
+#
+#     [network]
+#     egress_allow = [{ host = "api.openai.com", port = 443 }]
+#
+# The destination rules need the private namespace (and `nft`), so a config
+# that also sets `mode = "host"` is refused rather than enforced by port alone.
+#
 # For an agent that must not reach the network, use the `untrusted` floor,
 # which denies it outright.
 #

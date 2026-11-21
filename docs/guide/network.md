@@ -6,9 +6,9 @@ prints the decision a run would make, naming the layer or flag that chose it.
 | Policy | Mode | What is enforced |
 | --- | --- | --- |
 | `egress = "deny"` | **isolated** | Own network namespace, loopback only, in every mode. Only explicit forwards reach host services |
-| `broker = "ADDR:PORT"` | **brokered** | Private namespace held to one egress route, in every mode |
-| Egress allowed, `mode = "private"` | **private** | Private namespace with pasta connectivity; refused where the host cannot provide it |
-| Egress allowed, `mode = "host"` | **host** | The host's namespace, with Landlock rules over TCP ports. Other protocols are unrestricted |
+| `broker = "ADDR:PORT"` | **brokered** | Private namespace held to one egress route, in every mode. Destination rules are superseded by the broker and the summary says so |
+| Egress allowed, `mode = "private"` | **private** | Private namespace with pasta connectivity; destination rules and DNS enforced by nftables; refused where the host cannot provide it |
+| Egress allowed, `mode = "host"` | **host** | The host's namespace, with Landlock rules over TCP ports. Other protocols are unrestricted, and destination rules are refused |
 | Egress allowed, `mode = "auto"` (default) | **private or host** | The private namespace where the host provides it, otherwise the host's namespace, unless the policy needs the private one and the host cannot provide it |
 
 The default policy denies egress, so the default mode is isolated. `bailey
@@ -106,6 +106,78 @@ addresses the host-identity exposure above; it does not tighten the egress
 surface, which the policy's ports already govern. With denied egress, private
 mode changes nothing that is enforced, since the isolated namespace is already
 the strictest placement.
+
+### Naming destinations
+
+Port rules cannot tell one host on 443 from another: with a plain port
+allowance, a session may reach any host there. In the private namespace the
+policy's rules are enforced by nftables instead, per destination, so the host
+part of a rule is the enforcement and not a wish:
+
+```toml
+[network]
+egress_allow = [{ host = "api.example.com", port = 443 }]
+```
+
+```sh
+bailey run -- curl https://api.example.com/v1/models
+# reaches api.example.com on 443; every other destination is dropped
+```
+
+Bailey resolves each hostname once, on the host, before the target starts. The
+addresses it resolved to are what the firewall admits, and the same names
+resolve to those addresses inside the sandbox, so the destinations the rules
+enforce and the ones a client dials are the same addresses. A name that does
+not resolve refuses the run: a rule naming it could otherwise only ever be a
+silent no-op.
+
+A block covers a range, and `protocol = "udp"` covers a datagram port:
+
+```toml
+[network]
+egress_allow = [
+  { host = "10.0.0.0/8", port = 443 },
+  { host = "game.example.net", port = 7777, protocol = "udp" },
+]
+```
+
+`egress_deny` drops traffic ahead of every allowance, which is how a cloud
+metadata service is kept out of an otherwise allowed range:
+
+```toml
+[network]
+egress_allow = [{ host = "10.0.0.0/8", port = 443 }]
+egress_deny = [{ host = "169.254.169.254", port = 80 }]
+```
+
+Rules accumulate across config layers, entries for port 53 are refused (DNS is
+the `dns` setting's decision, not a rule's), and a deny naming loopback is
+refused, since the sandbox's own loopback is how its services talk to each
+other. The run summary lists each rule in force, the addresses each hostname
+resolved to, and the DNS state.
+
+Destination rules need the private namespace, and they need `nft` in a trusted
+location to install the firewall. Under host mode a policy that names
+destinations is refused, naming the layer that set it; under automatic mode the
+private namespace becomes required, and the run is refused where the host
+cannot provide it.
+
+### DNS inside the sandbox
+
+The `dns` setting decides who answers the target's questions:
+
+- `dns = "allow"` permits DNS, delivered to the namespace's forwarder and no
+  one else. The forwarder answers UDP and TCP, so a truncated or large answer
+  that drives the resolver to TCP is answered too.
+- `dns = "deny"` drops DNS questions whatever the allow rules say.
+- `dns = "auto"`, the default, allows DNS exactly when a rule names any
+  address (`host = "*"`): a rule that reaches every address is useless without
+  resolution, and one that names its destinations is safer without it, since
+  the pinned names resolve from the generated `/etc/hosts` alone.
+
+When a hostname rule is pinned, its name resolves inside the sandbox without
+sending any query. A query to a public resolver such as `8.8.8.8` is dropped in
+every case: the forwarder is the only DNS path there is.
 
 ### Automatic mode
 
@@ -246,6 +318,11 @@ at ADDR so a broker listening on the host is reachable. `bailey shell
 shell. A broker cannot be combined with publications, host mode, or
 `--no-isolate`; those combinations are refused, naming the layers involved.
 
+Destination rules beside a broker start the run rather than refusing it: the
+broker's namespace is built for the broker alone, so the rules have nothing to
+attach to, and the summary says they are superseded. Read that line as what it
+is: the broker is the egress policy in force, and the config's rules are not.
+
 The broker is whatever the caller runs there: it admits an allowlist of hosts
 and refuses the rest, so a session reaches the endpoints it needs and no relay
 it does not. The lockdown is the enforcement, and it is fail-closed: if the
@@ -297,6 +374,10 @@ refuses.
   mode still continues where nothing needs the private namespace.
 - **A broker can be named in config** with `broker = "ADDR:PORT"`, and is
   confined exactly as `--egress-proxy` confines a run.
+- **Host and CIDR rules in `egress_allow` are enforced now.** They used to be
+  advisory, enforced by port alone; they now need the private namespace, where
+  the host part is enforced by nftables, and a policy that names destinations
+  refuses where the private namespace cannot be provided.
 
 ## Scoping
 
@@ -317,9 +398,13 @@ is dropped, along with the protection.
 
 ## What is not covered
 
-- **Host and CIDR rules in `egress_allow` are advisory.** Landlock matches on TCP
-  port; the host field is not enforced, and bailey warns when you set one.
-- **UDP filtering.** There is no mode that allows some UDP and denies the rest.
+- **The sandbox's own loopback.** Inside the private namespace, loopback is how
+  the target's services talk to each other, and the firewall admits it whole. A
+  port the target binds is reachable from everywhere in the sandbox.
+- **What shares an admitted address.** A rule admits an address, and whatever
+  else answers on that address is admitted with it: a hosting neighbour, a
+  round-robin name that rotates mid-run, a pinned name whose DNS record changed
+  after the run started. See [known limitations](/security/limitations).
 - **Ingress.** A sandbox in isolated mode has no address, so nothing outside can
   reach it; a port it binds is reachable from inside the sandbox and nowhere
   else. In host mode, `bind_ports` governs what it may listen on and the port

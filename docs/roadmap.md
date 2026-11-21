@@ -48,6 +48,15 @@ the detail.
   the sandbox's own loopback, so a tool that dials a local daemon reaches it
   while the network namespace keeps refusing everything else.
 
+## Planned
+
+- **A resolver in the path.** Destination rules resolve each hostname once,
+  before the run starts, and admit the addresses it returned; a DNS proxy
+  inside the sandbox could resolve per query instead, so a rule would follow a
+  name that changes addresses mid-run, and a wildcard-subdomain rule could be
+  honest about what it admits. The pinned snapshot is the enforcement until
+  then; see [known limitations](/security/limitations).
+
 ## Decided against
 
 Each of these was specified, investigated, and dropped.

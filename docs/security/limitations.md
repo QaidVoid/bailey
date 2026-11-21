@@ -6,24 +6,30 @@ different decisions.
 
 ## Network
 
-### A partial egress allowance restricts TCP only
+### The host's namespace fallback restricts TCP only
 
-When the policy allows any egress, or binds a port, the target stays in the
-host's network namespace and only Landlock's TCP port rules apply. Landlock has
-no rule for any other protocol, so UDP, QUIC, DNS, ICMP, and stream protocols
-such as SCTP are unrestricted in that mode, and the run says so:
+When the policy allows egress, automatic mode provides the private namespace
+wherever the host can, and there the destination rules govern TCP and UDP
+alike, per address. Where the host cannot provide it, and nothing in the
+policy needs the private one, the run stays in the host's network namespace
+and only Landlock's TCP port rules apply. Landlock has no rule for any other
+protocol, so UDP, QUIC, DNS, ICMP, and stream protocols such as SCTP are
+unrestricted in that mode, and the run says so:
 
 ```
 bailey: warning: outbound access is restricted by TCP port only;
 non-TCP protocols such as UDP, QUIC, SCTP, and DNS are not restricted
 ```
 
-The MPTCP and SMC socket families are refused outright in every mode, because
-they reach TCP endpoints without Landlock's port rules seeing them; that closes
-the protocol side, not the UDP side.
+A policy that names destinations refuses in that situation instead of falling
+back, since a rule the host's namespace cannot enforce would resolve into a
+policy that means something else.
 
-The same mode leaves the host's loopback reachable, since the target shares your
-network namespace.
+The MPTCP and SMC socket families are refused outright in every mode, because
+they reach TCP endpoints without Landlock's port rules seeing them.
+
+The host's namespace also leaves the host's loopback reachable, since the
+target shares your network namespace.
 
 A full `egress = "deny"`, which is the default, has neither problem: the target
 gets its own network namespace with no route off the host and no access to your
@@ -65,10 +71,29 @@ of which Landlock gates: the port would be served at the cost of everything else
 being unrestricted. A policy that needs the port reachable from outside should
 allow egress, which keeps the host's namespace and says so in the run summary.
 
-### Host and CIDR rules are advisory
+### A destination rule admits the address, not the service
 
-`egress_allow = [{ host = "example.com", port = 443 }]` enforces the port and
-ignores the host. Bailey warns when you set a host other than `*`.
+`egress_allow = [{ host = "api.example.com", port = 443 }]` resolves the name
+once, before the target starts, and admits the addresses it returned. Three
+things follow, all inherent to address-based enforcement:
+
+- **Shared-address hosting.** Whatever else answers on an admitted address is
+  admitted with it. On shared hosting, a neighbour's site can be on the same
+  address and port; the rule cannot tell them apart, because the firewall sees
+  addresses and ports, not names.
+- **Pinning staleness.** A hostname whose DNS record changes while the run is
+  up is still admitted at its old addresses, and a new address is not admitted
+  until the next run. The inside-the-sandbox name resolution is pinned the same
+  way, so the target resolves the same addresses the firewall admits; the
+  consistency is deliberate, but it is a snapshot, not a live DNS view.
+- **No wildcard subdomains.** `host = "*.example.com"` is refused at config
+  time: netfilter matches addresses, and there is no honest way to admit a
+  family of names without admitting whatever resolves anywhere beneath it.
+  Name each host, or allow the block its addresses live in.
+
+Round-robin or anycast names that return several addresses are admitted at all
+of them; a name with a short TTL that fails over mid-run may reach a new
+address only in the next run.
 
 ## Filesystem
 
