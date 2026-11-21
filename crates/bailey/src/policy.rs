@@ -729,6 +729,67 @@ impl HttpPolicy {
     }
 }
 
+/// The host a request may be matched on: lowercase, ASCII, and without a
+/// trailing dot. `None` for anything else, which the broker refuses. A
+/// trailing dot is refused rather than stripped, because a request that names
+/// the DNS root is not a request any rule is written for.
+pub fn request_host(value: &str) -> Option<String> {
+    if value.is_empty() || !value.is_ascii() || value.ends_with('.') {
+        return None;
+    }
+    Some(value.to_ascii_lowercase())
+}
+
+/// Whether a request path is canonical: it
+/// starts with `/`, contains no empty or dot segments, no backslash, no
+/// semicolon, no control character, no malformed escape, and no escape of a
+/// character (`/`, `\`, `.`, `;` or an unreserved one) that could let a
+/// different path pass the rule a canonical one passes. Ordinary escapes
+/// such as `%20` are left untouched. The query is never part of the path the
+/// broker matches, so it is not considered here.
+pub fn is_canonical_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix('/') else {
+        return false;
+    };
+    if path.contains("//") || path.contains('\\') {
+        return false;
+    }
+    if rest
+        .split('/')
+        .any(|segment| segment == "." || segment == "..")
+    {
+        return false;
+    }
+    let bytes = path.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' => {
+                let Some(escape) = bytes
+                    .get(index + 1..index + 3)
+                    .and_then(|hex| std::str::from_utf8(hex).ok())
+                    .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+                else {
+                    return false;
+                };
+                // Escapes of the characters RFC 3986 calls equivalent to
+                // themselves, and of the separators a refusal turns on, would
+                // let a path pass a rule and reach a different one upstream.
+                if escape.is_ascii_alphanumeric()
+                    || matches!(escape, b'-' | b'.' | b'_' | b'~' | b'/' | b'\\' | b';')
+                {
+                    return false;
+                }
+                index += 3;
+            }
+            b';' => return false,
+            byte if byte < 0x20 || byte == 0x7f => return false,
+            _ => index += 1,
+        }
+    }
+    true
+}
+
 /// A host TCP service the target may reach on loopback, one port at a time.
 ///
 /// The target dials `127.0.0.1:port` inside its own network namespace, and
@@ -1019,5 +1080,79 @@ mod http_tests {
         };
         assert!(policy.is_intercepted("api.anthropic.com"));
         assert!(!policy.is_intercepted("anthropic.com"));
+    }
+
+    #[test]
+    fn request_hosts_are_lowercased_and_trailing_dots_are_refused() {
+        assert_eq!(
+            request_host("API.GitHub.com"),
+            Some("api.github.com".to_owned())
+        );
+        assert_eq!(request_host("api.github.com."), None);
+        assert_eq!(request_host("."), None);
+        assert_eq!(request_host(""), None);
+        assert_eq!(request_host("bücher.example"), None);
+        assert_eq!(request_host("10.0.0.1"), Some("10.0.0.1".to_owned()));
+    }
+
+    /// One row per input, with what the broker must answer: accepted paths
+    /// are canonical, refused paths are not.
+    #[test]
+    fn canonical_path_table() {
+        let accepted = [
+            "/",
+            "/repos",
+            "/repos/",
+            "/repos/myorg/x",
+            "/repos/myorg/x%20y",
+            "/repos/myorg/x?q=1", // the query is the codec's business, not a defect
+            "/v1/deep/path/with/many/segments",
+            "/repos/myorg/x/Y",
+            "/control%1f", // a control character is refused raw, not escaped
+        ];
+        for path in accepted {
+            assert!(super::is_canonical_path(path), "{path} should be canonical");
+        }
+
+        let refused = [
+            "relative/path",     // no leading slash
+            "",                  // empty
+            "/double//slash",    // empty segment
+            "/trailing/slash//", // empty segment at the end
+            "/dot/.",            // a dot segment
+            "/dot/../up",        // a dotdot segment
+            "/%2e/hidden",       // escaped dot segment
+            "/%2e%2e/up",        // escaped dotdot segment
+            "/slash%2Fedit",     // an escaped separator
+            "/back\\slash",      // a backslash
+            "/back%5Cslash",     // an escaped backslash
+            "/escape%61dmin",    // an escaped unreserved character
+            "/escape%41dmin",    // an escaped unreserved character, upper
+            "/tilde%7Ehome",     // an escaped unreserved character
+            "/malformed%",       // a bare percent
+            "/malformed%2",      // a truncated escape
+            "/malformed%zz",     // not hex
+            "/control\x01char",  // a control character
+            "/a;b",              // a path parameter separator
+            "/dot..;/up",        // a dotdot segment behind parameters
+            "/..;/admin",        // a parameterised dotdot segment
+            "/seg%3Btail",       // an escaped semicolon
+        ];
+        for path in refused {
+            assert!(
+                !super::is_canonical_path(path),
+                "{path:?} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_api_paths_pass_unchanged() {
+        assert!(super::is_canonical_path("/v1/messages"));
+        assert!(super::is_canonical_path(
+            "/v1/messages/a-long-id-with-hyphens-and-numbers-42"
+        ));
+        assert!(super::is_canonical_path("/static/css/site.css"));
+        assert!(super::is_canonical_path("/api/v2/items?limit=50&offset=0"));
     }
 }
