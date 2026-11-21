@@ -510,7 +510,7 @@ pub struct SocketRelay {
 /// host, or an IP literal. Compared in lowercase without a trailing dot.
 /// Names must be ASCII, so internationalised names are written in their
 /// `xn--` form.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum HttpHost {
     /// Any host: written `*`.
     Any,
@@ -586,7 +586,7 @@ impl std::fmt::Display for HttpHost {
 /// The request path a rule bounds: exact, or a prefix when written with a
 /// trailing `*`. No other wildcard. Matched against the path without the
 /// query.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum HttpPath {
     /// The whole path, byte for byte.
     Exact(String),
@@ -629,7 +629,7 @@ impl std::fmt::Display for HttpPath {
 /// method, and no path is any path. Methods are written and matched in
 /// uppercase, so a request whose method is anything else never matches an
 /// allow rule and lands in the default refusal.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HttpRule {
     /// Who the rule names.
     pub host: HttpHost,
@@ -689,7 +689,7 @@ pub enum Decision<'a> {
 }
 
 /// The shape of an attached credential.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AuthShape {
     /// `Authorization: Bearer <value>`.
     Bearer,
@@ -698,7 +698,7 @@ pub enum AuthShape {
 }
 
 /// Where a credential value comes from.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CredentialSource {
     /// An environment variable of the caller, read before the sandbox is
     /// made.
@@ -710,7 +710,7 @@ pub enum CredentialSource {
 }
 
 /// A credential the broker attaches to requests on an intercepted host.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CredentialBinding {
     /// The host it binds to, covered by an intercept entry.
     pub host: HttpHost,
@@ -724,7 +724,7 @@ pub struct CredentialBinding {
 ///
 /// The broker refuses a request unless an allow rule matches it, and drops
 /// it when a deny rule matches, whatever the allowances say.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HttpPolicy {
     /// Hosts the broker intercepts: it terminates TLS for them, and decides
     /// every request inside the tunnel on its own. Written as exact names or

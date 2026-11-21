@@ -187,6 +187,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bailey-broker"
+version = "0.2.4"
+dependencies = [
+ "bailey",
+ "libc",
+ "serde_json",
+]
+
+[[package]]
 name = "bailey-common"
 version = "0.1.0"
 dependencies = [

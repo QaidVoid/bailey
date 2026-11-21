@@ -9,6 +9,8 @@
 //! mechanisms.
 
 pub mod backend;
+/// The wire protocol between bailey and the `bailey-broker` helper.
+pub mod broker;
 pub mod cli;
 pub mod config;
 pub mod event;
