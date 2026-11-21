@@ -207,6 +207,44 @@ fn an_inner_run_needs_its_own_connect_entry_for_an_outer_socket() {
     );
 }
 
+/// A nested run cannot build the namespace that destination, UDP, deny and
+/// DNS rules are enforced in, so a policy carrying one must be refused
+/// rather than quietly reduced to the Landlock layer.
+#[test]
+fn a_nested_run_refuses_egress_rules_it_cannot_enforce() {
+    if !isolation_active() {
+        common::skip("isolation unavailable on this host");
+        return;
+    }
+    let store = tempfile::tempdir().unwrap();
+    let (_root, dir) = project(store.path());
+    fs::write(
+        dir.join("nested-net.toml"),
+        "[filesystem]\nread = [\".\"]\n\n[network]\negress = \"allow\"\n\
+         egress_deny = [{ host = \"203.0.113.0/24\", port = 443 }]\n",
+    )
+    .unwrap();
+
+    let output = outer(
+        store.path(),
+        &dir,
+        "./bailey-bin run -c nested-net.toml /bin/true\n",
+    );
+
+    assert!(
+        !output.status.success(),
+        "a nested run must refuse a policy whose egress rules need the \
+         namespace it cannot build: stdout {} stderr {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("nested"),
+        "the refusal says the run is nested: {stderr}"
+    );
+}
+
 /// Processes a confined shell starts are in the shell's own domain, so a
 /// socket one of them created is connectable by the others with no entry at
 /// all. That is what keeps a shell's own services working.

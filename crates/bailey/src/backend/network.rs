@@ -169,6 +169,14 @@ pub fn decide(
                  the policy's forwards cannot be carried"
             );
         }
+        if policy.network.needs_egress_namespace() {
+            anyhow::bail!(
+                "a nested run cannot carry the policy's destination, UDP, deny \
+                 and DNS rules, which are enforced in the private namespace's \
+                 netfilter rules, and that namespace is one a nested run \
+                 cannot build; run it outside the sandbox"
+            );
+        }
         return Ok(NetworkDecision {
             mode: NetworkMode::LandlockOnly,
             source: "nested run".to_owned(),
@@ -260,6 +268,7 @@ pub fn decide(
                 }
             );
         }
+        require_nft_for_allowed_egress(policy, &caps, &source)?;
         return Ok(NetworkDecision {
             mode: NetworkMode::Private,
             source,
@@ -269,6 +278,7 @@ pub fn decide(
 
     // Automatic mode: the private namespace wherever the host provides it.
     if caps.user_namespaces && caps.pasta {
+        require_nft_for_allowed_egress(policy, &caps, &source)?;
         return Ok(NetworkDecision {
             mode: NetworkMode::Private,
             source,
@@ -311,6 +321,28 @@ pub fn decide(
              only TCP ports are restricted"
         ),
     })
+}
+
+/// Require `nft` where the private namespace carries the egress rules.
+///
+/// Landlock's port rules bound TCP before netfilter did, so an egress-allowed
+/// private run could once survive without `nft`. With destination rules and
+/// the DNS setting in the table, the netfilter rules are the boundary
+/// itself: a table that cannot be installed would leave the run wider than
+/// the policy, so the run is refused instead.
+fn require_nft_for_allowed_egress(
+    policy: &Policy,
+    caps: &HostCapabilities,
+    source: &str,
+) -> anyhow::Result<()> {
+    if !matches!(policy.network.egress, Egress::DenyAll) && !caps.nft {
+        anyhow::bail!(
+            "the egress rules are enforced by netfilter in the private \
+             namespace, which needs nft, which is not in a trusted \
+             location; the run is refused (mode {source})"
+        );
+    }
+    Ok(())
 }
 
 /// Whether a bound port will only be reachable from inside the sandbox.

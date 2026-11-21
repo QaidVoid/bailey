@@ -830,45 +830,278 @@ fn lock_egress_to_broker(addr: std::net::Ipv4Addr, port: u16) -> anyhow::Result<
     })
 }
 
-/// Restrict the namespace's loopback traffic to what keeps the boundary.
+/// The namespace address pasta answers DNS questions at.
 ///
-/// The blanket drops are gone: with bailey's pasta arguments and `--no-map-gw`,
-/// namespace loopback never reaches the host, so a drop there only broke the
-/// servers a target talks to over its own loopback. What stays is the
-/// anti-widening half: a forwarded port must not become a new remote egress
-/// allowance, and a publication must not expose anything but its own endpoint.
-fn proxy_loopback_ruleset(forwards: &[PortForward], publishes: &[u16], egress: &Egress) -> String {
-    let mut ruleset = String::from(
-        "table inet bailey_loopback {\n\
-         \tchain output {\n\
-         \t\ttype filter hook output priority 0; policy accept;\n",
-    );
-    if !forwards.is_empty() || !publishes.is_empty() {
-        ruleset.push_str("\t\tct state established accept\n");
+/// A generated `resolv.conf` names it, the pasta arguments hand it to
+/// `--dns-forward`, and the netfilter table admits port 53 to it alone, so
+/// DNS reaches pasta's forwarder and nowhere else.
+pub(crate) const DNS_FORWARDER_V4: &str = "10.0.2.3";
+
+use crate::policy::Destination;
+
+/// The addresses one destination rule admits, split by family.
+#[derive(Default)]
+struct RuleAddresses {
+    v4: Vec<String>,
+    v6: Vec<String>,
+}
+
+impl RuleAddresses {
+    fn add(&mut self, host: &Destination, pins: &[Pin]) {
+        match host {
+            Destination::Any => {}
+            Destination::Address(addr) => self.push_addr(*addr),
+            Destination::Block(addr, prefix) => self.push_block(*addr, *prefix),
+            Destination::Name(name) => {
+                if let Some(pin) = pins.iter().find(|pin| &pin.name == name) {
+                    for addr in &pin.addresses {
+                        self.push_addr(*addr);
+                    }
+                }
+            }
+        }
     }
+
+    fn push_addr(&mut self, addr: std::net::IpAddr) {
+        match addr {
+            std::net::IpAddr::V4(v4) => self.v4.push(v4.to_string()),
+            std::net::IpAddr::V6(v6) => self.v6.push(v6.to_string()),
+        }
+    }
+
+    /// A block enters an interval set as its masked base over the prefix, so
+    /// host bits set in the config cannot widen the range past the prefix.
+    /// A whole-width prefix is a single address and is written as one.
+    fn push_block(&mut self, addr: std::net::IpAddr, prefix: u8) {
+        match addr {
+            std::net::IpAddr::V4(v4) => {
+                let bits = (u32::from(v4) as u128 & mask_prefix(prefix, 32)) as u32;
+                if prefix == 32 {
+                    self.v4.push(std::net::Ipv4Addr::from(bits).to_string());
+                } else {
+                    self.v4
+                        .push(format!("{}/{}", std::net::Ipv4Addr::from(bits), prefix));
+                }
+            }
+            std::net::IpAddr::V6(v6) => {
+                let bits = u128::from(v6) & mask_prefix(prefix, 128);
+                if prefix == 128 {
+                    self.v6.push(std::net::Ipv6Addr::from(bits).to_string());
+                } else {
+                    self.v6
+                        .push(format!("{}/{}", std::net::Ipv6Addr::from(bits), prefix));
+                }
+            }
+        }
+    }
+
+    /// The `elements = { ... }` body for one family, when it has any.
+    fn elements(&self, v6: bool) -> Option<String> {
+        let list = if v6 { &self.v6 } else { &self.v4 };
+        (!list.is_empty()).then(|| list.join(", "))
+    }
+}
+
+/// The address bits kept by a prefix of the given width.
+fn mask_prefix(prefix: u8, width: u8) -> u128 {
+    if prefix == 0 {
+        0
+    } else {
+        u128::MAX << (width - prefix)
+    }
+}
+
+/// Build the netfilter table that carries the policy's egress rules.
+///
+/// One output chain, policy drop, in the order that makes the precedence
+/// contract hold: established traffic first, because it was admitted when it
+/// was opened; then the deny entries; then port 53, which the `dns` setting
+/// alone decides; then the loopback handling the forwards and publications
+/// need; then the allowances. A rule whose host names a destination matches
+/// a per-port address set, so the rule count stays independent of how many
+/// addresses a hostname resolved to.
+fn egress_ruleset(
+    pins: &[Pin],
+    network: &crate::policy::NetworkPolicy,
+    forwards: &[PortForward],
+    publishes: &[u16],
+) -> String {
+    use crate::policy::{Egress, Protocol};
+
+    let allows: &[crate::policy::EgressRule] = match &network.egress {
+        Egress::Allow(rules) => rules,
+        Egress::DenyAll | Egress::AllowAll => &[],
+    };
+    let dns = network.dns_allowed();
+
+    // Portless denies share one set per family; a ported deny drops both
+    // transports on that port, so it gets a set of its own to name. A
+    // wildcard ported deny names no address, so it drops the port itself,
+    // on both transports, ahead of every allowance.
+    let mut denied_any = RuleAddresses::default();
+    let mut denied_ports: Vec<(u16, RuleAddresses)> = Vec::new();
+    let mut denied_ports_wildcard: Vec<u16> = Vec::new();
+    for rule in &network.deny {
+        let addresses = {
+            let mut addresses = RuleAddresses::default();
+            addresses.add(&rule.host, pins);
+            addresses
+        };
+        match rule.port {
+            None => {
+                denied_any.v4.extend(addresses.v4);
+                denied_any.v6.extend(addresses.v6);
+            }
+            Some(port) if rule.host.is_any() => {
+                if !denied_ports_wildcard.contains(&port) {
+                    denied_ports_wildcard.push(port);
+                }
+            }
+            Some(port) => {
+                if let Some(slot) = denied_ports.iter_mut().find(|(p, _)| *p == port) {
+                    slot.1.v4.extend(addresses.v4);
+                    slot.1.v6.extend(addresses.v6);
+                } else {
+                    denied_ports.push((port, addresses));
+                }
+            }
+        }
+    }
+
+    // Allowance groups, keyed by port and protocol: every rule naming the
+    // same port and the same protocol, and at least one address, shares
+    // that set, so a tcp allowance never opens the port for udp or the
+    // other way round. An any-host rule needs no set; its accept rule
+    // names the port alone.
+    let mut allowed_any: Vec<(Protocol, u16)> = Vec::new();
+    let mut allowed_sets: Vec<(u16, Protocol, RuleAddresses)> = Vec::new();
+    for rule in allows {
+        if rule.host.is_any() {
+            if !allowed_any.contains(&(rule.protocol, rule.port.unwrap_or(0))) {
+                allowed_any.push((rule.protocol, rule.port.unwrap_or(0)));
+            }
+            continue;
+        }
+        let Some(port) = rule.port else {
+            continue;
+        };
+        let mut addresses = RuleAddresses::default();
+        addresses.add(&rule.host, pins);
+        if addresses.v4.is_empty() && addresses.v6.is_empty() {
+            continue;
+        }
+        if let Some(slot) = allowed_sets
+            .iter_mut()
+            .find(|(p, proto, _)| *p == port && *proto == rule.protocol)
+        {
+            slot.2.v4.extend(addresses.v4);
+            slot.2.v6.extend(addresses.v6);
+        } else {
+            allowed_sets.push((port, rule.protocol, addresses));
+        }
+    }
+
+    let mut ruleset = String::from("table inet bailey_egress {\n");
+    if let Some(elements) = denied_any.elements(false) {
+        ruleset.push_str(&format!(
+            "\tset denied4 {{ type ipv4_addr; flags interval; elements = {{ {elements} }} }}\n"
+        ));
+    }
+    if let Some(elements) = denied_any.elements(true) {
+        ruleset.push_str(&format!(
+            "\tset denied6 {{ type ipv6_addr; flags interval; elements = {{ {elements} }} }}\n"
+        ));
+    }
+    for (port, addresses) in &denied_ports {
+        if let Some(elements) = addresses.elements(false) {
+            ruleset.push_str(&format!(
+                "\tset denied4_{port} {{ type ipv4_addr; flags interval; elements = {{ {elements} }} }}\n"
+            ));
+        }
+        if let Some(elements) = addresses.elements(true) {
+            ruleset.push_str(&format!(
+                "\tset denied6_{port} {{ type ipv6_addr; flags interval; elements = {{ {elements} }} }}\n"
+            ));
+        }
+    }
+    for (port, protocol, addresses) in &allowed_sets {
+        let proto = protocol.name();
+        if let Some(elements) = addresses.elements(false) {
+            ruleset.push_str(&format!(
+                "\tset allowed4_{port}_{proto} {{ type ipv4_addr; flags interval; elements = {{ {elements} }} }}\n"
+            ));
+        }
+        if let Some(elements) = addresses.elements(true) {
+            ruleset.push_str(&format!(
+                "\tset allowed6_{port}_{proto} {{ type ipv6_addr; flags interval; elements = {{ {elements} }} }}\n"
+            ));
+        }
+    }
+
+    ruleset.push_str(
+        "\tchain output {\n\
+         \t\ttype filter hook output priority 0; policy drop;\n\
+         \t\tct state established,related accept\n",
+    );
+    if denied_any.elements(false).is_some() {
+        ruleset.push_str("\t\tip daddr @denied4 drop\n");
+    }
+    if denied_any.elements(true).is_some() {
+        ruleset.push_str("\t\tip6 daddr @denied6 drop\n");
+    }
+    for (port, addresses) in &denied_ports {
+        if addresses.elements(false).is_some() {
+            ruleset.push_str(&format!(
+                "\t\tip daddr @denied4_{port} tcp dport {port} drop\n\
+                 \t\tip daddr @denied4_{port} udp dport {port} drop\n"
+            ));
+        }
+        if addresses.elements(true).is_some() {
+            ruleset.push_str(&format!(
+                "\t\tip6 daddr @denied6_{port} tcp dport {port} drop\n\
+                 \t\tip6 daddr @denied6_{port} udp dport {port} drop\n"
+            ));
+        }
+    }
+    for port in &denied_ports_wildcard {
+        ruleset.push_str(&format!(
+            "\t\ttcp dport {port} drop\n\t\tudp dport {port} drop\n"
+        ));
+    }
+    // Port 53 is the `dns` setting's to decide, ahead of every allowance:
+    // when it is allowed the questions go to the forwarder and nowhere else,
+    // and when it is denied nothing on the port leaves at all.
+    if dns {
+        ruleset.push_str(&format!(
+            "\t\tip daddr {DNS_FORWARDER_V4} udp dport 53 accept\n\
+             \t\tip daddr {DNS_FORWARDER_V4} tcp dport 53 accept\n"
+        ));
+    }
+    ruleset.push_str("\t\tudp dport 53 drop\n\t\ttcp dport 53 drop\n");
+
+    // The loopback half is the one the forwards and publications always
+    // needed: pasta's namespace-side socket dials the published port, the
+    // forward is held to the one address its contract names, and a forward
+    // whose port the policy also allows must not become a route to the host
+    // service behind it through any other address.
     for port in publishes {
-        // pasta's namespace-side socket dials the published loopback port.
-        ruleset.push_str(&format!("\t\tip daddr 127.0.0.1 tcp dport {port} accept\n"));
+        ruleset.push_str(&format!(
+            "\t\tip daddr 127.0.0.1 tcp dport {port} accept\n"
+        ));
     }
     for forward in forwards {
         ruleset.push_str(&format!(
             "\t\tip daddr 127.0.0.1 tcp dport {} accept\n",
             forward.port
         ));
-        // pasta answers a forwarded port on the whole loopback range and on
-        // ::1, so the forward is held to the one address its contract names:
-        // the namespace may dial it at 127.0.0.1 and nowhere else.
-        ruleset.push_str(&format!(
-            "\t\tip daddr 127.0.0.0/8 tcp dport {} drop\n",
-            forward.port
-        ));
-        ruleset.push_str(&format!(
-            "\t\tip6 daddr ::1 tcp dport {} drop\n",
-            forward.port
-        ));
     }
     for forward in forwards {
-        let already_allowed = match egress {
+        ruleset.push_str(&format!(
+            "\t\tip daddr 127.0.0.0/8 tcp dport {} drop\n\
+             \t\tip6 daddr ::1 tcp dport {} drop\n",
+            forward.port, forward.port
+        ));
+        let already_allowed = match &network.egress {
             Egress::AllowAll => true,
             Egress::DenyAll => false,
             Egress::Allow(rules) => rules
@@ -876,18 +1109,40 @@ fn proxy_loopback_ruleset(forwards: &[PortForward], publishes: &[u16], egress: &
                 .any(|rule| rule.port == Some(0) || rule.port == Some(forward.port)),
         };
         if already_allowed {
-            // pasta's listener must not also expose the host service through
-            // the namespace's non-loopback addresses.
             ruleset.push_str(&format!(
                 "\t\tip daddr {PROXY_ADDRESS_V4} tcp dport {} drop\n\
                  \t\tip6 daddr {PROXY_ADDRESS_V6} tcp dport {} drop\n",
                 forward.port, forward.port
             ));
-        } else {
-            // Landlock permits connects by port, not address. Its added local
-            // port must not become a new remote egress allowance.
-            ruleset.push_str(&format!("\t\ttcp dport {} drop\n", forward.port));
         }
+    }
+    ruleset.push_str("\t\toif \"lo\" accept\n");
+
+    for (protocol, port) in &allowed_any {
+        ruleset.push_str(&format!(
+            "\t\t{} dport {port} accept\n",
+            protocol.name()
+        ));
+    }
+    for (port, protocol, addresses) in &allowed_sets {
+        let proto = protocol.name();
+        for (family, set, present) in [
+            ("ip", format!("allowed4_{port}_{proto}"), &addresses.v4),
+            ("ip6", format!("allowed6_{port}_{proto}"), &addresses.v6),
+        ] {
+            if present.is_empty() {
+                continue;
+            }
+            ruleset.push_str(&format!(
+                "\t\t{family} daddr @{set} {proto} dport {port} accept\n"
+            ));
+        }
+    }
+    // Allow-all emits no allowance rules of its own: the chain ends with
+    // accept instead, with the denies, the DNS lock and the loopback
+    // handling above as the boundary it promises.
+    if matches!(network.egress, Egress::AllowAll) {
+        ruleset.push_str("\t\taccept\n");
     }
     ruleset.push_str("\t}\n}\n");
     ruleset
@@ -1163,11 +1418,19 @@ fn pasta_arguments(
     host_has_ipv6: bool,
     forwards: &[PortForward],
     publishes: &[u16],
+    dns_forward: bool,
 ) -> Vec<String> {
     let mut pasta_args: Vec<String> = ["--config-net", "--quiet", "--no-map-gw"]
         .iter()
         .map(|arg| (*arg).to_owned())
         .collect();
+    if dns_forward {
+        // pasta answers UDP and TCP questions at this address from the host's
+        // own resolver; the netfilter table admits port 53 to it alone, and
+        // the generated resolv.conf is what points the target here.
+        pasta_args.push("--dns-forward".to_owned());
+        pasta_args.push(DNS_FORWARDER_V4.to_owned());
+    }
     for forwarding in ["-t", "-u", "-T", "-U"] {
         if forwarding == "-T" && !forwards.is_empty() {
             for forward in forwards {
@@ -1212,6 +1475,7 @@ fn wrap_in_private_namespace(
     publishes: &[u16],
     announce: bool,
     guard_limit: u32,
+    dns_forward: bool,
 ) -> anyhow::Result<Wrapped> {
     // The decision above this call refused the run when a prerequisite was
     // missing, so the lookups here cannot fail honestly. Resolving again in
@@ -1232,7 +1496,15 @@ fn wrap_in_private_namespace(
     // IPv6 only where the host has it: handing the namespace a v6 route the host
     // cannot follow would leave a program stalling on v6 before it fell back.
     let egress_addr = broker.map(|(addr, _)| addr.to_string());
-    let pasta_args = pasta_arguments(egress_addr.as_deref(), host_has_ipv6(), forwards, publishes);
+    let pasta_args = pasta_arguments(
+        egress_addr.as_deref(),
+        host_has_ipv6(),
+        forwards,
+        publishes,
+        // A brokered run keeps its own DNS posture: the lockdown admits the
+        // broker and nothing else, so a forwarder would answer nothing.
+        dns_forward && broker.is_none(),
+    );
     // The namespace is made here rather than by pasta, and pasta is pointed at
     // it. Whoever installs the lockdown rule has to know which namespace it
     // lands in, and that cannot be established by looking: every reference a
@@ -1521,6 +1793,23 @@ fn prepare_network(
              CIDR blocks instead, or run with isolation"
         );
     }
+    // The private network's DNS contract names one forwarder, written into
+    // a generated `resolv.conf`. Under `--no-isolate` there is no root to
+    // place it in: the target reads the host's resolver, whose address the
+    // namespace's own table drops on the port, so every lookup would fail
+    // at runtime. A denied DNS setting needs no forwarder and stays
+    // honoured.
+    if no_isolate
+        && policy.network.dns_allowed()
+        && policy.network.mode == crate::policy::NetworkMode::Private
+    {
+        anyhow::bail!(
+            "--no-isolate provides no root to place a generated `resolv.conf` \
+             into, so the private network's DNS forwarder cannot be named and \
+             the target's questions would be dropped; run with isolation, or \
+             set dns = \"deny\" and name addresses or CIDR blocks"
+        );
+    }
     check_network_contradictions(policy, &forwards, &publishes)?;
     // Resolved on the host before anything forks, so the creator and the run
     // see the same addresses and an unresolvable name refuses the run before
@@ -1533,6 +1822,7 @@ fn prepare_network(
     // stays free for that. With the target running in the proxy namespace
     // directly, none is left at all.
     let guard_limit = proxy_guard_limit(no_isolate);
+    let dns_forward = policy.network.dns_allowed();
     let made_the_namespace = match decision.mode {
         network::NetworkMode::Private | network::NetworkMode::Brokered => {
             match wrap_in_private_namespace(
@@ -1541,6 +1831,7 @@ fn prepare_network(
                 &publishes,
                 announce,
                 guard_limit,
+                dns_forward,
             )? {
                 Wrapped::Parent(code) => {
                     return Ok((Wrapped::Parent(code), false, Some(decision), pins));
@@ -1572,14 +1863,14 @@ fn prepare_network(
         // reach; it only stops Landlock from refusing the one allowed hop.
         permit_egress_port(policy, port);
     } else if made_the_namespace {
-        let ruleset = proxy_loopback_ruleset(&forwards, &publishes, &policy.network.egress);
+        // The rules are the boundary in this mode, so a table that cannot be
+        // installed refuses the run: what the policy allows would otherwise
+        // be whatever nft's absence leaves open.
+        let ruleset = egress_ruleset(&pins, &policy.network, &forwards, &publishes);
         if let Err(err) = run_nft(&ruleset) {
-            if !forwards.is_empty() || !publishes.is_empty() {
-                anyhow::bail!(
-                    "the forwarding firewall could not be installed, so the run is refused: {err}"
-                );
-            }
-            eprintln!("bailey: warning: host loopback stays reachable: {err}");
+            anyhow::bail!(
+                "the egress rules could not be installed, so the run is refused: {err}"
+            );
         }
         for forward in &forwards {
             permit_egress_port(policy, forward.port);
@@ -2805,7 +3096,7 @@ mod tests {
     /// connection for the netfilter rule to refuse.
     #[test]
     fn a_private_network_forwards_no_port_in_either_direction() {
-        let args = pasta_arguments(Some("169.254.169.1"), true, &[], &[]);
+        let args = pasta_arguments(Some("169.254.169.1"), true, &[], &[], false);
 
         for forwarding in ["-t", "-u", "-T", "-U"] {
             let at = args
@@ -2828,11 +3119,23 @@ mod tests {
     /// with no IPv6 gets none rather than a route it cannot follow.
     #[test]
     fn a_plain_private_network_maps_no_host_and_no_absent_route() {
-        let args = pasta_arguments(None, false, &[], &[]);
+        let args = pasta_arguments(None, false, &[], &[], false);
 
         assert!(!args.iter().any(|arg| arg == "--map-host-loopback"));
         assert!(args.iter().any(|arg| arg == "-4"));
         assert!(!args.iter().any(|arg| arg == PROXY_ADDRESS_V6));
+    }
+
+    /// The DNS forwarder is named only when the setting allows questions,
+    /// and it is always the one address the generated resolv.conf names.
+    #[test]
+    fn the_dns_forwarder_is_passed_only_when_dns_is_allowed() {
+        let args = pasta_arguments(None, false, &[], &[], true);
+        let at = args.iter().position(|arg| arg == "--dns-forward").unwrap();
+        assert_eq!(args[at + 1], DNS_FORWARDER_V4);
+
+        let args = pasta_arguments(None, false, &[], &[], false);
+        assert!(!args.iter().any(|arg| arg == "--dns-forward"));
     }
 
     fn proxy_args(options: &[&str]) -> RunArgs {
@@ -2938,7 +3241,7 @@ mod tests {
                 host_port: 5432,
             },
         ];
-        let args = pasta_arguments(None, false, &forwards, &[]);
+        let args = pasta_arguments(None, false, &forwards, &[], false);
         let mappings: Vec<_> = args
             .windows(2)
             .filter(|pair| pair[0] == "-T")
@@ -2957,26 +3260,43 @@ mod tests {
         );
     }
 
+    /// The chain a plain allowed run gets: policy drop, replies accepted,
+    /// namespace loopback kept alive, and nothing else open.
     #[test]
-    fn proxy_loopback_default_admits_the_sandbox_loopback() {
-        let rules = proxy_loopback_ruleset(&[], &[], &Egress::AllowAll);
-        assert!(rules.contains("policy accept;"));
-        // The blanket drops are gone: namespace loopback never reaches the
-        // host under bailey's pasta arguments, so a drop there would only
-        // break the servers the target talks to over its own loopback.
-        assert!(!rules.contains("ip daddr 127.0.0.0/8 drop"));
-        assert!(!rules.contains("ip6 daddr ::1 drop"));
-        assert!(!rules.contains("dport"));
-        assert!(!rules.contains("ct state"));
+    fn the_egress_chain_defaults_to_drop_and_keeps_loopback() {
+        let network = crate::policy::NetworkPolicy {
+            egress: Egress::AllowAll,
+            ..Default::default()
+        };
+        let rules = egress_ruleset(&[], &network, &[], &[]);
+        assert!(rules.contains("policy drop;"));
+        assert!(rules.contains("ct state established,related accept"));
+        // Namespace loopback never reaches the host under bailey's pasta
+        // arguments, so keeping it open costs nothing and keeps the servers
+        // the target talks to over its own loopback alive.
+        assert!(rules.contains("\t\toif \"lo\" accept\n"));
+        assert!(!rules.contains("ip daddr 127.0.0.0/8 drop\n"));
+        assert!(!rules.contains("\t\tip6 daddr ::1 drop\n"));
+        // Automatic DNS reads allow-all as allowed: the questions reach the
+        // forwarder, and nothing else on the port leaves.
+        assert!(rules.contains("\t\tip daddr 10.0.2.3 udp dport 53 accept\n"));
+        assert!(rules.contains("\t\tip daddr 10.0.2.3 tcp dport 53 accept\n"));
+        assert!(rules.contains("\t\tudp dport 53 drop\n"));
+        assert!(rules.contains("\t\ttcp dport 53 drop\n"));
+        assert!(!rules.contains("\t\tudp dport 53 accept\n"));
     }
 
     #[test]
-    fn proxy_loopback_accepts_only_exact_forwarded_tcp_endpoints() {
+    fn egress_chain_accepts_only_exact_forwarded_tcp_endpoints() {
         let forwards = [PortForward {
             port: 8081,
             host_port: 8080,
         }];
-        let rules = proxy_loopback_ruleset(&forwards, &[], &Egress::AllowAll);
+        let network = crate::policy::NetworkPolicy {
+            egress: Egress::AllowAll,
+            ..Default::default()
+        };
+        let rules = egress_ruleset(&[], &network, &forwards, &[]);
         let permit = rules
             .find("ip daddr 127.0.0.1 tcp dport 8081 accept")
             .unwrap();
@@ -2984,14 +3304,15 @@ mod tests {
             .find("ip daddr 127.0.0.0/8 tcp dport 8081 drop")
             .unwrap();
         assert!(permit < deny_loopback);
-        assert!(rules.find("ct state established accept").unwrap() < permit);
-        assert!(rules.contains("policy accept;"));
+        let established = rules.find("ct state established,related accept").unwrap();
+        assert!(established < permit);
+        // All-egress already allows the port, so the drops that keep pasta's
+        // listener from exposing the host service are in force.
         assert!(rules.contains("ip daddr 10.0.2.15 tcp dport 8081 drop"));
         assert!(rules.contains("ip6 daddr fd00::2 tcp dport 8081 drop"));
         assert!(rules.contains("ip6 daddr ::1 tcp dport 8081 drop"));
-        assert!(!rules.contains("udp"));
+        assert!(!rules.contains("udp dport 8081"));
         assert!(!rules.contains("dport 8080"));
-        assert!(!rules.contains("oif lo accept"));
         // No blanket drop may come back: the sandbox's own servers on other
         // loopback addresses and ports stay reachable.
         assert!(!rules.contains("127.0.0.0/8 drop\n"));
@@ -3000,24 +3321,33 @@ mod tests {
 
     #[test]
     fn proxy_forward_connect_ports_do_not_widen_partial_remote_egress() {
-        use crate::policy::{Destination, EgressRule, Protocol};
-        let mut policy = Policy::default();
-        policy.network.egress = Egress::Allow(vec![EgressRule {
-            host: Destination::Any,
-            protocol: Protocol::Tcp,
-            port: Some(443),
-        }]);
+        use crate::policy::{Destination, EgressRule, NetworkPolicy, Protocol};
+        let network = NetworkPolicy {
+            egress: Egress::Allow(vec![EgressRule {
+                host: Destination::Any,
+                protocol: Protocol::Tcp,
+                port: Some(443),
+            }]),
+            ..Default::default()
+        };
         let forwards = [PortForward {
             port: 8081,
             host_port: 8080,
         }];
-        let rules = proxy_loopback_ruleset(&forwards, &[], &policy.network.egress);
+        let rules = egress_ruleset(&[], &network, &forwards, &[]);
+        // The forward is held to the one endpoint it names, and the 443
+        // allowance keeps its plain accept rule.
         let permit = rules
             .find("ip daddr 127.0.0.1 tcp dport 8081 accept")
             .unwrap();
-        let deny_remote = rules.find("\t\ttcp dport 8081 drop").unwrap();
-        assert!(permit < deny_remote);
+        assert!(rules[permit..].contains("ip daddr 127.0.0.0/8 tcp dport 8081 drop"));
+        assert!(rules.contains("\t\ttcp dport 443 accept\n"));
         assert!(!rules.contains("tcp dport 443 drop"));
+        // The forward port is not in the egress rules, so nothing protects
+        // against it widening: the policy drop already denies it remotely.
+        assert!(!rules.contains("ip daddr 10.0.2.15 tcp dport 8081 drop"));
+        let mut policy = Policy::default();
+        policy.network = network;
         permit_egress_port(&mut policy, 8081);
         assert!(
             matches!(policy.network.egress, Egress::Allow(ref ports) if ports.iter().any(|rule| rule.port == Some(8081)))
@@ -3026,20 +3356,250 @@ mod tests {
 
     #[test]
     fn proxy_forwards_preserve_existing_remote_port_allowances() {
-        use crate::policy::{Destination, EgressRule, Protocol};
+        use crate::policy::{Destination, EgressRule, NetworkPolicy, Protocol};
         let forwards = [PortForward {
             port: 8081,
             host_port: 8080,
         }];
         for port in [0, 8081] {
-            let egress = Egress::Allow(vec![EgressRule {
+            let network = NetworkPolicy {
+                egress: Egress::Allow(vec![EgressRule {
+                    host: Destination::Any,
+                    protocol: Protocol::Tcp,
+                    port: Some(port),
+                }]),
+                ..Default::default()
+            };
+            let rules = egress_ruleset(&[], &network, &forwards, &[]);
+            // The allowance survives as a plain port accept, and the drops
+            // around the forward name addresses, not the whole port.
+            assert!(
+                rules.contains(&format!("\t\ttcp dport {port} accept\n")),
+                "the allowance keeps its accept rule: {rules}"
+            );
+            assert!(!rules.contains(&format!("\t\ttcp dport 8081 drop\n")));
+        }
+    }
+
+    /// A named host becomes a per-port address set fed by the pins, and the
+    /// accept rules match the set: the rule count stays independent of how
+    /// many addresses the name resolved to.
+    #[test]
+    fn destination_rules_become_per_port_address_sets() {
+        use crate::policy::{Destination, EgressRule, NetworkPolicy, Protocol};
+        let pins = [Pin {
+            name: "api.example.com".to_owned(),
+            addresses: vec![
+                "203.0.113.7".parse().unwrap(),
+                "203.0.113.9".parse().unwrap(),
+                "2001:db8::7".parse().unwrap(),
+            ],
+        }];
+        let network = NetworkPolicy {
+            egress: Egress::Allow(vec![EgressRule {
+                host: Destination::Name("api.example.com".to_owned()),
+                protocol: Protocol::Tcp,
+                port: Some(443),
+            }]),
+            ..Default::default()
+        };
+        let rules = egress_ruleset(&pins, &network, &[], &[]);
+        assert!(rules.contains(
+            "set allowed4_443_tcp { type ipv4_addr; flags interval; elements = { 203.0.113.7, 203.0.113.9 } }"
+        ));
+        assert!(rules.contains(
+            "set allowed6_443_tcp { type ipv6_addr; flags interval; elements = { 2001:db8::7 } }"
+        ));
+        assert!(rules.contains("ip daddr @allowed4_443_tcp tcp dport 443 accept"));
+        assert!(rules.contains("ip6 daddr @allowed6_443_tcp tcp dport 443 accept"));
+        // A named rule admits no other protocol on the port.
+        assert!(!rules.contains("udp dport 443"));
+        assert!(rules.contains("policy drop;"));
+    }
+
+    /// Allowance sets are keyed by port and protocol together: `tcp A:443`
+    /// and `udp B:443` must not let A travel on udp or B on tcp.
+    #[test]
+    fn allowance_sets_do_not_cross_protocols() {
+        use crate::policy::{Destination, EgressRule, NetworkPolicy, Protocol};
+        let network = NetworkPolicy {
+            egress: Egress::Allow(vec![
+                EgressRule {
+                    host: Destination::Address("93.184.216.34".parse().unwrap()),
+                    protocol: Protocol::Tcp,
+                    port: Some(443),
+                },
+                EgressRule {
+                    host: Destination::Address("198.51.100.7".parse().unwrap()),
+                    protocol: Protocol::Udp,
+                    port: Some(443),
+                },
+            ]),
+            ..Default::default()
+        };
+        let rules = egress_ruleset(&[], &network, &[], &[]);
+
+        let tcp_block = rules.split("set allowed4_443_tcp").nth(1).unwrap();
+        assert!(tcp_block.contains("93.184.216.34"), "{rules}");
+        assert!(
+            rules.contains("ip daddr @allowed4_443_tcp tcp dport 443 accept"),
+            "{rules}"
+        );
+        let udp_block = rules.split("set allowed4_443_udp").nth(1).unwrap();
+        assert!(udp_block.contains("198.51.100.7"), "{rules}");
+        assert!(
+            rules.contains("ip daddr @allowed4_443_udp udp dport 443 accept"),
+            "{rules}"
+        );
+        assert!(
+            !rules.contains("@allowed4_443_tcp udp dport"),
+            "tcp hosts must not be reachable over udp: {rules}"
+        );
+        assert!(
+            !rules.contains("@allowed4_443_udp tcp dport"),
+            "udp hosts must not be reachable over tcp: {rules}"
+        );
+    }
+
+    /// A CIDR block enters its set as the masked base over the prefix, so a
+    /// config that writes host bits cannot widen the range.
+    #[test]
+    fn a_cidr_allowance_masks_host_bits() {
+        use crate::policy::{Destination, EgressRule, NetworkPolicy, Protocol};
+        let network = NetworkPolicy {
+            egress: Egress::Allow(vec![EgressRule {
+                host: Destination::Block("10.20.3.4".parse().unwrap(), 16),
+                protocol: Protocol::Tcp,
+                port: Some(5432),
+            }]),
+            ..Default::default()
+        };
+        let rules = egress_ruleset(&[], &network, &[], &[]);
+        assert!(rules.contains("elements = { 10.20.0.0/16 }"), "{rules}");
+        assert!(rules.contains("ip daddr @allowed4_5432_tcp tcp dport 5432 accept"));
+    }
+
+    /// A wildcard deny naming a port drops the port for everyone, on both
+    /// transports, ahead of the blanket accept: it is not accepted and
+    /// silently ignored.
+    #[test]
+    fn a_wildcard_deny_with_a_port_drops_the_port() {
+        use crate::policy::{DenyRule, Destination, NetworkPolicy};
+        let network = NetworkPolicy {
+            egress: Egress::AllowAll,
+            deny: vec![DenyRule {
+                host: Destination::Any,
+                port: Some(8080),
+            }],
+            ..Default::default()
+        };
+        let rules = egress_ruleset(&[], &network, &[], &[]);
+        assert!(rules.contains("\t\ttcp dport 8080 drop\n"), "{rules}");
+        assert!(rules.contains("\t\tudp dport 8080 drop\n"), "{rules}");
+        let deny = rules.find("tcp dport 8080 drop").unwrap();
+        let accept = rules.find("\t\taccept\n").unwrap();
+        assert!(deny < accept, "the deny wins ahead of allow-all's accept");
+    }
+
+    /// A deny list under full egress drops ahead of the (empty) allowances,
+    /// portless denies over whole families, ported denies per port.
+    #[test]
+    fn deny_rules_drop_ahead_of_every_allowance() {
+        use crate::policy::{DenyRule, Destination, NetworkPolicy};
+        let network = NetworkPolicy {
+            egress: Egress::AllowAll,
+            deny: vec![DenyRule {
+                host: Destination::Address("169.254.169.254".parse().unwrap()),
+                port: None,
+            }],
+            ..Default::default()
+        };
+        let rules = egress_ruleset(&[], &network, &[], &[]);
+        assert!(rules.contains(
+            "set denied4 { type ipv4_addr; flags interval; elements = { 169.254.169.254 } }"
+        ));
+        let deny = rules.find("ip daddr @denied4 drop").unwrap();
+        // Allow-all's blanket accept ends the chain, and the loopback and DNS
+        // rules come before it: the deny wins wherever they could overlap.
+        let loopback = rules.find("oif \"lo\" accept").unwrap();
+        let accept = rules.find("\t\taccept\n").unwrap();
+        assert!(deny < loopback && loopback < accept);
+
+        // A ported deny drops both transports on that port only.
+        let network = NetworkPolicy {
+            egress: Egress::AllowAll,
+            deny: vec![DenyRule {
+                host: Destination::Block("10.0.0.5".parse().unwrap(), 32),
+                port: Some(80),
+            }],
+            ..Default::default()
+        };
+        let rules = egress_ruleset(&[], &network, &[], &[]);
+        assert!(rules.contains("set denied4_80 { type ipv4_addr; flags interval; elements = { 10.0.0.5 } }"));
+        assert!(rules.contains("ip daddr @denied4_80 tcp dport 80 drop"));
+        assert!(rules.contains("ip daddr @denied4_80 udp dport 80 drop"));
+    }
+
+    /// `egress = "allow"` ends the chain with accept: the deny rules, the
+    /// DNS lock and the loopback handling above it are the boundary, and
+    /// everything they do not name leaves.
+    #[test]
+    fn allow_all_ends_the_chain_with_accept() {
+        use crate::policy::{DenyRule, Destination, NetworkPolicy};
+        let network = NetworkPolicy {
+            egress: Egress::AllowAll,
+            deny: vec![DenyRule {
+                host: Destination::Address("10.9.9.9".parse().unwrap()),
+                port: Some(8080),
+            }],
+            ..Default::default()
+        };
+        let rules = egress_ruleset(&[], &network, &[], &[]);
+        let deny = rules
+            .find("ip daddr @denied4_8080 tcp dport 8080 drop")
+            .unwrap();
+        let accept = rules.find("\t\taccept\n").unwrap();
+        assert!(deny < accept, "{rules}");
+    }
+
+    /// DNS is the setting's alone: allowed, the questions reach the
+    /// forwarder and nothing else on the port; denied, nothing does. Both
+    /// shapes sit ahead of every allowance.
+    #[test]
+    fn port_53_follows_the_dns_setting_alone() {
+        use crate::policy::{Destination, EgressRule, DnsSetting, NetworkPolicy, Protocol};
+        let wildcard = |dns| NetworkPolicy {
+            egress: Egress::Allow(vec![EgressRule {
                 host: Destination::Any,
                 protocol: Protocol::Tcp,
-                port: Some(port),
-            }]);
-            let rules = proxy_loopback_ruleset(&forwards, &[], &egress);
-            assert!(!rules.contains("\t\ttcp dport 8081 drop"));
-        }
+                port: Some(443),
+            }]),
+            dns,
+            ..Default::default()
+        };
+        let allowed = egress_ruleset(&[], &wildcard(DnsSetting::Auto), &[], &[]);
+        assert!(allowed.contains("ip daddr 10.0.2.3 udp dport 53 accept"));
+        assert!(allowed.contains("ip daddr 10.0.2.3 tcp dport 53 accept"));
+        let dns_accept = allowed.find("udp dport 53 accept").unwrap();
+        let dns_drop = allowed.find("\t\tudp dport 53 drop").unwrap();
+        let tcp_accept = allowed.find("\t\ttcp dport 443 accept").unwrap();
+        assert!(dns_accept < dns_drop && dns_drop < tcp_accept);
+
+        let denied = egress_ruleset(&[], &wildcard(DnsSetting::Deny), &[], &[]);
+        assert!(!denied.contains("dport 53 accept"));
+        assert!(denied.contains("\t\tudp dport 53 drop\n"));
+
+        // A policy of named hosts only allows no DNS under automatic mode.
+        let named = NetworkPolicy {
+            egress: Egress::Allow(vec![EgressRule {
+                host: Destination::Address("203.0.113.7".parse().unwrap()),
+                protocol: Protocol::Tcp,
+                port: Some(443),
+            }]),
+            ..Default::default()
+        };
+        let rules = egress_ruleset(&[], &named, &[], &[]);
+        assert!(!rules.contains("dport 53 accept"));
     }
 
     fn publish_args(options: &[&str]) -> NetworkArgs {
@@ -3229,6 +3789,29 @@ mod tests {
         assert!(err.contains("/etc/hosts"), "{err}");
     }
 
+    /// The private network's DNS forwarder can only be named in a generated
+    /// `resolv.conf`, and there is no root to place one in under
+    /// `--no-isolate`: the target would read the host's resolver, whose
+    /// address the namespace's own table drops on the port. The run is
+    /// refused rather than left to fail at its first lookup.
+    #[test]
+    fn no_isolate_refuses_private_mode_when_dns_is_allowed() {
+        let mut policy = Policy::default();
+        policy.network.mode = crate::policy::NetworkMode::Private;
+        policy.network.egress = Egress::AllowAll;
+        let err = prepare_network(&mut policy, &NetworkArgs::default(), true, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--no-isolate"), "{err}");
+        assert!(err.contains("DNS"), "{err}");
+
+        // A denied DNS setting needs no forwarder, so the run is honoured.
+        let mut policy = Policy::default();
+        policy.network.mode = crate::policy::NetworkMode::Private;
+        policy.network.dns = crate::policy::DnsSetting::Deny;
+        prepare_network(&mut policy, &NetworkArgs::default(), true, false).unwrap();
+    }
+
     /// The resolver is libc's, asked on the host before anything forks, so a
     /// name that only the host's `/etc/hosts` answers is pinned all the same.
     #[test]
@@ -3310,7 +3893,7 @@ mod tests {
 
     #[test]
     fn publication_maps_only_loopback_and_keeps_other_directions_off() {
-        let args = pasta_arguments(None, false, &[], &[3800, 4000]);
+        let args = pasta_arguments(None, false, &[], &[3800, 4000], false);
         let mappings: Vec<_> = args
             .windows(2)
             .filter(|pair| pair[0] == "-t")
@@ -3327,8 +3910,12 @@ mod tests {
 
     #[test]
     fn publication_rules_admit_the_local_connection() {
-        let rules = proxy_loopback_ruleset(&[], &[3800], &Egress::AllowAll);
-        let established = rules.find("ct state established accept").unwrap();
+        let network = crate::policy::NetworkPolicy {
+            egress: Egress::AllowAll,
+            ..Default::default()
+        };
+        let rules = egress_ruleset(&[], &network, &[], &[3800]);
+        let established = rules.find("ct state established,related accept").unwrap();
         let accept = rules
             .find("ip daddr 127.0.0.1 tcp dport 3800 accept")
             .unwrap();
@@ -3336,14 +3923,17 @@ mod tests {
         assert!(!rules.contains("127.0.0.0/8 drop"));
         // A publication is not an egress allowance, so it gets no remote drop.
         assert!(!rules.contains("\t\ttcp dport 3800 drop"));
-        assert!(!rules.contains("udp"));
-        assert!(!rules.contains("oif lo accept"));
+        assert!(!rules.contains("udp dport 3800"));
     }
 
     #[test]
     fn publication_only_rules_keep_established_replies() {
-        let rules = proxy_loopback_ruleset(&[], &[3800], &Egress::AllowAll);
-        assert!(rules.contains("ct state established accept"));
+        let network = crate::policy::NetworkPolicy {
+            egress: Egress::AllowAll,
+            ..Default::default()
+        };
+        let rules = egress_ruleset(&[], &network, &[], &[3800]);
+        assert!(rules.contains("ct state established,related accept"));
     }
 
     #[test]

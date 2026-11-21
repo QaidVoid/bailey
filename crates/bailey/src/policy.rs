@@ -346,6 +346,24 @@ impl NetworkPolicy {
                 .iter()
                 .any(|rule| matches!(rule.host, Destination::Name(_)))
     }
+
+    /// Whether DNS questions are answered for this policy.
+    ///
+    /// An explicit `dns` setting decides. `auto` allows DNS exactly when a
+    /// rule names any host, since a rule that reaches every address is
+    /// useless without resolution, and drops it otherwise, leaving the
+    /// pinned `/etc/hosts` to answer.
+    pub fn dns_allowed(&self) -> bool {
+        match self.dns {
+            DnsSetting::Allow => true,
+            DnsSetting::Deny => false,
+            DnsSetting::Auto => match &self.egress {
+                Egress::Allow(rules) => rules.iter().any(|rule| rule.host.is_any()),
+                Egress::AllowAll => true,
+                Egress::DenyAll => false,
+            },
+        }
+    }
 }
 
 /// A device access grant, typically a node under `/dev`.
