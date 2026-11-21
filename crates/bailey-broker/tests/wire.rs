@@ -4,9 +4,11 @@
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 
-use bailey::broker::{BROKER_PROTOCOL_VERSION, BrokerConfig, BrokerLayers, BrokerReady};
+use bailey::broker::{BROKER_PROTOCOL_VERSION, BrokerConfig, BrokerReady};
 
-/// Spawn the broker, hand it a configuration, and read its ready line.
+/// Spawn the broker the way bailey's parent does, hand it a configuration,
+/// and read its ready line. The broker parks after the ready line until it
+/// is signalled, so the test stops it once the line is read.
 #[test]
 fn the_broker_answers_the_config_with_a_ready_line() {
     let config = BrokerConfig {
@@ -17,8 +19,10 @@ fn the_broker_answers_the_config_with_a_ready_line() {
     };
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_bailey-broker"))
+        .arg(std::process::id().to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
         .spawn()
         .expect("the broker binary builds and spawns");
     let mut stdin = child.stdin.take().expect("stdin is piped");
@@ -28,14 +32,14 @@ fn the_broker_answers_the_config_with_a_ready_line() {
     drop(stdin);
     let mut stdout = child.stdout.take().expect("stdout is piped");
     let ready = BrokerReady::decode(&mut stdout).expect("a ready line");
-    child.wait().expect("the broker exits cleanly");
+    child.kill().expect("the broker is stopped");
+    child.wait().expect("the broker exits");
 
     assert_eq!(ready.version, BROKER_PROTOCOL_VERSION);
     assert_eq!(ready.ca_pem, None, "no host is intercepted yet");
-    assert_eq!(
-        ready.layers,
-        BrokerLayers::default(),
-        "the skeleton applies no confinement layer yet"
+    assert!(
+        ready.layers.seccomp,
+        "the broker refuses to serve without its syscall filter: {ready:?}"
     );
 }
 
@@ -51,8 +55,10 @@ fn the_broker_refuses_a_foreign_version() {
     };
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_bailey-broker"))
+        .arg(std::process::id().to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()
         .expect("the broker binary builds and spawns");
     let mut stdin = child.stdin.take().expect("stdin is piped");

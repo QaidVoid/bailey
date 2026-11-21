@@ -2742,6 +2742,260 @@ fn target_arch() -> anyhow::Result<seccompiler::TargetArch> {
     }
 }
 
+/// The sockets the broker may create: the internet protocol families only.
+///
+/// The broker needs no local IPC once it has its descriptors, and a broker
+/// that could open a UNIX socket could reach the caller's session bus,
+/// `ssh-agent` or `gpg-agent`, which hold the caller's authority. Its filter
+/// therefore refuses `socket` and `socketpair` for every family except
+/// `AF_INET` and `AF_INET6`.
+/// The family is an integer argument, so the filter reads it from the
+/// registers and there is nothing to race. `AF_NETLINK` needs no exception:
+/// glibc's `AI_ADDRCONFIG` probe fails and it assumes both families, which
+/// is what a run wants anyway.
+fn broker_socket_family_guards() -> Vec<seccompiler::sock_filter> {
+    use seccompiler::sock_filter;
+
+    const BPF_LD_W_ABS: u16 = 0x20;
+    const BPF_JMP_JEQ_K: u16 = 0x15;
+    const BPF_RET_K: u16 = 0x06;
+    const NR_OFFSET: u32 = 0;
+    const SOCKET_FAMILY_OFFSET: u32 = 16;
+    const RET_ERRNO_EPERM: u32 = 0x0005_0000 | (libc::EPERM as u32);
+
+    let stmt = |code: u16, k: u32| sock_filter {
+        code,
+        jt: 0,
+        jf: 0,
+        k,
+    };
+    let jump = |code: u16, k: u32, jt: u8, jf: u8| sock_filter { code, jt, jf, k };
+
+    // Block layout, with `past` the first instruction after it:
+    //   [0] load the syscall number
+    //   [1] socket:     fall into the family check
+    //   [2] socketpair: fall into the family check, else jump to past
+    //   [3] load the family
+    //   [4] AF_INET:        jump to past
+    //   [5] AF_INET6:       jump to past
+    //   [6] refuse the rest
+    vec![
+        stmt(BPF_LD_W_ABS, NR_OFFSET),
+        jump(BPF_JMP_JEQ_K, libc::SYS_socket as u32, 1, 0),
+        jump(BPF_JMP_JEQ_K, libc::SYS_socketpair as u32, 0, 4),
+        stmt(BPF_LD_W_ABS, SOCKET_FAMILY_OFFSET),
+        jump(BPF_JMP_JEQ_K, libc::AF_INET as u32, 2, 0),
+        jump(BPF_JMP_JEQ_K, libc::AF_INET6 as u32, 1, 0),
+        stmt(BPF_RET_K, RET_ERRNO_EPERM),
+    ]
+}
+
+/// bailey's seccomp denylist with the broker's IPC boundary.
+///
+/// The broker runs under the same denylist the target runs, with the socket
+/// family guard in front. Applied by [`confine_broker`],
+/// which refuses rather than continuing without it.
+pub(crate) fn broker_seccomp_program() -> anyhow::Result<seccompiler::BpfProgram> {
+    let mut program = broker_socket_family_guards();
+    program.extend(prepend_seccomp_guards(build_seccomp_filter(false)?));
+    Ok(program)
+}
+
+/// The Landlock ABI the broker confines under: a test's forced value when
+/// one is set, the kernel's otherwise.
+///
+/// `BAILEY_BROKER_LANDLOCK_ABI` exists so the below-ABI-6 behaviour the
+/// kernel-matrix job sees on old kernels can also be exercised on a new
+/// one. Forcing a value higher than the kernel has is answered honestly:
+/// the ruleset then covers more than the kernel enforces, and the layers
+/// report what was actually enforced.
+fn broker_landlock_abi() -> Option<u32> {
+    if let Ok(forced) = std::env::var("BAILEY_BROKER_LANDLOCK_ABI")
+        && let Ok(version) = forced.trim().parse::<u32>()
+    {
+        return Some(version);
+    }
+    crate::backend::probe::landlock_abi()
+}
+
+/// The `landlock` crate's ABI value for a version number, clamped to the
+/// newest the crate names.
+fn landlock_abi_of(version: u32) -> ABI {
+    match version {
+        1 => ABI::V1,
+        2 => ABI::V2,
+        3 => ABI::V3,
+        4 => ABI::V4,
+        5 => ABI::V5,
+        _ => ABI::V6,
+    }
+}
+
+/// Whether the HTTP rules allow a connect to any port.
+///
+/// A rule without a port allows every port to its host, and Landlock can
+/// bound a connect by port alone, so no set of port grants covers such a
+/// rule. The caller drops the connect layer instead: every port passes
+/// Landlock, and the broker's own ACL stays the boundary for hosts and
+/// ports.
+fn broker_connects_any_port(http: &crate::policy::HttpPolicy) -> bool {
+    http.allow.iter().any(|rule| rule.port.is_none())
+}
+
+/// The TCP connect ports the HTTP rules can produce, plus 53 for DNS over
+/// TCP.
+///
+/// A rule without a port can produce both the CONNECT default and the
+/// cleartext default. Denied rules never produce a connect, so only the
+/// allowances are read.
+fn broker_connect_ports(http: &crate::policy::HttpPolicy) -> Vec<u16> {
+    let mut ports = std::collections::BTreeSet::new();
+    ports.insert(53);
+    for rule in &http.allow {
+        match rule.port {
+            Some(port) => {
+                ports.insert(port);
+            }
+            None => {
+                ports.insert(443);
+                ports.insert(80);
+            }
+        }
+    }
+    ports.into_iter().collect()
+}
+
+/// Confine the broker process itself.
+///
+/// Landlock first: read access to the two files name resolution needs, TCP
+/// connect only to the ports the HTTP rules can produce plus 53, abstract
+/// UNIX sockets and signals scoped where the kernel has ABI 6, and pathname
+/// UNIX resolution handled with no grant from ABI 9. No socket is granted
+/// for name resolution: glibc falls back from an unreachable NSS socket to
+/// plain DNS. Then bailey's seccomp denylist with the socket family filter.
+///
+/// A kernel without Landlock degrades rather than refuses: the seccomp
+/// family filter is the boundary and holds there. The returned layers say
+/// what was actually enforced, for the ready line and the run summary. The
+/// seccomp filter is not optional: its failure refuses.
+pub fn confine_broker(http: &crate::policy::HttpPolicy) -> io::Result<crate::broker::BrokerLayers> {
+    let mut layers = crate::broker::BrokerLayers::default();
+
+    if let Some(version) = broker_landlock_abi()
+        && version >= 1
+    {
+        let abi = landlock_abi_of(version);
+        let read: BitFlags<AccessFs> = AccessFs::ReadFile | AccessFs::ReadDir;
+        let ruleset = Ruleset::default()
+            .set_compatibility(CompatLevel::BestEffort)
+            .handle_access(AccessFs::from_all(abi))
+            .and_then(|ruleset| {
+                if version >= 9 {
+                    // Handled with no grant: a pathname UNIX socket cannot
+                    // be resolved into an open, and nothing is added to
+                    // permit one.
+                    ruleset.handle_access(AccessFs::ResolveUnix)
+                } else {
+                    Ok(ruleset)
+                }
+            })
+            .and_then(|ruleset| {
+                // The connect layer is only handled when the port grants
+                // can cover the rules: a portless allowance allows every
+                // port to its host, and handling the right with no grants
+                // would deny what the rule allows.
+                if version >= 4 && !broker_connects_any_port(http) {
+                    ruleset.handle_access(AccessNet::ConnectTcp)
+                } else {
+                    Ok(ruleset)
+                }
+            })
+            .and_then(|ruleset| {
+                if version >= 6 {
+                    ruleset.scope(Scope::from_all(landlock_abi_of(6)))
+                } else {
+                    Ok(ruleset)
+                }
+            })
+            .map_err(|error| io::Error::other(format!("landlock ruleset: {error}")))?;
+        let mut created = ruleset
+            .create()
+            .map_err(|error| io::Error::other(format!("landlock create: {error}")))?;
+        for path in ["/etc/resolv.conf", "/etc/hosts"] {
+            if let Ok(file) = std::fs::File::open(path) {
+                created = created
+                    .add_rule(PathBeneath::new(&file, read))
+                    .map_err(|error| {
+                        io::Error::other(format!("landlock grant {path}: {error}"))
+                    })?;
+            }
+        }
+        // The upstream TLS sessions verify certificates against the host's
+        // own roots, so the bundle files are readable to the
+        // broker, and the directories beside them, because the loader lists
+        // a hashed-certificates directory as well as reading a bundle file.
+        // Nothing else of /etc is granted.
+        for path in crate::broker::CA_BUNDLE_PATHS {
+            if let Ok(file) = std::fs::File::open(path) {
+                created = created
+                    .add_rule(PathBeneath::new(&file, AccessFs::ReadFile))
+                    .map_err(|error| {
+                        io::Error::other(format!("landlock grant {path}: {error}"))
+                    })?;
+            }
+            if let Some(dir) = std::path::Path::new(path).parent()
+                && let Ok(handle) = std::fs::File::open(dir)
+            {
+                created = created
+                    .add_rule(PathBeneath::new(&handle, read))
+                    .map_err(|error| {
+                        io::Error::other(format!(
+                            "landlock grant {}: {error}",
+                            dir.display()
+                        ))
+                    })?;
+            }
+        }
+        // A portless allowance allows every port to its host, and no set of
+        // port grants covers that, so the connect layer is left unhandled
+        // and the broker's ACL is the boundary. With only ported rules, the
+        // grants cover what they can produce.
+        if !broker_connects_any_port(http) {
+            for port in broker_connect_ports(http) {
+                created = created
+                    .add_rule(NetPort::new(port, AccessNet::ConnectTcp))
+                    .map_err(|error| {
+                        io::Error::other(format!("landlock grant port {port}: {error}"))
+                    })?;
+            }
+        }
+        let status = created
+            .restrict_self()
+            .map_err(|error| io::Error::other(format!("landlock restrict: {error}")))?;
+        // A kernel that reports PartiallyEnforced here has dropped the
+        // crate's preview rights, such as pathname UNIX resolution when its
+        // ABI has no such right yet. Everything it supports was enforced,
+        // and the layers below report that, gated by the ABI each layer
+        // needs. Only a ruleset that is not enforced at all leaves a layer
+        // false beside the version gates.
+        let enforced = status.ruleset != RulesetStatus::NotEnforced;
+        layers.landlock = enforced && version >= 6;
+        layers.landlock_network = enforced && version >= 4 && !broker_connects_any_port(http);
+    }
+
+    unsafe {
+        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    let program = broker_seccomp_program()
+        .map_err(|error| io::Error::other(format!("seccomp: {error}")))?;
+    seccompiler::apply_filter(&program)
+        .map_err(|error| io::Error::other(format!("seccomp: {error}")))?;
+    layers.seccomp = true;
+    Ok(layers)
+}
+
 /// Applies cgroup v2 resource limits for the duration of a run and removes the
 /// cgroup when dropped. All operations are best-effort: on a system without a
 /// writable delegated cgroup the limits are skipped with a warning rather than

@@ -660,6 +660,12 @@ impl HttpRule {
             Some(path) => path.matches(req.path),
         }
     }
+
+    /// Whether the rule names a destination, whatever it bounds: the
+    /// host matches and either no port is set or it is this port.
+    fn names(&self, host: &str, port: u16) -> bool {
+        self.host.matches(host) && !self.port.is_some_and(|bound| bound != port)
+    }
 }
 
 /// A request the broker matches, with the port defaults applied and the
@@ -696,6 +702,22 @@ pub enum AuthShape {
     /// A named header carrying the value raw.
     Header(String),
 }
+
+/// The headers the broker never forwards and a credential never attaches
+/// under: the framing headers it writes itself, and the hop-by-hop set.
+/// One list for both crates, so what parsing drops and what config refuses
+/// stay the same list.
+pub const HOP_BY_HOP_HEADERS: [&str; 9] = [
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "proxy-authorization",
+    "te",
+    "upgrade",
+    "host",
+    "content-length",
+    "transfer-encoding",
+];
 
 /// Where a credential value comes from.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -750,6 +772,30 @@ impl HttpPolicy {
             return Decision::Denied(rule);
         }
         if let Some(rule) = self.allow.iter().find(|rule| rule.matches(req)) {
+            return Decision::Allowed(rule);
+        }
+        Decision::Refused
+    }
+
+    /// The decision for a CONNECT to a host and port.
+    ///
+    /// A CONNECT carries no method and no path, so the bounds a rule puts
+    /// on the requests riding inside the tunnel say nothing about the
+    /// CONNECT itself. The tunnel is dropped when a deny rule matches the
+    /// request a CONNECT stands for, and granted when any allow rule names
+    /// the host and the port; what the rule bounds is decided inside the
+    /// tunnel, request by request.
+    pub fn decide_connect(&self, host: &str, port: u16) -> Decision<'_> {
+        let req = HttpRequest {
+            host,
+            port,
+            method: "CONNECT",
+            path: "",
+        };
+        if let Some(rule) = self.deny.iter().find(|rule| rule.matches(&req)) {
+            return Decision::Denied(rule);
+        }
+        if let Some(rule) = self.allow.iter().find(|rule| rule.names(host, port)) {
             return Decision::Allowed(rule);
         }
         Decision::Refused
@@ -951,6 +997,60 @@ mod http_tests {
         policy.allow.push(rule("api.github.com"));
         policy.deny.push(rule("*"));
         assert!(matches!(policy.decide(&check("/x")), Decision::Denied(_)));
+    }
+
+    #[test]
+    fn a_connect_is_granted_when_a_rule_names_the_host_whatever_it_bounds() {
+        let mut bounded = rule("api.github.com");
+        bounded.methods = vec!["GET".to_owned()];
+        bounded.path = Some(HttpPath::parse("/v1*").unwrap());
+        let mut policy = HttpPolicy::default();
+        policy.allow.push(bounded);
+        assert!(matches!(
+            policy.decide_connect("api.github.com", 443),
+            Decision::Allowed(_)
+        ));
+        assert_eq!(
+            policy.decide_connect("other.example", 443),
+            Decision::Refused
+        );
+    }
+
+    #[test]
+    fn a_connect_is_granted_on_the_port_a_rule_names_and_refused_on_others() {
+        let mut policy = HttpPolicy::default();
+        let mut pinned = rule("api.github.com");
+        pinned.port = Some(8443);
+        policy.allow.push(pinned);
+        assert!(matches!(
+            policy.decide_connect("api.github.com", 8443),
+            Decision::Allowed(_)
+        ));
+        assert_eq!(
+            policy.decide_connect("api.github.com", 443),
+            Decision::Refused
+        );
+    }
+
+    #[test]
+    fn a_connect_is_denied_by_a_deny_rule_naming_the_host_and_not_by_a_bounded_one() {
+        let mut policy = HttpPolicy::default();
+        policy.allow.push(rule("api.github.com"));
+        policy.deny.push(rule("api.github.com"));
+        assert!(matches!(
+            policy.decide_connect("api.github.com", 443),
+            Decision::Denied(_)
+        ));
+
+        let mut policy = HttpPolicy::default();
+        policy.allow.push(rule("api.github.com"));
+        let mut bounded = rule("api.github.com");
+        bounded.methods = vec!["DELETE".to_owned()];
+        policy.deny.push(bounded);
+        assert!(matches!(
+            policy.decide_connect("api.github.com", 443),
+            Decision::Allowed(_)
+        ));
     }
 
     #[test]

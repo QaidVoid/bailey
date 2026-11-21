@@ -10,6 +10,11 @@ description = "The built-in HTTP egress broker bailey spawns beside the sandbox"
 bailey = { path = "../bailey", version = "0.2.4" }
 serde_json = "1"
 libc = "0.2"
+rcgen = "0.13"
+httparse = "1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8"
+time = { version = "0.3", default-features = false, features = ["std"] }
 
 [[bin]]
 name = "bailey-broker"

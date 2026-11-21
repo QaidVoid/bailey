@@ -19,6 +19,30 @@ use std::io::{Read, Write};
 /// run at startup, not serve rules it misreads.
 pub const BROKER_PROTOCOL_VERSION: u32 = 1;
 
+/// Where a system trust bundle lives, in the order bailey prefers them.
+///
+/// The interception CA is bound read-only over each of these the
+/// reconstructed root carries, and the first one a host has is
+/// what the combined bundle is seeded from.
+pub const CA_BUNDLE_PATHS: [&str; 6] = [
+    "/etc/ssl/certs/ca-certificates.crt",
+    "/etc/pki/tls/certs/ca-bundle.crt",
+    "/etc/ssl/cert.pem",
+    "/etc/ssl/ca-bundle.pem",
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+    "/etc/ca-certificates/extracted/tls-ca-bundle.pem",
+];
+
+/// The host's own trust bundle: the first well-known path that names a
+/// readable regular file, or `None` when this host carries none.
+pub fn system_ca_bundle() -> Option<std::path::PathBuf> {
+    CA_BUNDLE_PATHS
+        .iter()
+        .map(std::path::Path::new)
+        .find(|path| path.is_file())
+        .map(std::path::Path::to_path_buf)
+}
+
 /// The configuration bailey writes to the broker's stdin pipe.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrokerConfig {
@@ -94,6 +118,13 @@ pub enum WireError {
 }
 
 impl BrokerConfig {
+    /// The credential bound to a request host, in the shape it attaches as.
+    pub fn credential_for(&self, host: &str) -> Option<&BrokerCredential> {
+        self.credentials
+            .iter()
+            .find(|credential| credential.host.matches(host))
+    }
+
     /// Encode the configuration for the broker's stdin pipe.
     pub fn encode(&self) -> Result<Vec<u8>, WireError> {
         let mut document = serde_json::to_vec(&self)?;
