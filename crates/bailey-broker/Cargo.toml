@@ -14,7 +14,7 @@ rcgen = "0.13"
 httparse = "1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-native-certs = "0.8"
-time = { version = "0.3", default-features = false, features = ["std"] }
+time = { version = "0.3", default-features = false, features = ["std", "formatting"] }
 
 [[bin]]
 name = "bailey-broker"

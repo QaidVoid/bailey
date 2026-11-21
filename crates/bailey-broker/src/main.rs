@@ -6,17 +6,30 @@
 //! one ready line on stdout,
 //! and then serves the CONNECT ACL and HTTP rules the configuration carries.
 
-use std::io;
+use std::io::{self, Write};
 use std::net::TcpListener;
-use std::os::unix::io::FromRawFd;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use bailey_broker::audit::AuditLog;
 use bailey_broker::{tls, tunnel};
 
 /// How many connections may be served at once. An agent opens
 /// tens, not thousands; a client over the cap is refused with 503.
 const MAX_CONNECTIONS: usize = 64;
+
+/// The write end of the self-pipe SIGTERM goes through. The handler does
+/// nothing but write one byte, which is async-signal-safe.
+static TERM_PIPE: AtomicI32 = AtomicI32::new(-1);
+
+extern "C" fn on_sigterm(_: libc::c_int) {
+    let fd = TERM_PIPE.load(Ordering::Relaxed);
+    if fd >= 0 {
+        let byte = b"t";
+        unsafe { libc::write(fd, byte.as_ptr().cast(), 1) };
+    }
+}
 
 fn main() {
     std::process::exit(run());
@@ -143,16 +156,98 @@ fn run() -> i32 {
         return 0;
     }
 
-    // Descriptor 3 is the namespaced listener. Serve it until the death
-    // signal, or SIGTERM, ends the process; no counts line is written yet.
+    // Descriptor 3 is the namespaced listener; descriptor 4 is the
+    // append-only log the caller opened and verified. Without the log the
+    // decisions still serve, and the counts line still tells the parent
+    // how the run went.
     let listener = unsafe { TcpListener::from_raw_fd(3) };
+    let log_file = config
+        .log
+        .then(|| unsafe { std::fs::File::from_raw_fd(4) });
+    let audit = Arc::new(AuditLog::new(log_file));
     let config = Arc::new(config);
     let authority = Arc::new(authority);
     let serving = Arc::new(AtomicUsize::new(0));
-    for event in listener.incoming() {
-        let stream = match event {
-            Ok(stream) => stream,
+
+    // SIGTERM is turned into a clean stop through a self-pipe: the
+    // handler writes one byte, and the serve loop below polls the pipe
+    // beside the listener. The signal is not asked to restart syscalls,
+    // so nothing blocks past a wake-up.
+    // The read end is nonblocking, so the drain after the wake-up cannot
+    // block on an empty pipe whose write end is still open.
+    let mut pipe_fds = [-1 as libc::c_int; 2];
+    let pipe_flags = libc::O_CLOEXEC | libc::O_NONBLOCK;
+    if unsafe { libc::pipe2(pipe_fds.as_mut_ptr(), pipe_flags) } != 0 {
+        eprintln!("bailey-broker: pipe: {}", io::Error::last_os_error());
+        return 1;
+    }
+    let (term_read, term_write) = (pipe_fds[0], pipe_fds[1]);
+    TERM_PIPE.store(term_write, Ordering::Relaxed);
+    let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+    action.sa_sigaction = on_sigterm as *const () as usize;
+    unsafe { libc::sigemptyset(&mut action.sa_mask) };
+    if unsafe { libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut()) } != 0 {
+        eprintln!(
+            "bailey-broker: sigaction(SIGTERM): {}",
+            io::Error::last_os_error()
+        );
+        return 1;
+    }
+
+    if let Err(error) = listener.set_nonblocking(true) {
+        if error.raw_os_error() == Some(libc::EBADF) {
+            // The descriptor does not exist: nothing can be served, and
+            // dropping the listener would close a descriptor std believes
+            // it owns, so it is forgotten instead.
+            std::mem::forget(listener);
+        }
+        eprintln!("bailey-broker: the listener is unusable: {error}");
+        return 1;
+    }
+    let mut watched = [
+        libc::pollfd {
+            fd: listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: term_read,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    loop {
+        watched.iter_mut().for_each(|entry| entry.revents = 0);
+        let ready = unsafe { libc::poll(watched.as_mut_ptr(), 2, -1) };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EINTR) {
+                eprintln!("bailey-broker: poll: {error}");
+                return 1;
+            }
+            continue;
+        }
+        if watched[1].revents & libc::POLLIN != 0 {
+            // The parent asked for a stop. Drain the pipe so a second
+            // signal finds no stale byte; nonblocking, so an empty pipe
+            // answers EAGAIN instead of blocking.
+            let mut drain = [0u8; 64];
+            loop {
+                let read = unsafe { libc::read(term_read, drain.as_mut_ptr().cast(), drain.len()) };
+                if read <= 0 {
+                    break;
+                }
+            }
+            break;
+        }
+        if watched[0].revents & libc::POLLIN == 0 {
+            continue;
+        }
+        let stream = match listener.accept() {
+            Ok((stream, _)) => stream,
             Err(error) => match error.raw_os_error() {
+                // Spurious wake-ups are ordinary; serve on.
+                Some(libc::EAGAIN | libc::ECONNABORTED) => continue,
                 // The descriptor does not exist: nothing can be served, and
                 // dropping the listener would close a descriptor std
                 // believes it owns, so it is forgotten instead.
@@ -176,22 +271,39 @@ fn run() -> i32 {
             },
         };
         if serving.load(Ordering::Relaxed) >= MAX_CONNECTIONS {
+            // Over the cap the client gets a 503 and nothing is logged:
+            // the cap is not a decision about a host, and a flood would
+            // fill the log with nothing a run could act on.
             refuse_over_cap(stream);
             continue;
         }
         serving.fetch_add(1, Ordering::Relaxed);
         let config_for_thread = Arc::clone(&config);
         let authority_for_thread = Arc::clone(&authority);
+        let audit_for_thread = Arc::clone(&audit);
         let serving_for_thread = Arc::clone(&serving);
         let spawned = std::thread::Builder::new()
             .name("broker-tunnel".into())
             .spawn(move || {
-                tunnel::handle_connection(stream, &config_for_thread, &authority_for_thread);
+                tunnel::handle_connection(
+                    stream,
+                    &config_for_thread,
+                    &authority_for_thread,
+                    &audit_for_thread,
+                );
                 serving_for_thread.fetch_sub(1, Ordering::Relaxed);
             });
         if spawned.is_err() {
             serving.fetch_sub(1, Ordering::Relaxed);
         }
+    }
+
+    // The counts line is the broker's last output, and the parent reads it
+    // for the summary it prints after its own.
+    {
+        let mut stdout = io::stdout().lock();
+        let _ = writeln!(stdout, "{}", audit.counts_line());
+        let _ = stdout.flush();
     }
     0
 }

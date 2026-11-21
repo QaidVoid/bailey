@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use bailey::broker::BrokerConfig;
 use bailey::policy::{request_host, Decision, HttpRequest};
+use crate::audit::{AuditEntry, AuditLog};
 use crate::request;
 use crate::response;
 use rustls::StreamOwned;
@@ -49,16 +50,48 @@ struct ConnectRequest {
     port: u16,
 }
 
+/// A request the ACL allowed, held until an upstream answer gives it its
+/// status, or the exchange aborts without one.
+struct PendingRequest {
+    method: String,
+    path: String,
+    rule: String,
+}
+
+/// Records an allowed request whose exchange ended without an upstream
+/// answer, so the line carries no status.
+fn record_pending(
+    audit: &AuditLog,
+    pending: &mut Option<PendingRequest>,
+    host: &str,
+    port: u16,
+    intercepted: bool,
+) {
+    if let Some(request) = pending.take() {
+        record_allowed(
+            audit,
+            &request.method,
+            host,
+            port,
+            &request.path,
+            &request.rule,
+            intercepted,
+            None,
+        );
+    }
+}
+
 /// Serve one client connection to the end of its tunnel.
 ///
-/// Every branch that refuses closes the connection after its answer; the
-/// counts and the log line are the caller's business.
+/// Every branch that refuses closes the connection after its answer and
+/// records the decision in the log; the counts ride the same records.
 pub fn handle_connection(
     stream: TcpStream,
     config: &BrokerConfig,
     authority: &Option<crate::tls::CertificateAuthority>,
+    audit: &AuditLog,
 ) {
-    if let Err(error) = serve(stream, config, authority) {
+    if let Err(error) = serve(stream, config, authority, audit) {
         // A client that vanishes mid-handshake is ordinary; report only
         // what a run could act on.
         if error.kind() != io::ErrorKind::UnexpectedEof
@@ -75,6 +108,7 @@ fn serve(
     mut client: TcpStream,
     config: &BrokerConfig,
     authority: &Option<crate::tls::CertificateAuthority>,
+    audit: &AuditLog,
 ) -> io::Result<()> {
     client.set_read_timeout(Some(HEAD_TIMEOUT))?;
     client.set_nodelay(true).ok();
@@ -104,7 +138,7 @@ fn serve(
         Ok(Some(request)) => request,
         // Any other request line: a cleartext proxy request in absolute
         // form, served with the same codec and rules.
-        Ok(None) => return serve_cleartext(client, head, config),
+        Ok(None) => return serve_cleartext(client, head, config, audit),
         Err(error) => {
             write_answer(
                 &mut client,
@@ -114,35 +148,58 @@ fn serve(
             return Ok(());
         }
     };
-    let source = config
-        .http
-        .source
-        .clone()
-        .unwrap_or_else(|| "the policy".to_string());
     let host = request.host.as_str();
     match config.http.decide_connect(host, request.port) {
         Decision::Denied(rule) => {
+            let rule = rule_name("deny", config, &config.http.deny, rule);
             write_answer(
                 &mut client,
                 "403 Forbidden",
-                &format!(
-                    "bailey: CONNECT {} denied by deny rule {} in {}\r\n",
-                    host,
-                    rule_index(config, rule),
-                    source
-                ),
+                &format!("bailey: CONNECT {host} denied by {rule}\r\n"),
             )?;
+            record_refused(
+                audit,
+                "CONNECT",
+                host,
+                request.port,
+                "",
+                &format!("CONNECT {host} denied by {rule}"),
+                &rule,
+            );
             return Ok(());
         }
         Decision::Refused => {
             write_answer(
                 &mut client,
                 "403 Forbidden",
-                &format!("bailey: CONNECT {} denied: no rule allows it\r\n", host),
+                &format!("bailey: CONNECT {host} denied: no rule allows it\r\n",),
             )?;
+            record_refused(
+                audit,
+                "CONNECT",
+                host,
+                request.port,
+                "",
+                &format!("CONNECT {host} denied: no rule allows it"),
+                "",
+            );
             return Ok(());
         }
-        Decision::Allowed(_) => {}
+        Decision::Allowed(rule) => {
+            let intercepted = authority
+                .as_ref()
+                .is_some_and(|ca| ca.is_intercepted(host));
+            record_allowed(
+                audit,
+                "CONNECT",
+                host,
+                request.port,
+                "",
+                &rule_name("allow", config, &config.http.allow, rule),
+                intercepted,
+                None,
+            );
+        }
     }
 
     // The tunnel is granted on the name. The ClientHello must agree with it
@@ -153,6 +210,15 @@ fn serve(
     let hello = read_client_hello(&mut client)?;
     let granted_ok = hello_server_name(&hello).is_some_and(|name| name.eq_ignore_ascii_case(host));
     if !granted_ok {
+        record_refused(
+            audit,
+            "CONNECT",
+            host,
+            request.port,
+            "",
+            "the ClientHello named another host",
+            "",
+        );
         return Ok(());
     }
 
@@ -161,7 +227,7 @@ fn serve(
     // session once the first request passes the ACL. The
     // upstream is not even resolved until then.
     if let Some(ca) = authority.as_ref().filter(|ca| ca.is_intercepted(host)) {
-        return terminate(client, hello, config, ca, host, request.port);
+        return terminate(client, hello, config, ca, host, request.port, audit);
     }
 
     // One resolution, after the ACL and the SNI agree. The addresses it
@@ -205,6 +271,7 @@ fn terminate(
     ca: &crate::tls::CertificateAuthority,
     host: &str,
     port: u16,
+    audit: &AuditLog,
 ) -> io::Result<()> {
     let server_config = ca
         .server_config(host)
@@ -235,12 +302,24 @@ fn terminate(
             Err(request::RequestError::Eof) => break,
             Err(request::RequestError::TimedOut) => break,
             Err(error) => {
-                write_answer(&mut client_tls, "403 Forbidden", &format!("{error}\r\n"))?;
+                let reason = format!("{error}");
+                write_answer(&mut client_tls, "403 Forbidden", &format!("{reason}\r\n"))?;
+                record_refused(audit, "", host, port, "", &reason, "");
                 break;
             }
         };
         if let Err(error) = head.check_host(host, port, 443) {
-            write_answer(&mut client_tls, "403 Forbidden", &format!("{error}\r\n"))?;
+            let reason = format!("{error}");
+            write_answer(&mut client_tls, "403 Forbidden", &format!("{reason}\r\n"))?;
+            record_refused(
+                audit,
+                &head.method,
+                host,
+                port,
+                head.acl_path(),
+                &reason,
+                "",
+            );
             break;
         }
         let acl_request = HttpRequest {
@@ -249,42 +328,47 @@ fn terminate(
             method: &head.method,
             path: head.acl_path(),
         };
+        let mut pending;
         match config.http.decide(&acl_request) {
             Decision::Denied(rule) => {
+                let rule = rule_name("deny", config, &config.http.deny, rule);
+                let reason = format!("{} {} denied by {rule}", head.method, head.acl_path());
                 write_answer(
                     &mut client_tls,
                     "403 Forbidden",
-                    &format!(
-                        "bailey: {} {} denied by deny rule {}\r\n",
-                        head.method,
-                        head.acl_path(),
-                        rule_index(config, rule)
-                    ),
+                    &format!("bailey: {reason}\r\n"),
                 )?;
+                record_refused(audit, &head.method, host, port, head.acl_path(), &reason, &rule);
                 break;
             }
             Decision::Refused => {
+                let reason = format!("{} {} denied: no rule allows it", head.method, head.acl_path());
                 write_answer(
                     &mut client_tls,
                     "403 Forbidden",
-                    &format!(
-                        "bailey: {} {} denied: no rule allows it\r\n",
-                        head.method,
-                        head.acl_path()
-                    ),
+                    &format!("bailey: {reason}\r\n"),
                 )?;
+                record_refused(audit, &head.method, host, port, head.acl_path(), &reason, "");
                 break;
             }
-            Decision::Allowed(_) => {}
+            Decision::Allowed(rule) => {
+                pending = Some(PendingRequest {
+                    method: head.method.clone(),
+                    path: head.acl_path().to_string(),
+                    rule: rule_name("allow", config, &config.http.allow, rule),
+                });
+            }
         }
         // A non-canonical path is refused: there is one form to reason
         // about, and what reaches the upstream is what the rule matched.
         if !bailey::policy::is_canonical_path(head.acl_path()) {
+            let reason = format!("the path {} is not canonical", head.acl_path());
             write_answer(
                 &mut client_tls,
                 "403 Forbidden",
-                &format!("bailey: the path {} is not canonical\r\n", head.acl_path()),
+                &format!("bailey: {reason}\r\n"),
             )?;
+            record_refused(audit, &head.method, host, port, head.acl_path(), &reason, "");
             break;
         }
 
@@ -304,7 +388,8 @@ fn terminate(
             addresses.map(|address| address.ip()).find(|ip| is_dialable(*ip))
         else {
             // A name that resolves only to addresses the broker refuses
-            // ends the tunnel.
+            // ends the tunnel. The request passed, and got no answer.
+            record_pending(audit, &mut pending, host, port, true);
             break;
         };
         let upstream = TcpStream::connect_timeout(
@@ -340,6 +425,7 @@ fn terminate(
         let forwarded = head.serialise(host, port, 443);
         upstream_tls.write_all(&forwarded)?;
         if request::relay_body(&mut client_tls, &mut upstream_tls, head.body).is_err() {
+            record_pending(audit, &mut pending, host, port, true);
             abort(&mut client_tls, &mut upstream_tls);
             return Ok(());
         }
@@ -350,11 +436,24 @@ fn terminate(
             match response::read_step(&mut upstream_tls, &head.method) {
                 Ok(response::Step::Interim(raw)) => {
                     if client_tls.write_all(&raw).is_err() {
+                        record_pending(audit, &mut pending, host, port, true);
                         abort(&mut client_tls, &mut upstream_tls);
                         return Ok(());
                     }
                 }
                 Ok(response::Step::Final(answer)) => {
+                    if let Some(request) = pending.take() {
+                        record_allowed(
+                            audit,
+                            &request.method,
+                            host,
+                            port,
+                            &request.path,
+                            &request.rule,
+                            true,
+                            Some(answer.status),
+                        );
+                    }
                     if client_tls.write_all(&answer.serialise()).is_err() {
                         abort(&mut client_tls, &mut upstream_tls);
                         return Ok(());
@@ -374,6 +473,7 @@ fn terminate(
                 }
                 // An ambiguous or unreadable response closes both sides.
                 Err(_) => {
+                    record_pending(audit, &mut pending, host, port, true);
                     abort(&mut client_tls, &mut upstream_tls);
                     return Ok(());
                 }
@@ -406,6 +506,7 @@ fn serve_cleartext(
     mut client: TcpStream,
     first_head: String,
     config: &BrokerConfig,
+    audit: &AuditLog,
 ) -> io::Result<()> {
     let mut first_head = Some(first_head);
     loop {
@@ -420,26 +521,30 @@ fn serve_cleartext(
             Err(request::RequestError::Eof) => break,
             Err(request::RequestError::TimedOut) => break,
             Err(error) => {
-                write_answer(&mut client, "403 Forbidden", &format!("{error}\r\n"))?;
+                let reason = format!("{error}");
+                write_answer(&mut client, "403 Forbidden", &format!("{reason}\r\n"))?;
+                record_refused(audit, "", "", 0, "", &reason, "");
                 break;
             }
         };
         let Some((raw_host, port)) = head.authority.clone() else {
+            let reason = "the request-target has no authority";
+            record_refused(audit, &head.method, "", 0, head.acl_path(), reason, "");
             break;
         };
         let host = match request_host(&raw_host) {
             Some(host) => host,
             None => {
-                write_answer(
-                    &mut client,
-                    "403 Forbidden",
-                    "bailey: the request's authority is not a servable name\r\n",
-                )?;
+                let reason = "the request's authority is not a servable name";
+                write_answer(&mut client, "403 Forbidden", &format!("{reason}\r\n"))?;
+                record_refused(audit, &head.method, &raw_host, port, head.acl_path(), reason, "");
                 break;
             }
         };
         if let Err(error) = head.check_host(&host, port, 80) {
-            write_answer(&mut client, "403 Forbidden", &format!("{error}\r\n"))?;
+            let reason = format!("{error}");
+            write_answer(&mut client, "403 Forbidden", &format!("{reason}\r\n"))?;
+            record_refused(audit, &head.method, &host, port, head.acl_path(), &reason, "");
             break;
         }
         let acl_request = HttpRequest {
@@ -448,58 +553,49 @@ fn serve_cleartext(
             method: &head.method,
             path: head.acl_path(),
         };
+        let mut pending;
         match config.http.decide(&acl_request) {
             Decision::Denied(rule) => {
-                write_answer(
-                    &mut client,
-                    "403 Forbidden",
-                    &format!(
-                        "bailey: {} {} denied by deny rule {}\r\n",
-                        head.method,
-                        head.acl_path(),
-                        rule_index(config, rule)
-                    ),
-                )?;
+                let rule = rule_name("deny", config, &config.http.deny, rule);
+                let reason = format!("{} {} denied by {rule}", head.method, head.acl_path());
+                write_answer(&mut client, "403 Forbidden", &format!("bailey: {reason}\r\n"))?;
+                record_refused(audit, &head.method, &host, port, head.acl_path(), &reason, &rule);
                 break;
             }
             Decision::Refused => {
-                write_answer(
-                    &mut client,
-                    "403 Forbidden",
-                    &format!(
-                        "bailey: {} {} denied: no rule allows it\r\n",
-                        head.method,
-                        head.acl_path()
-                    ),
-                )?;
+                let reason = format!("{} {} denied: no rule allows it", head.method, head.acl_path());
+                write_answer(&mut client, "403 Forbidden", &format!("bailey: {reason}\r\n"))?;
+                record_refused(audit, &head.method, &host, port, head.acl_path(), &reason, "");
                 break;
             }
-            Decision::Allowed(_) => {}
+            Decision::Allowed(rule) => {
+                pending = Some(PendingRequest {
+                    method: head.method.clone(),
+                    path: head.acl_path().to_string(),
+                    rule: rule_name("allow", config, &config.http.allow, rule),
+                });
+            }
         }
         // A non-canonical path is refused: there is one form to reason
         // about, and what reaches the upstream is what the rule matched.
         if !bailey::policy::is_canonical_path(head.acl_path()) {
-            write_answer(
-                &mut client,
-                "403 Forbidden",
-                &format!("bailey: the path {} is not canonical\r\n", head.acl_path()),
-            )?;
+            let reason = format!("the path {} is not canonical", head.acl_path());
+            write_answer(&mut client, "403 Forbidden", &format!("bailey: {reason}\r\n"))?;
+            record_refused(audit, &head.method, &host, port, head.acl_path(), &reason, "");
             break;
         }
 
         // A cleartext request to a host with a credential is refused: the
         // value never rides an unencrypted leg.
         if config.credential_for(&host).is_some() {
-            write_answer(
-                &mut client,
-                "403 Forbidden",
-                &format!(
-                    "bailey: {} {} refused: a credential is bound to {host}, \
-                     which is served over TLS only\r\n",
-                    head.method,
-                    head.acl_path()
-                ),
-            )?;
+            let reason = format!(
+                "{} {} refused: a credential is bound to {host}, \
+                 which is served over TLS only",
+                head.method,
+                head.acl_path()
+            );
+            write_answer(&mut client, "403 Forbidden", &format!("bailey: {reason}\r\n"))?;
+            record_refused(audit, &head.method, &host, port, head.acl_path(), &reason, "");
             break;
         }
 
@@ -510,7 +606,8 @@ fn serve_cleartext(
             addresses.map(|address| address.ip()).find(|ip| is_dialable(*ip))
         else {
             // A name that resolves only to addresses the broker refuses
-            // ends the connection.
+            // ends the connection. The request passed, and got no answer.
+            record_pending(audit, &mut pending, &host, port, false);
             break;
         };
         let mut upstream = TcpStream::connect_timeout(
@@ -527,6 +624,7 @@ fn serve_cleartext(
         let forwarded = head.serialise(&host, port, 80);
         upstream.write_all(&forwarded)?;
         if request::relay_body(&mut client, &mut upstream, head.body).is_err() {
+            record_pending(audit, &mut pending, &host, port, false);
             abort_plain(&mut client, &mut upstream);
             return Ok(());
         }
@@ -538,11 +636,24 @@ fn serve_cleartext(
             match response::read_step(&mut upstream, &head.method) {
                 Ok(response::Step::Interim(raw)) => {
                     if client.write_all(&raw).is_err() {
+                        record_pending(audit, &mut pending, &host, port, false);
                         abort_plain(&mut client, &mut upstream);
                         return Ok(());
                     }
                 }
                 Ok(response::Step::Final(answer)) => {
+                    if let Some(request) = pending.take() {
+                        record_allowed(
+                            audit,
+                            &request.method,
+                            &host,
+                            port,
+                            &request.path,
+                            &request.rule,
+                            false,
+                            Some(answer.status),
+                        );
+                    }
                     if client.write_all(&answer.serialise()).is_err() {
                         abort_plain(&mut client, &mut upstream);
                         return Ok(());
@@ -558,6 +669,7 @@ fn serve_cleartext(
                 }
                 // An ambiguous or unreadable response closes both sides.
                 Err(_) => {
+                    record_pending(audit, &mut pending, &host, port, false);
                     abort_plain(&mut client, &mut upstream);
                     return Ok(());
                 }
@@ -598,14 +710,74 @@ fn attached_header(credential: &bailey::broker::BrokerCredential) -> (&str, Stri
     }
 }
 
-/// The deny rule's number in the policy, for the refusal line.
-fn rule_index(config: &BrokerConfig, rule: &bailey::policy::HttpRule) -> usize {    config
-        .http
-        .deny
+/// The deciding rule's log and refusal name: its kind, its one-based
+/// position in the list that carries it, and that list's source.
+fn rule_name(
+    kind: &str,
+    config: &BrokerConfig,
+    list: &[bailey::policy::HttpRule],
+    rule: &bailey::policy::HttpRule,
+) -> String {
+    let index = list
         .iter()
         .position(|listed| std::ptr::eq(listed, rule))
         .map(|at| at + 1)
-        .unwrap_or(0)
+        .unwrap_or(0);
+    let source = config
+        .http
+        .source
+        .clone()
+        .unwrap_or_else(|| "the policy".to_string());
+    format!("{kind} rule {index} in {source}")
+}
+
+/// One refused decision, as the log line carries it.
+fn record_refused(
+    audit: &AuditLog,
+    method: &str,
+    host: &str,
+    port: u16,
+    path: &str,
+    reason: &str,
+    rule: &str,
+) {
+    audit.record(AuditEntry {
+        method,
+        host,
+        port,
+        path,
+        verdict: "refused",
+        reason,
+        rule,
+        intercepted: false,
+        status: None,
+    });
+}
+
+/// One allowed decision: an intercepted host only when the tunnel was
+/// terminated, and a status once an upstream answer came back.
+#[allow(clippy::too_many_arguments)]
+fn record_allowed(
+    audit: &AuditLog,
+    method: &str,
+    host: &str,
+    port: u16,
+    path: &str,
+    rule: &str,
+    intercepted: bool,
+    status: Option<u16>,
+) {
+    audit.record(AuditEntry {
+        method,
+        host,
+        port,
+        path,
+        verdict: "allowed",
+        reason: "",
+        rule,
+        intercepted,
+        status,
+    });
 }
 
 /// Read the request head: to the first empty line, bounded.

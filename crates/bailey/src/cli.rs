@@ -1892,7 +1892,8 @@ fn wrap_builtin_broker(
                 }
             };
             drop(parent_side);
-            let (broker, ca_pem) = match spawn_builtin_broker(&spawn, listener, port) {
+            let (broker, ca_pem, broker_stdout) = match spawn_builtin_broker(&spawn, listener, port)
+            {
                 Ok(answer) => answer,
                 Err(error) => {
                     // Dropping the release end tells the child to stop, as it
@@ -1927,14 +1928,19 @@ fn wrap_builtin_broker(
             let watcher = std::thread::spawn(move || {
                 let mut broker = broker;
                 let status = broker.wait().ok();
-                (flag.load(Ordering::SeqCst), status)
+                // The broker wrote its counts before it stopped; read what
+                // is left of its stdout.
+                let mut stdout = broker_stdout;
+                let mut counts_text = String::new();
+                let _ = std::io::Read::read_to_string(&mut stdout, &mut counts_text);
+                (flag.load(Ordering::SeqCst), status, broker_counts(&counts_text))
             });
             // The child of this fork is the run: reaping it is when the
             // target is done and the broker's work with it.
             let code = reap(child);
             asked_to_stop.store(true, Ordering::SeqCst);
             unsafe { libc::kill(broker_pid as libc::pid_t, libc::SIGTERM) };
-            let (was_asked, status) = watcher.join().unwrap_or((true, None));
+            let (was_asked, status, counts) = watcher.join().unwrap_or((true, None, None));
             // The bundle outlived its use: the mounts died with the
             // namespace, so the file is only a leftover now.
             if let Some(bundle) = bundle
@@ -1949,6 +1955,18 @@ fn wrap_builtin_broker(
                     "bailey: the egress broker exited early ({}); egress was \
                      unavailable from then on",
                     describe_exit(&status)
+                );
+            }
+            // The broker's own numbers, after everything else the run said.
+            if announce
+                && let Some((allowed, refused)) = counts
+            {
+                let suffix = match &spawn.log_path {
+                    Some(path) => format!(" (log: {})", path.display()),
+                    None => String::new(),
+                };
+                eprintln!(
+                    "bailey: http broker: {allowed} allowed, {refused} refused{suffix}"
                 );
             }
             Ok((Wrapped::Parent(code), None))
@@ -2011,6 +2029,16 @@ fn describe_exit(status: &std::process::ExitStatus) -> String {
     } else {
         format!("killed by signal {}", status.signal().unwrap_or(0))
     }
+}
+
+/// The broker's counts: the allowed and refused decisions it logged, from
+/// the last line it wrote, or `None` when it wrote none.
+fn broker_counts(text: &str) -> Option<(u64, u64)> {
+    let line = text.lines().next_back()?;
+    let value = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    let allowed = value.get("allowed")?.as_u64()?;
+    let refused = value.get("refused")?.as_u64()?;
+    Some((allowed, refused))
 }
 
 /// One direction of a parent-and-child handshake over a pipe.
@@ -2162,7 +2190,13 @@ fn spawn_builtin_broker(
     spawn: &BuiltinSpawn,
     listener: std::os::unix::io::OwnedFd,
     port: u16,
-) -> anyhow::Result<(std::process::Child, Option<String>)> {
+) -> anyhow::Result<
+    (
+        std::process::Child,
+        Option<String>,
+        std::process::ChildStdout,
+    ),
+> {
     use std::os::unix::io::AsRawFd;
     use std::os::unix::process::CommandExt as _;
     use std::process::Stdio;
@@ -2242,7 +2276,9 @@ fn spawn_builtin_broker(
             crate::broker::BROKER_PROTOCOL_VERSION
         );
     }
-    Ok((broker, ready.ca_pem))
+    // The rest of stdout belongs to the broker: whatever it writes after
+    // the ready line is its counts line, read after the wait.
+    Ok((broker, ready.ca_pem, stdout))
 }
 
 /// Open the broker's audit log.

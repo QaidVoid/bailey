@@ -2,6 +2,7 @@
 //! setup, and the CONNECT tunnel. The binary is a thin entry point over
 //! this library, and the fuzz targets exercise the codecs through it.
 
+pub mod audit;
 pub mod request;
 pub mod response;
 pub mod tls;

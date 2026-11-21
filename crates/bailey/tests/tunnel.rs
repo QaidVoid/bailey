@@ -88,6 +88,29 @@ fn config_with(allow: &[String], deny: &[String]) -> Vec<u8> {
     .unwrap()
 }
 
+/// The same, with denials, resolved credentials, and the log descriptor
+/// expected on descriptor 4: the shapes the log tests need.
+fn config_with_log(
+    allow: &[String],
+    deny: &[String],
+    credentials: &[bailey::broker::BrokerCredential],
+    log: bool,
+) -> Vec<u8> {
+    let rules = |list: &[String]| list.join(",");
+    serde_json::to_vec(&bailey::broker::BrokerConfig {
+        version: bailey::broker::BROKER_PROTOCOL_VERSION,
+        http: serde_json::from_str(&format!(
+            r#"{{"intercept":[],"allow":[{}],"deny":[{}],"credentials":[],"log":null,"source":"the test config"}}"#,
+            rules(allow),
+            rules(deny)
+        ))
+        .unwrap(),
+        credentials: credentials.to_vec(),
+        log,
+    })
+    .unwrap()
+}
+
 /// An upstream service that counts what it accepts. In the echo mode it
 /// waits for the test's marker inside whatever the tunnel carries, and
 /// answers with exactly the marker, whatever came before it.
@@ -162,6 +185,53 @@ fn spawn_broker(config: &[u8], listener: &TcpListener) -> Broker {
     let mut stdout = child.stdout.take().unwrap();
     bailey::broker::BrokerReady::decode(&mut stdout).expect("a ready line");
     Broker(child)
+}
+
+/// Spawn the broker serving `listener` as descriptor 3, with an audit log
+/// handed over as descriptor 4 when `log_path` is given. Returns the
+/// broker's stdout after its ready line, where its counts line will land.
+fn spawn_broker_with_log(
+    config: &[u8],
+    listener: &TcpListener,
+    log_path: &std::path::Path,
+) -> (Broker, std::process::ChildStdout) {    use std::os::unix::io::AsRawFd;
+
+    let log_file = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(log_path)
+        .unwrap();
+    let log_fd = log_file.as_raw_fd();
+    let mut command = Command::new(broker());
+    command
+        .arg(std::process::id().to_string())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    hand_listener(&mut command, listener);
+    // Safety: runs in the forked child before exec, where only
+    // async-signal-safe calls are made. The caller keeps its own file
+    // open, so it outlives the dup.
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        command.pre_exec(move || {
+            let copy = libc::fcntl(log_fd, libc::F_DUPFD_CLOEXEC, 5);
+            if copy < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::dup2(copy, 4) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(config).unwrap();
+    drop(stdin);
+    let mut stdout = child.stdout.take().unwrap();
+    bailey::broker::BrokerReady::decode(&mut stdout).expect("a ready line");
+    (Broker(child), stdout)
 }
 
 /// A broker the test stops and reaps when it drops.
@@ -3064,3 +3134,432 @@ print(json.dumps(report), flush=True)
 }
 
 
+/// Every decision writes one line to the log the caller handed over: what
+/// was decided, which rule decided it, and never a header, a query, or a
+/// credential value. The broker reports the counts on its stdout when it
+/// is asked to stop.
+#[test]
+fn the_log_records_one_line_per_decision_and_the_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let log_path = dir.path().join("http-log.jsonl");
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let config = config_with_log(
+        &[name_rule("tun.test")],
+        &[name_rule_on_path("tun.test", "/private")],
+        &[bailey::broker::BrokerCredential {
+            host: serde_json::from_str(r#"{"Exact": "tun.test"}"#).unwrap(),
+            auth: bailey::policy::AuthShape::Bearer,
+            value: "sekrit-value".into(),
+        }],
+        true,
+    );
+    let (mut child, mut stdout) = spawn_broker_with_log(&config, &listener, &log_path);
+
+    // An allowed CONNECT: logged at the decision, before the name is even
+    // resolved, and this name resolves nowhere dialable.
+    let _ = tunnel_to_end(&listener, "tun.test:443", &client_hello("tun.test"));
+
+    // A refused CONNECT: no rule allows the host.
+    let (_, body) = refused(
+        client_of(&listener),
+        "CONNECT refused.test:443 HTTP/1.1\r\n\r\n",
+    );
+    assert!(body.contains("no rule allows it"), "{body}");
+
+    // A cleartext request denied by the deny rule, with the query the
+    // request carried nowhere in the answer or the log.
+    let (_, body) = refused(
+        client_of(&listener),
+        "GET http://tun.test/private/thing?q=sekrit-value HTTP/1.1\r\nHost: tun.test\r\n\r\n",
+    );
+    assert!(body.contains("deny rule 1"), "{body}");
+
+    // A cleartext request to a credentialed host: refused before anything
+    // is attached, and the credential's value rides nothing.
+    let (_, body) = refused(
+        client_of(&listener),
+        "GET http://tun.test/ok HTTP/1.1\r\nHost: tun.test\r\n\r\n",
+    );
+    assert!(body.contains("served over TLS only"), "{body}");
+
+    // The broker reports the counts on its stdout when it is asked to
+    // stop: the last line it writes.
+    unsafe { libc::kill(child.0.id() as libc::pid_t, libc::SIGTERM) };
+    let mut counts_text = String::new();
+    std::io::Read::read_to_string(&mut stdout, &mut counts_text).unwrap();
+    let status = child.0.wait().unwrap();
+    assert!(status.success(), "a stopped broker exits cleanly: {status:?}");
+    let counts: serde_json::Value = serde_json::from_str(counts_text.trim())
+        .unwrap_or_else(|error| panic!("the counts line is not json: {error}; {counts_text:?}"));
+    assert_eq!(counts["allowed"], 1, "{counts_text}");
+    assert_eq!(counts["refused"], 3, "{counts_text}");
+
+    // The log: one line per decision, in the order they were decided.
+    let text = std::fs::read_to_string(&log_path).unwrap();
+    let lines: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| {
+            serde_json::from_str(line)
+                .unwrap_or_else(|error| panic!("log line is not json: {error}; {line:?}"))
+        })
+        .collect();
+    assert_eq!(lines.len(), 4, "{text}");
+    let time = lines[0]["time"].as_str().unwrap();
+    assert!(
+        time.len() > 20 && time.contains('T'),
+        "the line carries a timestamp: {time}"
+    );
+    assert_eq!(
+        lines[0],
+        serde_json::json!({
+            "time": time,
+            "method": "CONNECT",
+            "host": "tun.test",
+            "port": 443,
+            "path": "",
+            "verdict": "allowed",
+            "reason": "",
+            "rule": "allow rule 1 in the test config",
+            "intercepted": false,
+        }),
+        "the allowed tunnel's line: {text}"
+    );
+    assert_eq!(lines[1]["verdict"], "refused", "{text}");
+    assert_eq!(lines[1]["host"], "refused.test", "{text}");
+    assert_eq!(
+        lines[1]["reason"],
+        "CONNECT refused.test denied: no rule allows it",
+        "{text}"
+    );
+    assert_eq!(lines[1]["rule"], "", "no rule decided it: {text}");
+    assert_eq!(lines[2]["method"], "GET", "{text}");
+    assert_eq!(lines[2]["path"], "/private/thing", "{text}");
+    assert_eq!(lines[2]["rule"], "deny rule 1 in the test config", "{text}");
+    assert!(lines[2]["reason"].as_str().unwrap().contains("denied by"), "{text}");
+    assert_eq!(lines[3]["verdict"], "refused", "{text}");
+    assert!(
+        lines[3]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("served over TLS only"),
+        "{text}"
+    );
+
+    // Nothing but decisions: no query, no credential shape, no value.
+    assert!(!text.contains("sekrit-value"), "{text}");
+    assert!(!text.contains("q="), "{text}");
+    assert!(!text.contains("Bearer"), "{text}");
+    for line in &lines {
+        assert!(
+            line.get("status").is_none(),
+            "no upstream answered, so no status: {line}"
+        );
+    }
+}
+/// The terminated path's decisions carry the upstream status and the
+/// deciding rule, and never the request's query, its extra headers, or
+/// the credential the broker attached upstream.
+///
+/// Same shape as the termination test: the broker, its TLS upstream, and
+/// the client meet inside one fresh namespace, and the script reports the
+/// log's lines and the counts the broker wrote on its way out.
+#[test]
+fn the_terminated_log_carries_the_decisions_and_no_secrets() {
+    let Some(python) = python() else {
+        common::skip("needs python3");
+        return;
+    };
+    let unshare = ["/usr/bin/unshare", "/bin/unshare"]
+        .into_iter()
+        .find(|path| std::path::Path::new(path).exists());
+    let Some(unshare) = unshare else {
+        common::skip("needs the unshare binary");
+        return;
+    };
+    let probe = Command::new(unshare)
+        .args(["-Urm", "true"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("unshare runs");
+    if !probe.success() {
+        common::skip("needs mountable user namespaces");
+        return;
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let ca_path = dir.path().join("ca.pem");
+    let leaf_path = dir.path().join("leaf.pem");
+    let key_path = dir.path().join("key.pem");
+    std::fs::write(&ca_path, TERMINATION_CA).unwrap();
+    std::fs::write(&leaf_path, TERMINATION_LEAF).unwrap();
+    std::fs::write(&key_path, TERMINATION_KEY).unwrap();
+    let config = serde_json::to_vec(&bailey::broker::BrokerConfig {
+        version: bailey::broker::BROKER_PROTOCOL_VERSION,
+        http: serde_json::from_str(&format!(
+            r#"{{"intercept":[{{"Exact": "intercepted.test"}}],"allow":[{}],"deny":[{}],"credentials":[],"log":null,"source":"the test config"}}"#,
+            name_rule("intercepted.test"),
+            name_rule_on_path("intercepted.test", "/private")
+        ))
+        .unwrap(),
+        credentials: vec![bailey::broker::BrokerCredential {
+            host: serde_json::from_str(r#"{"Exact": "intercepted.test"}"#).unwrap(),
+            auth: bailey::policy::AuthShape::Bearer,
+            value: "sekrit-value".into(),
+        }],
+        log: true,
+    })
+    .unwrap();
+    let config_path = dir.path().join("broker-config.json");
+    std::fs::write(&config_path, &config).unwrap();
+    let log_path = dir.path().join("http-log.jsonl");
+    let script_path = dir.path().join("sandbox.py");
+    std::fs::write(&script_path, log_script()).unwrap();
+
+    let output = Command::new(unshare)
+        .arg("-Urnm")
+        .arg(python)
+        .arg(&script_path)
+        .arg(broker())
+        .arg(&config_path)
+        .arg(&ca_path)
+        .arg(&leaf_path)
+        .arg(&key_path)
+        .arg(&log_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let report: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|error| {
+        panic!("the sandbox script did not report: {error}; stdout: {stdout}")
+    });
+    if let Some(error) = report.get("error") {
+        panic!("the sandbox script failed: {error}");
+    }
+    assert_eq!(
+        report["good_status"].as_str().unwrap(),
+        "HTTP/1.0 200 OK",
+        "the allowed request was answered upstream: {}",
+        stdout
+    );
+
+    // The counts the broker wrote on its way out: four allowed (three
+    // tunnels, one request), two refused (the denied request, and the
+    // tunnel whose ClientHello fronted another host).
+    let counts: serde_json::Value = serde_json::from_str(report["counts"].as_str().unwrap())
+        .unwrap_or_else(|error| panic!("the counts are not json: {error}; {}", stdout));
+    assert_eq!(counts["allowed"], 4, "{counts}");
+    assert_eq!(counts["refused"], 2, "{counts}");
+
+    // The log: one line per decision, nothing but decisions in them.
+    let lines: Vec<String> = report["log"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|line| line.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(lines.len(), 6, "{}", lines.join("\n"));
+    let parsed: Vec<serde_json::Value> = lines
+        .iter()
+        .map(|line| {
+            serde_json::from_str(line)
+                .unwrap_or_else(|error| panic!("log line is not json: {error}; {line:?}"))
+        })
+        .collect();
+    assert_eq!(parsed[0]["method"], "CONNECT", "{}", lines.join("\n"));
+    assert_eq!(parsed[0]["verdict"], "allowed");
+    assert_eq!(parsed[0]["intercepted"], true);
+    assert_eq!(
+        parsed[0]["rule"], "allow rule 1 in the test config",
+        "{}",
+        lines.join("\n")
+    );
+    assert!(parsed[0].get("status").is_none(), "a tunnel has no status");
+    assert_eq!(parsed[1]["method"], "GET");
+    assert_eq!(parsed[1]["path"], "/secret", "the query is not the path");
+    assert_eq!(parsed[1]["status"], 200, "{}", lines.join("\n"));
+    assert_eq!(parsed[1]["intercepted"], true);
+    assert_eq!(parsed[2]["method"], "CONNECT");
+    assert_eq!(parsed[2]["verdict"], "allowed");
+    assert!(parsed[2].get("status").is_none(), "a tunnel has no status");
+    assert_eq!(parsed[3]["path"], "/private");
+    assert_eq!(parsed[3]["verdict"], "refused");
+    assert_eq!(
+        parsed[3]["rule"], "deny rule 1 in the test config",
+        "{}",
+        lines.join("\n")
+    );
+    assert_eq!(parsed[4]["method"], "CONNECT");
+    assert_eq!(parsed[4]["verdict"], "allowed", "the evil tunnel was granted on the name");
+    assert_eq!(parsed[5]["verdict"], "refused");
+    assert_eq!(
+        parsed[5]["reason"], "the ClientHello named another host",
+        "{}",
+        lines.join("\n")
+    );
+    let joined = lines.join("\n");
+    assert!(!joined.contains("sekrit-value"), "{}", joined);
+    assert!(!joined.contains("token"), "{}", joined);
+    assert!(!joined.contains("X-Other"), "{}", joined);
+    assert!(!joined.contains("Bearer"), "{}", joined);
+}
+
+/// The sandbox script for the log test: the mounts, the TLS upstream, the
+/// broker with its log on descriptor 4, and the four probes.
+fn log_script() -> String {
+    r#"
+import fcntl, json, os, signal, socket, ssl, struct, subprocess, sys, threading, time
+import ctypes
+import http.server
+
+broker_path, config_path, ca_path, leaf_path, key_path, log_path = sys.argv[1:7]
+counts = {'accepts': 0}
+
+MS_REC = 0x8000
+MS_PRIVATE = 0x40000
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.mount(None, b'/', None, MS_PRIVATE | MS_REC, None) != 0:
+    print(json.dumps({'error': f'remount private refused: {ctypes.get_errno()}'}))
+    sys.exit(3)
+if libc.mount(b'tmpfs', b'/etc', b'tmpfs', 0, None) != 0:
+    print(json.dumps({'error': f'/etc mount refused: {ctypes.get_errno()}'}))
+    sys.exit(3)
+with open('/etc/hosts', 'w') as hosts:
+    hosts.write('127.0.0.1 localhost\n10.0.0.7 intercepted.test\n')
+with open('/etc/nsswitch.conf', 'w') as switch:
+    switch.write('hosts: files dns\n')
+with open('/etc/resolv.conf', 'w') as resolv:
+    resolv.write('nameserver 127.0.0.1\n')
+os.makedirs('/etc/ssl/certs', exist_ok=True)
+with open(ca_path) as source, open('/etc/ssl/certs/ca-certificates.crt', 'w') as store:
+    store.write(source.read())
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+fcntl.ioctl(sock, 0x8914, struct.pack('16sH22x', b'lo', 0x41))
+fcntl.ioctl(sock, 0x8916, struct.pack('16sH2s4s16x', b'lo', 2, b'\x00\x00', socket.inet_aton('10.0.0.7')))
+sock.close()
+
+# The listener takes descriptor 3, the log takes descriptor 4.
+listener = socket.socket()
+listener.bind(('10.0.0.7', 0))
+listener.listen(16)
+if listener.fileno() != 3:
+    os.dup2(listener.fileno(), 3)
+    listener.close()
+    listener = socket.socket(fileno=3)
+port = listener.getsockname()[1]
+log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+if log_fd != 4:
+    os.dup2(log_fd, 4)
+    os.close(log_fd)
+
+class Served(http.server.BaseHTTPRequestHandler):
+    def setup(self):
+        counts['accepts'] += 1
+        super().setup()
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/plain')
+        self.end_headers()
+        self.wfile.write(b'bailey-termination-ok')
+    def log_message(self, *rest):
+        pass
+
+context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+context.load_cert_chain(leaf_path, key_path)
+context.set_alpn_protocols(['http/1.1'])
+server = http.server.HTTPServer(('10.0.0.7', 443), Served)
+server.socket = context.wrap_socket(server.socket, server_side=True)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+
+config = open(config_path, 'rb').read()
+broker = subprocess.Popen(
+    [broker_path, str(os.getpid())], pass_fds=(3, 4),
+    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+broker.stdin.write(config)
+broker.stdin.close()
+ready = broker.stdout.readline()
+if b'"layers"' not in ready:
+    print(json.dumps({'error': f'no ready line: {ready!r}'}))
+    sys.exit(3)
+
+def connect_head(authority):
+    client = socket.create_connection(('10.0.0.7', port), timeout=10)
+    client.settimeout(10)
+    client.sendall(f'CONNECT {authority} HTTP/1.1\r\n\r\n'.encode())
+    head = b''
+    while b'\r\n\r\n' not in head:
+        chunk = client.recv(4096)
+        if not chunk:
+            break
+        head += chunk
+    return client, head.split(b'\r\n', 1)[0].decode(errors='replace')
+
+def client_hello(sni):
+    name = sni.encode()
+    name_list = b'\x00' + len(name).to_bytes(2, 'big') + name
+    extension = len(name_list).to_bytes(2, 'big') + name_list
+    extensions = b'\x00\x00' + len(extension).to_bytes(2, 'big') + extension
+    body = (b'\x03\x03' + b'\x00' * 32 + b'\x00' + b'\x00\x02' + b'\x13\x01'
+            + b'\x01\x00' + len(extensions).to_bytes(2, 'big') + extensions)
+    message = b'\x01' + len(body).to_bytes(3, 'big') + body
+    return b'\x16\x03\x01' + len(message).to_bytes(2, 'big') + message
+
+# One allowed request whose query and extra header carry the secret, and
+# one denied by the deny rule.
+tls_client, _ = connect_head('intercepted.test:443')
+client = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+client.check_hostname = False
+client.verify_mode = ssl.CERT_NONE
+client.set_alpn_protocols(['http/1.1'])
+tls = client.wrap_socket(tls_client, server_hostname='intercepted.test')
+tls.sendall(b'GET /secret?token=sekrit-value HTTP/1.1\r\nHost: intercepted.test\r\nX-Other: sekrit-value\r\n\r\n')
+response = b''
+while True:
+    try:
+        chunk = tls.recv(4096)
+    except socket.timeout:
+        break
+    if not chunk:
+        break
+    response += chunk
+tls.close()
+good_status = response.split(b'\r\n', 1)[0].decode(errors='replace')
+
+# The denied request rides its own tunnel: the stub upstream speaks HTTP/1.0,
+# so the broker ends the first tunnel after one exchange.
+tls_client, _ = connect_head('intercepted.test:443')
+tls = client.wrap_socket(tls_client, server_hostname='intercepted.test')
+tls.sendall(b'GET /private HTTP/1.1\r\nHost: intercepted.test\r\n\r\n')
+denied = b''
+while True:
+    try:
+        chunk = tls.recv(4096)
+    except socket.timeout:
+        break
+    if not chunk:
+        break
+    denied += chunk
+tls.close()
+
+# The fronted probe: a raw ClientHello naming another host.
+evil_client, _ = connect_head('intercepted.test:443')
+evil_client.sendall(client_hello('evil.test'))
+evil_client.close()
+
+# The last probe's decisions are written by the time the signal lands.
+time.sleep(0.3)
+os.kill(broker.pid, signal.SIGTERM)
+broker.wait()
+counts_text = broker.stdout.read().decode().strip()
+log_lines = open(log_path).read().splitlines()
+print(json.dumps({
+    'good_status': good_status,
+    'counts': counts_text,
+    'log': log_lines,
+}), flush=True)
+server.shutdown()
+"#
+    .to_string()
+}
