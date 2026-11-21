@@ -60,9 +60,11 @@ jobs:
           echo "building $version for ${{ matrix.target }}"
 
       # musl, statically linked: the binary then runs on any distribution rather
-      # than on the ones whose glibc is new enough.
+      # than on the ones whose glibc is new enough. The built-in egress broker
+      # ships beside the tool: a `bailey` that names `broker = "builtin"`
+      # refuses to run without it.
       - name: Build
-        run: cargo build --release -p bailey --locked --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }} -p bailey -p bailey-broker
 
       - name: Generate the completions and the man page
         run: |
@@ -79,6 +81,7 @@ jobs:
           stage="bailey-$VERSION-${{ matrix.target }}"
           mkdir -p "$stage" dist
           cp "target/${{ matrix.target }}/release/bailey" "$stage/"
+          cp "target/${{ matrix.target }}/release/bailey-broker" "$stage/"
           cp README.md LICENSE-MIT LICENSE-APACHE "$stage/"
           cp -r extras/completions extras/bailey.1 "$stage/"
           tar -czf "dist/$stage.tar.gz" "$stage"

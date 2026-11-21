@@ -19,13 +19,13 @@ jobs:
   check:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           components: clippy, rustfmt
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Format
         run: cargo fmt --all -- --check
@@ -70,7 +70,7 @@ jobs:
     outputs:
       matrix: ${{ steps.read.outputs.matrix }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - id: read
         run: echo "matrix=$(jq -c .kernel ci/kernels.json)" >> "$GITHUB_OUTPUT"
 
@@ -92,7 +92,7 @@ jobs:
       matrix:
         kernel: ${{ fromJSON(needs.read-matrix.outputs.matrix) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # Standard runners ship /dev/kvm, but only root may open it until a
       # rule says otherwise. Without the device this job would fall back to
@@ -113,14 +113,14 @@ jobs:
           python3 -m pip install --user --break-system-packages virtme-ng==1.42
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
 
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/.cache/virtme-ng
           key: virtme-ng-${{ runner.arch }}-${{ matrix.kernel.version }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: kernels
 
@@ -135,11 +135,17 @@ jobs:
       # seconds of a boot never reach the host, and the job log is the only
       # channel the guest's results travel by. Four vcpus match the four
       # test threads guest.sh pins.
+      # The matrix values travel by env, not by interpolation into the
+      # script, so a kernels.json entry can only ever be data.
       - name: Boot ${{ matrix.kernel.version }} and run the suite
+        env:
+          KERNEL_VERSION: ${{ matrix.kernel.version }}
+          KERNEL_APPEND: ${{ matrix.kernel.append }}
+          KERNEL_ID: ${{ matrix.kernel.id }}
         run: >-
-          vng --network user --cpus 4 -m 8192 -r ${{ matrix.kernel.version }}
-          --append "${{ matrix.kernel.append }}" --
-          sh -c "sleep 3; ci/guest.sh ${{ matrix.kernel.id }} CARGO_HOME=$HOME/.cargo RUSTUP_HOME=$HOME/.rustup"
+          vng --network user --cpus 4 -m 8192 -r "$KERNEL_VERSION"
+          --append "$KERNEL_APPEND" --
+          sh -c "sleep 3; ci/guest.sh $KERNEL_ID CARGO_HOME=$HOME/.cargo RUSTUP_HOME=$HOME/.rustup"
 
   # The other shipped architecture, natively: the suite runs on arm's own
   # kernel rather than in a VM, since arm runners do not expose KVM and
@@ -151,13 +157,13 @@ jobs:
   aarch64:
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           targets: aarch64-unknown-linux-musl
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: aarch64
 
@@ -181,13 +187,13 @@ jobs:
   musl:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
           targets: x86_64-unknown-linux-musl
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: musl
 
@@ -211,13 +217,13 @@ jobs:
   ebpf:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@6a52aad76a94a5fbc50d567bb5be24419801c1fb # nightly
         with:
           components: rust-src
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: bpf
 
@@ -228,6 +234,22 @@ jobs:
             -Z build-std=core \
             --features bpf
 
+  # The shipped dependencies, checked against the RustSec advisory database.
+  # A sandbox that fetches and runs code is the kind of binary a known
+  # vulnerability in a dependency should hold up, so this fails the push
+  # rather than filing a report nobody reads. `rustsec/audit-check` reads the
+  # workspace's Cargo.lock, which covers every member including the broker.
+  audit:
+    runs-on: ubuntu-24.04
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   # VitePress fails a build on a dead internal link, which is the failure worth
   # catching: these pages cross-reference heavily.
   docs:
@@ -236,10 +258,10 @@ jobs:
       run:
         working-directory: docs
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # Pinned: with `--frozen-lockfile` an unpinned bun turns its own upgrades
       # into a docs build failure. Bump this and the lockfile together.
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
           bun-version: 1.4.0
       - run: bun install --frozen-lockfile
