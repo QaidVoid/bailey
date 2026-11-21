@@ -2074,15 +2074,25 @@ fn resolve_for_shell(
     let implicit_shell = implicit_target_layer(shell);
     let implicit_dir = implicit_dir_layer(dir);
     let layers = profiles::base_layers(profile).map_err(|err| anyhow::anyhow!(err))?;
-    let mut bases: Vec<(&str, &str)> = vec![
-        ("implicit:shell", implicit_shell.as_str()),
-        ("implicit:cwd", implicit_dir.as_str()),
+    let mut bases: Vec<(&str, &str, config::Origin)> = vec![
+        (
+            "implicit:shell",
+            implicit_shell.as_str(),
+            config::Origin::Explicit,
+        ),
+        (
+            "implicit:cwd",
+            implicit_dir.as_str(),
+            config::Origin::Explicit,
+        ),
     ];
-    bases.extend(
-        layers
-            .iter()
-            .map(|layer| (layer.label.as_str(), layer.toml.as_str())),
-    );
+    bases.extend(layers.iter().map(|layer| {
+        (
+            layer.label.as_str(),
+            layer.toml.as_str(),
+            config::Origin::Profile,
+        )
+    }));
     let overrides = override_layers(grants)?;
     let override_refs: Vec<(&str, &str)> = overrides
         .iter()
@@ -2583,12 +2593,21 @@ fn resolve(
 ) -> anyhow::Result<Resolved> {
     let implicit = implicit_target_layer(target);
     let layers = profiles::base_layers(profile).map_err(|err| anyhow::anyhow!(err))?;
-    let mut bases: Vec<(&str, &str)> = vec![("implicit:target", implicit.as_str())];
-    bases.extend(
-        layers
-            .iter()
-            .map(|layer| (layer.label.as_str(), layer.toml.as_str())),
-    );
+    // The implicit layers are synthesized from what the caller named on the
+    // command line and carry no caller-secret keys; the profiles do carry
+    // them.
+    let mut bases: Vec<(&str, &str, config::Origin)> = vec![(
+        "implicit:target",
+        implicit.as_str(),
+        config::Origin::Explicit,
+    )];
+    bases.extend(layers.iter().map(|layer| {
+        (
+            layer.label.as_str(),
+            layer.toml.as_str(),
+            config::Origin::Profile,
+        )
+    }));
     let overrides = override_layers(grants)?;
     let override_refs: Vec<(&str, &str)> = overrides
         .iter()

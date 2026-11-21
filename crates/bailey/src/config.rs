@@ -96,24 +96,26 @@ pub fn resolve(target: &Path, explicit: Option<&Path>) -> Result<Resolved, Confi
 
 /// Resolve configuration with `bases` applied as the lowest-precedence layers.
 ///
-/// Each base is a `(label, toml)` pair, typically a bundled profile. Bases are
-/// applied in order beneath all discovered config, so user config always
-/// overrides them. The label is used only in error messages.
+/// Each base is a `(label, toml, origin)` triple, typically the implicit
+/// layers and a bundled or user profile. Bases are applied in order beneath
+/// all discovered config, so user config always overrides them. The label is
+/// used only in error messages; the origin decides which keys the layer may
+/// carry, the same decision a discovered file's [`Origin`] makes.
 ///
 /// `overrides` are `(label, toml)` pairs applied above everything, discovered
 /// config included. They carry what a caller asked for on the command line,
 /// which stands above every file for the same reason `explicit` is never
 /// trust-gated: the user typed it, at the moment they typed it.
 pub fn resolve_with_bases(
-    bases: &[(&str, &str)],
+    bases: &[(&str, &str, Origin)],
     target: &Path,
     explicit: Option<&Path>,
     overrides: &[(&str, &str)],
 ) -> Result<Resolved, ConfigError> {
     let base_dir = target_dir(target);
     let mut layers = Vec::new();
-    for (label, text) in bases {
-        layers.push(parse_layer(label, text, &base_dir)?);
+    for (label, text, origin) in bases {
+        layers.push(parse_layer(label, text, &base_dir, *origin)?);
     }
     for source in discover(target, explicit) {
         if !source.applies() {
@@ -122,7 +124,7 @@ pub fn resolve_with_bases(
         layers.push(load_verified_layer(&source)?);
     }
     for (label, text) in overrides {
-        layers.push(parse_layer(label, text, &base_dir)?);
+        layers.push(parse_layer(label, text, &base_dir, Origin::Explicit)?);
     }
     merge(&layers)
 }
@@ -144,6 +146,8 @@ pub enum Origin {
     WorkingDir,
     /// Named on the command line.
     Explicit,
+    /// A profile: bundled, or one the caller named.
+    Profile,
 }
 
 impl Origin {
@@ -154,7 +158,15 @@ impl Origin {
             Origin::Target => "target",
             Origin::WorkingDir => "working dir",
             Origin::Explicit => "explicit",
+            Origin::Profile => "profile",
         }
+    }
+
+    /// Whether a layer found this way may bind credentials or name an audit
+    /// log. Only what the caller chose outright may: a file found by walking
+    /// up the directory tree could have been written by anyone.
+    pub fn may_hold_secrets(self) -> bool {
+        matches!(self, Origin::Global | Origin::Explicit | Origin::Profile)
     }
 }
 
@@ -187,6 +199,9 @@ impl Source {
 struct Layer {
     path: PathBuf,
     base: PathBuf,
+    /// How this layer was found, which decides whether it may bind
+    /// credentials or name an audit log.
+    origin: Origin,
     raw: RawLayer,
 }
 
@@ -1442,10 +1457,24 @@ fn apply_http(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> {
         ));
     }
     for raw in &http.credential {
+        if !layer.origin.may_hold_secrets() {
+            return Err(refused_secret_key(
+                layer,
+                &format!("http credential for `{}`", raw.host),
+                "binds one of the caller's secrets to a host",
+            ));
+        }
         acc.http_credentials
             .push((build_credential(raw, &layer.path)?, layer.path.clone()));
     }
     if let Some(log) = &http.log {
+        if !layer.origin.may_hold_secrets() {
+            return Err(refused_secret_key(
+                layer,
+                "[http] log",
+                "chooses the file bailey appends the audit log to",
+            ));
+        }
         let Some(resolved) = resolve_path(log, &layer.base) else {
             return Err(ConfigError::Invalid {
                 path: layer.path.clone(),
@@ -1463,6 +1492,24 @@ fn apply_http(acc: &mut Accumulator, layer: &Layer) -> Result<(), ConfigError> {
         acc.http_source.get_or_insert_with(|| layer.path.clone());
     }
     Ok(())
+}
+
+/// The refusal for a key only the caller's own config may carry, from a layer
+/// found by walking up the directory tree. Trusted or not, such a file was
+/// still written by the project being confined, and it is the caller, not the
+/// project, who chooses which secrets leave the machine and where they are
+/// recorded. The error names the file, so an agent reading its tool's output
+/// knows which rule to move.
+fn refused_secret_key(layer: &Layer, key: &str, what: &str) -> ConfigError {
+    ConfigError::Invalid {
+        path: layer.path.clone(),
+        reason: format!(
+            "{key} is refused from {} config: it {what}, a choice the \
+             project being confined must not make. Move it to a profile, \
+             the global config, `--config` or a command-line flag",
+            layer.origin.label()
+        ),
+    }
 }
 
 /// Header names a credential may not bind to: the ones the broker strips as
@@ -1855,7 +1902,7 @@ pub(crate) fn expand_connect_entry(raw: &str, base: &Path) -> Result<PathBuf, St
     Ok(path)
 }
 
-fn parse_layer(label: &str, text: &str, base: &Path) -> Result<Layer, ConfigError> {
+fn parse_layer(label: &str, text: &str, base: &Path, origin: Origin) -> Result<Layer, ConfigError> {
     let path = PathBuf::from(label);
     let raw: RawLayer = toml::from_str(text).map_err(|source| ConfigError::Parse {
         path: path.clone(),
@@ -1864,6 +1911,7 @@ fn parse_layer(label: &str, text: &str, base: &Path) -> Result<Layer, ConfigErro
     Ok(Layer {
         path,
         base: base.to_path_buf(),
+        origin,
         raw,
     })
 }
@@ -1874,13 +1922,13 @@ fn parse_layer(label: &str, text: &str, base: &Path) -> Result<Layer, ConfigErro
 /// has no verified bytes and is read here instead.
 fn load_verified_layer(source: &Source) -> Result<Layer, ConfigError> {
     match &source.verified {
-        Some(bytes) => parse_layer_bytes(&source.path, bytes),
-        None => load_layer(&source.path),
+        Some(bytes) => parse_layer_bytes(&source.path, bytes, source.origin),
+        None => load_layer(&source.path, source.origin),
     }
 }
 
 /// Parse `text` as a layer attributed to `path`.
-fn parse_layer_bytes(path: &Path, text: &[u8]) -> Result<Layer, ConfigError> {
+fn parse_layer_bytes(path: &Path, text: &[u8], origin: Origin) -> Result<Layer, ConfigError> {
     let text = String::from_utf8_lossy(text);
     let raw: RawLayer = toml::from_str(&text).map_err(|source| ConfigError::Parse {
         path: path.to_path_buf(),
@@ -1893,11 +1941,12 @@ fn parse_layer_bytes(path: &Path, text: &[u8]) -> Result<Layer, ConfigError> {
     Ok(Layer {
         path: path.to_path_buf(),
         base,
+        origin,
         raw,
     })
 }
 
-fn load_layer(path: &Path) -> Result<Layer, ConfigError> {
+fn load_layer(path: &Path, origin: Origin) -> Result<Layer, ConfigError> {
     let path = absolute(path);
     let text = fs::read_to_string(&path).map_err(|source| ConfigError::Read {
         path: path.clone(),
@@ -1911,7 +1960,12 @@ fn load_layer(path: &Path) -> Result<Layer, ConfigError> {
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("/"));
-    Ok(Layer { path, base, raw })
+    Ok(Layer {
+        path,
+        base,
+        origin,
+        raw,
+    })
 }
 
 fn parse_access(spec: &str) -> Result<Access, String> {
@@ -2187,12 +2241,23 @@ mod tests {
     use super::*;
     use crate::policy::{DnsSetting, NetworkMode, Protocol};
 
+    /// A layer found by no discovery walk, as a profile or the global config
+    /// would be: free to carry the caller-secret keys.
     fn layer(base: &str, toml_src: &str) -> Layer {
         Layer {
             path: PathBuf::from(base).join(CONFIG_NAME),
             base: PathBuf::from(base),
+            origin: Origin::Global,
             raw: toml::from_str(toml_src).expect("valid test config"),
         }
+    }
+
+    /// A layer as a trusted discovered file arrives: parsed from the bytes
+    /// the trust decision was made against, carrying the origin its discovery
+    /// walk gave it. The path is a real file path so the error text names the
+    /// file a user would see.
+    fn discovered_layer(path: &Path, text: &str, origin: Origin) -> Layer {
+        parse_layer_bytes(path, text.as_bytes(), origin).expect("valid test config")
     }
 
     /// A layer whose TOML may not parse, for tests that expect a parse
@@ -3158,6 +3223,92 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("ttl"), "{err}");
+    }
+
+    /// A `bailey.toml` found by walking up to the target or the working
+    /// directory is refused `[[http.credential]]` and `[http] log` even once
+    /// trusted. Trusted means it may describe what the project reaches. It may
+    /// not choose which of the caller's secrets leave, or where the log is
+    /// written.
+    #[test]
+    fn a_discovered_credential_is_refused_naming_the_file() {
+        for origin in [Origin::Target, Origin::WorkingDir] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join(CONFIG_NAME);
+            let text = "[http]\nintercept = [\"api.anthropic.com\"]\n\n\
+                        [[http.credential]]\nhost = \"api.anthropic.com\"\n\
+                        auth = \"bearer\"\nsource = \"env:ANTHROPIC_API_KEY\"";
+            let err = merge(&[discovered_layer(&path, text, origin)])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(path.display().to_string().as_str()), "{err}");
+            assert!(err.contains("api.anthropic.com"), "{err}");
+            assert!(err.contains("credential"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_discovered_log_path_is_refused_naming_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_NAME);
+        let text = "[http]\nlog = \"http-broker.jsonl\"";
+        let err = merge(&[discovered_layer(&path, text, Origin::WorkingDir)])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(path.display().to_string().as_str()), "{err}");
+        assert!(err.contains("log"), "{err}");
+    }
+
+    /// The refusal is about the keys, not the file: the same discovered layer
+    /// still contributes its intercept, allow and deny rules, which only
+    /// narrow or widen reach.
+    #[test]
+    fn a_discovered_file_s_http_rules_still_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_NAME);
+        let text = "[http]\nintercept = [\"api.anthropic.com\"]\n\n\
+                    [[http.allow]]\nhost = \"api.anthropic.com\"\n\
+                    methods = [\"POST\"]\npath = \"/v1/*\"";
+        let resolved = merge(&[discovered_layer(&path, text, Origin::WorkingDir)]).unwrap();
+        let host = crate::policy::HttpHost::parse("api.anthropic.com").unwrap();
+        assert_eq!(resolved.policy.http.intercept, vec![host.clone()]);
+        assert_eq!(resolved.policy.http.allow.len(), 1);
+        assert_eq!(resolved.policy.http.allow[0].host, host);
+        assert_eq!(resolved.policy.http.allow[0].methods, vec!["POST"]);
+    }
+
+    /// Profiles, the global config and the command line are the caller's own
+    /// choices, so they may carry the caller-secret keys end to end.
+    #[test]
+    fn a_credential_from_the_caller_s_own_config_is_accepted() {
+        let credential = "[http]\nintercept = [\"api.anthropic.com\"]\n\n\
+                          [[http.credential]]\nhost = \"api.anthropic.com\"\n\
+                          auth = \"bearer\"\nsource = \"env:ANTHROPIC_API_KEY\"";
+
+        // The global config.
+        let resolved = merge(&[layer("/home/me/.config/bailey", credential)]).unwrap();
+        assert_eq!(resolved.policy.http.credentials.len(), 1);
+
+        // A named profile, through the same path `resolve` builds.
+        let _env = crate::test_support::env_lock();
+        let resolved = resolve_with_bases(
+            &[("profile:ai-agent", credential, Origin::Profile)],
+            Path::new("/bin/true"),
+            None,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(resolved.policy.http.credentials.len(), 1);
+
+        // Command-line grants, which arrive as overrides.
+        let resolved = resolve_with_bases(
+            &[],
+            Path::new("/bin/true"),
+            None,
+            &[("command-line grants", credential)],
+        )
+        .unwrap();
+        assert_eq!(resolved.policy.http.credentials.len(), 1);
     }
 
     #[test]

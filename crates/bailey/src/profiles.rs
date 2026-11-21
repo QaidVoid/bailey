@@ -337,9 +337,15 @@ mod tests {
         let _env = crate::test_support::env_lock();
         for profile in ALL {
             let layers = base_layers(profile.name).expect("a known profile");
-            let borrowed: Vec<(&str, &str)> = layers
+            let borrowed: Vec<(&str, &str, crate::config::Origin)> = layers
                 .iter()
-                .map(|layer| (layer.label.as_str(), layer.toml.as_str()))
+                .map(|layer| {
+                    (
+                        layer.label.as_str(),
+                        layer.toml.as_str(),
+                        crate::config::Origin::Profile,
+                    )
+                })
                 .collect();
             crate::config::resolve_with_bases(
                 &borrowed,
@@ -361,9 +367,15 @@ mod tests {
         // tempdir config can be seen just before its owner removes it.
         let _env = crate::test_support::env_lock();
         let layers = base_layers("ai-agent").unwrap();
-        let borrowed: Vec<(&str, &str)> = layers
+        let borrowed: Vec<(&str, &str, crate::config::Origin)> = layers
             .iter()
-            .map(|layer| (layer.label.as_str(), layer.toml.as_str()))
+            .map(|layer| {
+                (
+                    layer.label.as_str(),
+                    layer.toml.as_str(),
+                    crate::config::Origin::Profile,
+                )
+            })
             .collect();
         let resolved = crate::config::resolve_with_bases(
             &borrowed,
