@@ -95,6 +95,73 @@ Round-robin or anycast names that return several addresses are admitted at all
 of them; a name with a short TTL that fails over mid-run may reach a new
 address only in the next run.
 
+### A tunnelled host answers for whatever shares its front end
+
+The built-in broker grants a CONNECT on the name it names, checks that the TLS
+ClientHello agrees, and then relays the tunnel byte for byte: the TLS session
+and everything in it belong to the client and the server, end to end. Inside
+that tunnel the HTTP `Host` header decides which site answers, and a front end
+that serves several origins on one address and port cannot tell an allowed
+origin from its neighbours. A target granted `example.com` can therefore reach
+whatever else that front end serves, by sending `Host:` headers naming it. The
+broker never sees the header, so no rule can stop this; grant hosts whose
+front ends serve only what you would allow.
+
+### A deny rule cannot know a server's own path equivalences
+
+On an intercepted host the broker matches the path exactly as the client sent
+it and forwards those bytes. A server is free to route several different paths
+to the same resource: a trailing slash, a case difference, a name it
+unescapes itself, a query that changes where a request lands. A deny rule for
+`/admin` therefore stops `/admin` and refuses tricks that could disguise it
+(`/%61dmin`, `/admin/../admin`), but it cannot stop `/ADMIN` or `/admin/`
+reaching a handler that treats them as the same thing. Interception narrows
+what a target can ask for; it does not model the server. Deny hosts outright
+when the path is what matters.
+
+### A credential is the target's authority within the rules
+
+The broker attaches the credential to every allowed request the target sends
+to the bound host. Which requests those are is the target's decision: a target
+that spends the key's quota, sends a request the user did not intend, or
+shapes a request to reach a different endpoint on the same origin acts within
+its rules and the broker supplies the key all the same. The binding removes
+the secret from the target's reach, not the authority from the target. Grant
+a credential to code you trust to use the account it opens, and keep the
+allow rules tight enough that what it can ask for is what you would send.
+
+### An upstream that echoes or stores headers hands the key back
+
+Whatever an upstream does with the attached header is outside bailey's reach.
+A service that echoes request headers into its responses, logs them
+ verbatim, or forwards them to another service (a payment processor, a
+monitoring relay, a misconfigured proxy) copies the credential to wherever
+those bytes end up. Interception sees the request and the response; it cannot
+see what the upstream does afterwards. Treat a credential bound to a host as
+readable by everything that host's operators can read.
+
+### Compiled-in roots fail closed under interception
+
+A client whose trust anchors are compiled into its own binary, and which reads
+neither the system bundle path nor any of the CA variables bailey sets, will
+not trust the run's interception CA. Its TLS handshakes to intercepted hosts
+fail, and nothing is forwarded. That is deliberate: interception never asks a
+client to accept an unverifiable certificate, so a client bailey cannot teach
+to trust the run simply does not reach intercepted hosts. Such a target needs
+those hosts left out of `intercept` (host-and-port tunnel rules still work),
+or its own trust configuration pointed at the bundle path inside the sandbox.
+
+### `*` reaches the LAN
+
+`host = "*"` in an allow rule admits every name, and the broker dials private
+addresses, the RFC 1918 ranges included, because a rule naming an internal
+service is a normal thing to write. A run allowed `*` can therefore reach your
+local network: printers, admin panels, whatever answers there. The address
+filter still refuses loopback, `0.x.x.x`, `169.254.x.x`, multicast and the
+broadcast address, so the run reaches neither your machine nor the link-local
+range; it is everything behind the router that `*` opens. Name the hosts you
+mean, or accept that the rule is "anything, anywhere".
+
 ## Filesystem
 
 ### Taking access away needs the isolation layer

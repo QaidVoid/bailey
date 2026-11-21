@@ -348,6 +348,193 @@ process that has to be told cannot check the answer, because whatever it is told
 the caller chose. There is no flag that says "this run is already inside a
 namespace", and a caller cannot ask for the rule to be installed anywhere.
 
+### The built-in egress broker
+
+`builtin` in place of an address names the broker bailey brings. It spawns
+`bailey-broker` outside the target's namespace, hands it the listening socket,
+and aims every proxy variable inside the session at it. The helper is looked up
+beside the `bailey` executable, then in the directories `BAILEY_HELPER_DIRS`
+names; `bailey doctor` reports which it found, with its version, or why it
+found none.
+
+```toml
+[network]
+broker = "builtin"
+
+[[http.allow]]
+host = "example.com"
+
+[[http.allow]]
+host = "*.npmjs.org"
+
+[[http.deny]]
+host = "*.internal.npmjs.org"
+```
+
+```sh
+bailey run -- curl https://example.com
+# 200; one.one.one.one is refused: no rule allows it
+```
+
+The `--egress-proxy builtin` flag selects the same broker in place of the
+config's `broker` key; the rules still come from the config, and a run with no
+`[[http]]` rules at all refuses every tunnel, because nothing is open that no
+rule opens:
+
+```sh
+bailey run --egress-proxy builtin -- curl https://example.com
+```
+
+The `[[http]]` rules are the broker's access policy, written where every other
+policy is written. A deny rule drops ahead of every allowance. A rule bounds
+its host always, and its port when it names one, the CONNECT default being 443.
+A
+host is an exact name, `*.suffix`, an IP literal, or `*` for any. Methods and
+paths bound requests, not tunnels: a rule that names either never decides a
+CONNECT, so write tunnel rules with host and port only.
+
+A tunnel is granted on the name it CONNECTs to, before anything is resolved.
+The refusal names the rule that made it, so a blocked run can be read against
+the config:
+
+```
+bailey: CONNECT registry.npmjs.org denied by deny rule 1 in /work/bailey.toml
+bailey: CONNECT internal.npmjs.org denied: no rule allows it
+```
+
+After a grant the client's TLS ClientHello must name the granted host. A target
+that fronts another name through an allowed one gets a closed tunnel, and costs
+the broker neither a DNS question nor a dial. The name is resolved once, after
+the ACL and the name check agree, and the addresses it returns are filtered:
+loopback, the `0.x.x.x` and `169.254.x.x` ranges, multicast and the broadcast
+address are never dialled, and every other address, private LAN addresses
+included, is.
+
+Inside the session there is no DNS and no other way out, so a client reaches
+the network only by naming its destination to the broker. The proxy variables
+are set in every spelling a client looks for (`HTTP_PROXY`, `HTTPS_PROXY`,
+`ALL_PROXY`, lowercase included), `NO_PROXY` is emptied so an inherited
+exclusion cannot route around the broker, and `NODE_USE_ENV_PROXY=1` is set,
+without which Node ignores proxy variables outright. What each client does
+with those variables, measured against a stub CONNECT proxy:
+
+| Client | https | cleartext http | note |
+| --- | --- | --- | --- |
+| curl | CONNECT | absolute-form | |
+| git | CONNECT | n/a | via libcurl |
+| Python `urllib` | CONNECT | absolute-form | |
+| Python `requests` | CONNECT | absolute-form | pip is the vendored requests stack, same variables |
+| npm | CONNECT | n/a | default retries only retry |
+| Node `fetch` | CONNECT | absolute-form | requires `NODE_USE_ENV_PROXY=1` |
+| Go `net/http` | CONNECT | absolute-form | `HTTP_PROXY` is read; `ALL_PROXY` is not |
+
+A cleartext `http://` request through the proxy is served like a tunnel's
+requests: the request-target names one absolute authority (`http://` only, no
+userinfo), `Host` must agree with it, and the request is forwarded in
+origin-form with a `Host` the broker writes. A client that ignores the
+variables entirely, a raw socket for instance, fails at once with the name
+resolution error, which is the lockdown showing itself rather than a hang. The
+run summary reports the lockdown as `egress broker (built-in)`.
+
+### Interception
+
+TLS termination is opt-in per host. A host listed in `[http] intercept` has its
+tunnel terminated: the broker answers the target's TLS itself and decides each
+request inside against the same rules as everything else. A host no rule
+bounds needs no interception; write host-and-port rules and the tunnel stays
+opaque.
+
+```toml
+[http]
+intercept = ["api.github.com", "*.internal.example"]
+```
+
+An intercept entry is an exact name or `*.suffix`; `*` is refused, and a
+method rule, path rule or credential for a host no intercept entry covers is a
+resolution error, so an unenforceable rule never loads.
+
+What the target sees: on the first request to an intercepted host the broker
+issues a short-lived leaf certificate for that exact name, signed by a
+per-run ECDSA CA whose key lives in the broker's memory only. The CA carries
+an X.509 name constraint permitting exactly the intercepted names, so even a
+leaked key cannot vouch for any other host. The broker offers `http/1.1`
+alone on both legs by ALPN: HTTP/2 never negotiates on an intercepted host,
+and a request asking to upgrade (a WebSocket handshake) is refused with 403
+before anything is forwarded.
+
+Which clients trust it: the run writes a combined bundle (the host's own trust
+bundle followed by the run's CA) over the system bundle paths inside the
+sandbox, and sets the per-client variables (`SSL_CERT_FILE`, `CURL_CA_BUNDLE`,
+`GIT_SSL_CAINFO`, `PIP_CERT`, `REQUESTS_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`,
+`DENO_CERT`, `CARGO_HTTP_CAINFO`, `AWS_CA_BUNDLE`). Every measured client stack (OpenSSL,
+Python, Go, Node, rustls) then accepts the leaf for an intercepted name and
+rejects one for any other name. The one caveat is Python `requests`, which
+ignores the system bundle unless `REQUESTS_CA_BUNDLE` is set; bailey sets it,
+and that setting is load-bearing rather than convenience.
+
+Paths on intercepted hosts must be canonical: they start with `/`, carry no
+empty or dot segment, no backslash, no control character, and no escape of a
+character that is equivalent to itself (`/%61dmin` is refused where `/admin`
+matches, because unescaping it upstream would let a request pass a rule and
+reach something else). Ordinary escapes such as `%20` are left untouched and
+forwarded byte for byte. The rule matched and the path forwarded are the same
+path; a refusal names the rule.
+
+### Credentials
+
+A credential binding hands the broker a secret and a host, and the broker
+attaches the secret to the requests the target is allowed to send there. The
+value lives in the caller's environment or files, never in policy text: a
+binding names where to read it, bailey reads it once before the sandbox is
+made, and the broker receives it on a pipe, not in an argument or an
+environment variable anything can list.
+
+Credentials are accepted from the caller's own layers only: bundled and user
+profiles, the global config, a `--config` file and the command line. A
+discovered `bailey.toml` that declares a credential fails resolution even when
+trusted, because a project's build scripts should not be able to name what
+secrets a run carries.
+
+The two everyday shapes are OpenAI's and Anthropic's:
+
+```toml
+[[http.credential]]
+host = "api.openai.com"
+auth = "bearer"
+source = "env:OPENAI_API_KEY"
+
+[[http.credential]]
+host = "api.anthropic.com"
+auth = "header:x-api-key"
+source = "env:ANTHROPIC_API_KEY"
+```
+
+`auth = "bearer"` attaches `Authorization: Bearer <value>`; `auth =
+"header:NAME"` attaches `NAME: <value>` raw. A header name the broker strips
+anyway (the hop-by-hop set, `Host`, the framing headers) is a config error:
+the credential could never reach the upstream under it.
+
+A source names the caller's environment (`env:NAME`), a file
+(`file:PATH`) or a descriptor bailey already holds (`fd:N`). Resolution
+happens before the namespace is made, and a source that does not resolve, is
+empty, or holds a line break refuses the run naming the binding, so a broken
+secret never starts a target that would then fail halfway through its work.
+`fd:0`, `fd:1` and `fd:2` are refused: the target's own streams cannot be
+credential sources. A descriptor source is consumed the way `fd:N` implies:
+bailey checks it is open, sets close-on-exec, reads it once and closes it
+before any hook, helper or fork, so nothing the run starts holds a descriptor
+the target could seek back to the start of. An `env:` name is added to the
+environment deny list whatever a `pass` says, and a `pass` that would have
+forwarded the variable prints a note saying so.
+
+Attachment is strict about what it rides on. A credential is attached only
+after the request has passed the allow and deny rules, only on an intercepted
+host, and only over TLS: it replaces every header of the same name the target
+sent, so a target cannot smuggle its own `Authorization` past the binding.
+A cleartext request to a host with a credential binding is refused rather
+than sent, because an unencrypted leg is exactly where a secret must not go.
+A denied request reaches no upstream at all and carries no credential.
+
 ## Nested runs
 
 A run started inside another bailey sandbox cannot create a network namespace
