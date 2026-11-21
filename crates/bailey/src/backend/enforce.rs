@@ -750,8 +750,8 @@ impl EnforceBackend {
                 .as_ref()
                 .map(|plan| plan.staging.clone())
                 .into_iter()
-                .chain(generated_files.map(|(dir, _)| dir))
                 .collect(),
+            plain: generated_files.map(|(dir, _)| vec![dir]).unwrap_or_default(),
         };
         let stop_before_exec = self.stop_before_exec;
         let create_guard = creates_guard(self.guard_in_place);
@@ -1041,10 +1041,15 @@ fn policy_with_generated(policy: &Policy, generated: &[(PathBuf, PathBuf)]) -> P
 /// Both live in one staging directory of their own, because the staging
 /// root itself becomes the tmpfs mountpoint and anything written inside it
 /// before that mount is covered.
+///
+/// The pair is the staging directory and the host-to-sandbox file placements
+/// to bind.
+type GeneratedFiles = (PathBuf, Vec<(PathBuf, PathBuf)>);
+
 fn write_generated_files(
     pins: &[crate::cli::Pin],
     dns_forward: bool,
-) -> io::Result<Option<(PathBuf, Vec<(PathBuf, PathBuf)>)>> {
+) -> io::Result<Option<GeneratedFiles>> {
     if pins.is_empty() && !dns_forward {
         return Ok(None);
     }
@@ -1084,10 +1089,19 @@ fn write_generated_files(
 /// name carries the pid.
 struct StagingGuard {
     dirs: Vec<PathBuf>,
+    /// Staging that holds generated files. These are plain directories whose
+    /// contents are ours alone, so removal takes the contents with them. The
+    /// mountpoint staging above must stay `remove_dir`-only: it is empty on
+    /// the host by construction, and a directory with contents was filled by
+    /// something else.
+    plain: Vec<PathBuf>,
 }
 
 impl Drop for StagingGuard {
     fn drop(&mut self) {
+        for dir in &self.plain {
+            let _ = std::fs::remove_dir_all(dir);
+        }
         for dir in &self.dirs {
             let _ = std::fs::remove_dir(dir);
         }
@@ -1541,13 +1555,53 @@ fn sweep_staging(dir: &Path) {
         if !meta.is_dir() || meta.uid() != me {
             continue;
         }
-        // A staging directory is empty on the host by construction: the tmpfs
-        // is mounted over it inside the target's own mount namespace, so
-        // nothing a run does ever lands in it. Emptiness is what identifies
-        // one, so a directory that is not empty was filled by something else
-        // and is not ours however its name is spelled. `remove_dir` refusing a
-        // non-empty directory is the whole guarantee.
-        let _ = std::fs::remove_dir(entry.path());
+        // A mountpoint staging directory is empty on the host by construction:
+        // the tmpfs is mounted over it inside the target's own mount
+        // namespace, so nothing a run does ever lands in it. The other shape a
+        // run leaves is the generated-files staging, which holds nothing but
+        // the files bailey wrote there. A non-empty directory that is neither
+        // was filled by something else and is not ours however its name is
+        // spelled. `remove_dir` refusing a non-empty directory is the whole
+        // guarantee.
+        let generated = generated_file_names(&entry.path());
+        match generated {
+            None => {
+                let _ = std::fs::remove_dir(entry.path());
+            }
+            Some(names) => {
+                for name in names {
+                    let _ = std::fs::remove_file(entry.path().join(name));
+                }
+                let _ = std::fs::remove_dir(entry.path());
+            }
+        }
+    }
+}
+
+/// The generated files a staging directory holds, when it holds only those.
+///
+/// A run that died between writing the generated files and mounting them left
+/// a directory that the mountpoint rule above would refuse forever: the files
+/// make it non-empty, and nothing else would ever empty it. A directory whose
+/// every entry is one of the names the generated-files staging uses is one of
+/// those, and it is safe to empty.
+fn generated_file_names(dir: &Path) -> Option<Vec<&'static str>> {
+    let mut names = Vec::new();
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let name = match entry.file_name().to_str()? {
+            "hosts" => "hosts",
+            "resolv.conf" => "resolv.conf",
+            _ => return None,
+        };
+        if entry.metadata().ok()?.is_dir() {
+            return None;
+        }
+        names.push(name);
+    }
+    if names.is_empty() {
+        None
+    } else {
+        Some(names)
     }
 }
 
@@ -3901,6 +3955,46 @@ mod tests {
             old.join("kept").is_file(),
             "a filled old-shape directory is not swept"
         );
+    }
+
+    /// A generated-files staging a dead run left is healed, and a lookalike
+    /// that holds anything else is not.
+    ///
+    /// A run that died between writing the generated files and tearing them
+    /// down leaves a directory the emptiness rule above would refuse forever,
+    /// because nothing would ever empty it. The sweep recognizes the exact
+    /// shape the generated-files staging has (only `hosts` and `resolv.conf`
+    /// files) and empties that one; a directory that carries any other name
+    /// stays untouched.
+    #[test]
+    fn the_sweep_heals_a_generated_files_leftover_and_no_lookalike() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // The exact shape a dead run's generated-files staging has.
+        let healed = dir
+            .path()
+            .join(format!("{STAGING_PREFIX}987654321.c0ffee"));
+        std::fs::create_dir_all(&healed).unwrap();
+        std::fs::write(healed.join("hosts"), "127.0.0.1 pinned\n").unwrap();
+        std::fs::write(healed.join("resolv.conf"), "nameserver 10.0.2.3\n").unwrap();
+        // The same shape plus one name the generated staging never writes.
+        let lookalike = dir
+            .path()
+            .join(format!("{STAGING_PREFIX}987654320.c0ffee"));
+        std::fs::create_dir_all(&lookalike).unwrap();
+        std::fs::write(lookalike.join("hosts"), "127.0.0.1 pinned\n").unwrap();
+        std::fs::write(lookalike.join("kept"), "not ours").unwrap();
+
+        sweep_staging(dir.path());
+
+        assert!(!healed.exists(), "a generated-files leftover is healed");
+        assert!(
+            lookalike.join("kept").is_file(),
+            "a lookalike holding another file is not swept"
+        );
+
+        let _ = std::fs::remove_dir_all(&healed);
+        let _ = std::fs::remove_dir_all(&lookalike);
     }
 
     /// A session runtime directory that is not this user's own is refused, even
