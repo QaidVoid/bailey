@@ -147,7 +147,7 @@ before the run starts.
 | `egress_deny` | list of tables | Destinations dropped ahead of every allowance, `{ host, port }` |
 | `dns` | `"auto"`, `"allow"` or `"deny"` | Whether the run may ask DNS questions. Default `"auto"` |
 | `mode` | `"auto"`, `"private"` or `"host"` | How the network is placed. Default `"auto"` |
-| `broker` | `"ADDR:PORT"` | Hold the run to one egress route, through a broker at that address |
+| `broker` | `"ADDR:PORT"` or `"builtin"` | Hold the run to one egress route: through a broker at that address, or through bailey's own broker, whose `[http]` rules decide what passes |
 | `bind_ports` | list of integers | TCP ports the target may bind |
 | `publish_ports` | list of integers | Sandbox TCP ports published on the host at `127.0.0.1:PORT`; needs the private namespace and allowed egress |
 
@@ -176,7 +176,10 @@ mode, because the namespace is the only way to deny every protocol at once.
 `broker` is a boundary the policy itself names: every outbound connection
 except one to `ADDR:PORT` is dropped, so the session reaches the broker and
 nothing else. It needs the private namespace and `nft`, and refuses the run
-where either is missing.
+where either is missing. `broker = "builtin"` is bailey's own broker instead,
+run by bailey on a listener the target is handed in place of the host's
+loopback gateway; what passes through it is decided by the `[http]` rules
+below. `--egress-proxy builtin` selects it from the command line.
 
 Resolved settings that contradict each other are refused at resolution,
 naming the layers that set them: host mode with forwards, published ports, a
@@ -233,6 +236,86 @@ useless without resolution. Queries go to the namespace's forwarder only.
 `dns = "deny"` drops them, so names must resolve through the pinned
 `/etc/hosts`. A DNS denial is a netfilter rule, so it needs the private
 namespace like a destination rule does.
+
+## `[http]`
+
+HTTP-level rules for the built-in egress broker, `broker = "builtin"`. The
+lists accumulate across layers, and `[filesystem] reset = true` clears them,
+like the forwards and published ports.
+
+| Key | Type | Description |
+| --- | --- | --- |
+| `intercept` | list of strings | Hosts the broker terminates TLS for, deciding every request inside the tunnel itself. An exact name, `*.suffix` for subdomains only, or an address; `*` is refused |
+| `log` | path | The append-only JSONL audit log of every decision the broker makes. Caller-owned config only |
+
+```toml
+[network]
+egress_allow = [{ host = "*", port = 443 }]
+broker = "builtin"
+
+[http]
+intercept = ["api.anthropic.com"]
+
+[[http.allow]]
+host = "api.anthropic.com"
+methods = ["POST"]
+path = "/v1/*"
+
+[[http.deny]]
+host = "api.anthropic.com"
+methods = ["DELETE"]
+
+[[http.credential]]
+host = "api.anthropic.com"
+auth = "header:x-api-key"
+source = "env:ANTHROPIC_API_KEY"
+```
+
+### `[[http.allow]]` and `[[http.deny]]`
+
+| Key | Type | Description |
+| --- | --- | --- |
+| `host` | string | Required. A name, `*.suffix`, an address, or `*` |
+| `port` | integer | Optional. Defaults to 443 for a CONNECT and 80 for a cleartext request |
+| `methods` | list of strings | Optional, any by default. Uppercase tokens; a request whose method is not an uppercase token is refused, so `delete` never passes a rule written for `DELETE` |
+| `path` | string | Optional, any by default. Exact, or a prefix when it ends in `*`, and no other wildcard. Matched against the path without the query |
+
+The broker refuses a request unless an allow rule matches it, and drops it
+when a deny rule matches, ahead of every allowance. With no allow rules,
+everything is refused.
+
+A rule that bounds a method or a path, and every credential, needs its host
+in `intercept`: inside the tunnel is where the request is visible and the
+rule can be applied. A rule naming only a host and port is a tunnel, and
+needs no interception.
+
+### `[[http.credential]]`
+
+| Key | Type | Description |
+| --- | --- | --- |
+| `host` | string | The intercepted host it binds to |
+| `auth` | string | `bearer`, or `header:NAME` naming the header the value goes in |
+| `source` | string | `env:NAME`, `file:PATH` or `fd:N`, read by the broker when a request needs it |
+
+A credential attaches after the request has passed the rules, on the upstream
+TLS connection, replacing any header of the same name the target sent. An
+`auth` header that is a framing or hop-by-hop name (`Host`,
+`Content-Length`, `Transfer-Encoding`, `Connection` and the rest) is refused:
+the broker strips or writes those itself. The names in `env:` sources are
+added to `policy.env.deny`, so the sandbox environment never carries them.
+`bailey show` reports the host, the auth shape and the source kind and name;
+never a value.
+
+### Credentials and the log are the caller's own
+
+`[[http.credential]]` and `log` are accepted from bundled and user profiles,
+the global config, `--config` and the command line, and refused from a config
+found by walking up to the target or the working directory, trusted or not. A
+trusted project file is trusted to describe what the project may reach, which
+is what allow, deny and intercept rules do, like an `egress_allow` entry. It
+is not trusted to choose which of your secrets leave the machine, which is
+what a `file:~/.ssh/id_ed25519` binding to a host the file names would do, or
+to choose a file bailey appends to as you.
 
 ## `[[device]]`
 

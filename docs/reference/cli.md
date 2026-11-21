@@ -35,11 +35,16 @@ exit status.
 | `--deny <PATH>` | Deny a path outright, retracting any grant. Repeatable |
 | `--allow-connect <PATH>` | Allow connecting to a UNIX socket at this path, reading and writing it. Repeatable. Unset or empty variables refuse the flag, and the session runtime directory is off limits |
 | `--allow-net <PORT>` | Allow outbound TCP to this port, on any host. Repeatable |
+| `--http-intercept <HOST>` | Intercept HTTP on a host, so the built-in broker terminates TLS and decides each request inside. Repeatable |
+| `--http-allow <RULE>` | Allow an HTTP request, as `[METHOD] HOST[:PORT][/PATH]`, where a path ending in `*` bounds the prefix. Repeatable |
+| `--http-deny <RULE>` | Deny an HTTP request, in the same form, ahead of every allowance. Repeatable |
+| `--http-credential <BINDING>` | Attach a credential to an intercepted host, as `HOST AUTH SOURCE`, with `AUTH` one of `bearer`, `header:NAME`, and `SOURCE` one of `env:NAME`, `file:PATH`, `fd:N`. Repeatable |
+| `--http-log <PATH>` | The append-only JSONL audit log of the built-in broker's decisions |
 | `-p, --profile <NAME>` | Profile used as the base, bundled or your own. Defaults to one that claims the target, else `untrusted` |
 | `--proxy-net` | Ask for the private network namespace outright; the run is refused where the host cannot provide it |
 | `--publish-port <PORT>` | Publish a sandbox TCP port at host `127.0.0.1:PORT`. Repeatable; needs the private namespace, isolation, and allowed egress |
 | `--no-proxy-net` | Share the host's network namespace, with Landlock's TCP rules as the only restriction |
-| `--egress-proxy <ADDR:PORT>` | Restrict egress to a host broker; cannot be combined with forwards or publications |
+| `--egress-proxy <ADDR:PORT\|builtin>` | Restrict egress to a broker: one on the host at ADDR:PORT, or `builtin` for bailey's own broker, with the `--http-*` flags as its rules |
 | `--no-isolate` | Run without namespace isolation, leaving Landlock and seccomp |
 | `--isolate` | Accepted and redundant: isolation is the default |
 | `--quiet` | Do not print what the run enforced |
@@ -48,6 +53,14 @@ exit status.
 `ARGS` are passed to the target untouched. Bailey stops interpreting options at
 the target, so `bailey run ./tool -c ./tool.conf` gives `-c ./tool.conf` to
 `./tool`. Bailey's own options go before the target.
+
+The `--http-*` flags describe the same layer as the `[http]` keys of the
+[configuration reference](/reference/config.md), and share their grammar: a
+rule is `[METHOD] HOST[:PORT][/PATH]`, a binding is `HOST AUTH SOURCE`. A
+credential or log passed here stands where you stand, so it is accepted
+outright; the same keys in a project's `bailey.toml`, found by walking up the
+directory tree, are refused even when that file is trusted, because the file
+must not choose which of your secrets leave the machine.
 
 A target with no `/` in it is looked up on `PATH`, the way a shell would, so
 `bailey run curl` means what it appears to. A target that resolves to nothing is
@@ -103,11 +116,16 @@ the same policy without being invoked through bailey.
 | `--deny <PATH>` | Deny a path outright, retracting any grant. Repeatable |
 | `--allow-connect <PATH>` | Allow connecting to a UNIX socket at this path, reading and writing it. Repeatable. Unset or empty variables refuse the flag, and the session runtime directory is off limits |
 | `--allow-net <PORT>` | Allow outbound TCP to this port, on any host. Repeatable |
+| `--http-intercept <HOST>` | Intercept HTTP on a host, so the built-in broker terminates TLS and decides each request inside. Repeatable |
+| `--http-allow <RULE>` | Allow an HTTP request, as `[METHOD] HOST[:PORT][/PATH]`, where a path ending in `*` bounds the prefix. Repeatable |
+| `--http-deny <RULE>` | Deny an HTTP request, in the same form, ahead of every allowance. Repeatable |
+| `--http-credential <BINDING>` | Attach a credential to an intercepted host, as `HOST AUTH SOURCE`, with `AUTH` one of `bearer`, `header:NAME`, and `SOURCE` one of `env:NAME`, `file:PATH`, `fd:N`. Repeatable |
+| `--http-log <PATH>` | The append-only JSONL audit log of the built-in broker's decisions |
 | `-p, --profile <NAME>` | Profile used as the base |
 | `--proxy-net` | Ask for the private network namespace outright; the run is refused where the host cannot provide it |
 | `--publish-port <PORT>` | Publish a sandbox TCP port at host `127.0.0.1:PORT`. Repeatable; needs the private namespace, isolation, and allowed egress |
 | `--no-proxy-net` | Share the host's network namespace, with Landlock's TCP rules as the only restriction |
-| `--egress-proxy <ADDR:PORT>` | Restrict egress to a host broker; cannot be combined with forwards or publications |
+| `--egress-proxy <ADDR:PORT\|builtin>` | Restrict egress to a broker: one on the host at ADDR:PORT, or `builtin` for bailey's own broker, with the `--http-*` flags as its rules |
 | `--no-isolate` | Run without namespace isolation, leaving Landlock and seccomp |
 
 Network options have the same behavior as for `bailey run`. Online TCP forwards
