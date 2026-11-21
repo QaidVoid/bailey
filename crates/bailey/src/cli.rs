@@ -1892,7 +1892,11 @@ fn wrap_builtin_broker(
                 }
             };
             drop(parent_side);
-            let (broker, ca_pem, broker_stdout) = match spawn_builtin_broker(&spawn, listener, port)
+            // The watcher names the log beside the run's counts, so the
+            // path is kept before the rest of the spawn moves into the
+            // broker's start-up.
+            let log_path = spawn.log_path.clone();
+            let (broker, ca_pem, broker_stdout) = match spawn_builtin_broker(spawn, listener, port)
             {
                 Ok(answer) => answer,
                 Err(error) => {
@@ -1963,7 +1967,7 @@ fn wrap_builtin_broker(
             }
             // The broker's own numbers, after everything else the run said.
             if announce && let Some((allowed, refused)) = counts {
-                let suffix = match &spawn.log_path {
+                let suffix = match &log_path {
                     Some(path) => format!(" (log: {})", path.display()),
                     None => String::new(),
                 };
@@ -2188,7 +2192,7 @@ fn recv_fd_and_port(
 /// argument is this process's pid, which it pins its parent check to.
 /// Secrets travel in the stdin document alone.
 fn spawn_builtin_broker(
-    spawn: &BuiltinSpawn,
+    spawn: BuiltinSpawn,
     listener: std::os::unix::io::OwnedFd,
     port: u16,
 ) -> anyhow::Result<(
@@ -2254,6 +2258,10 @@ fn spawn_builtin_broker(
     use std::io::Write as _;
     stdin.write_all(&spawn.config.encode()?)?;
     drop(stdin);
+    // The values have crossed to the broker, which holds them in memory
+    // only. This process keeps none: it outlives the run, and a secret a
+    // run is done with is not a secret the run should still hold.
+    drop(spawn.config);
 
     let mut stdout = broker.stdout.take().expect("the broker's stdout is piped");
     let ready = match crate::broker::BrokerReady::decode(&mut stdout) {
