@@ -317,6 +317,32 @@ is not trusted to choose which of your secrets leave the machine, which is
 what a `file:~/.ssh/id_ed25519` binding to a host the file names would do, or
 to choose a file bailey appends to as you.
 
+### The decision log
+
+With `log` set, bailey opens the path itself, refusing anything that is not a
+regular file you own, never following a symbolic link, and hands it to the
+broker appended-only. The broker writes one JSON line per decision it makes:
+every tunnel it grants or refuses, and every request it decides on an
+intercepted host or through a cleartext proxy. Nothing else goes into the
+line: no headers, no query strings, no credential values. The line carries the
+time, the method (`CONNECT` for a tunnel), the host, the port, the path
+without its query, the verdict, the reason a client would have seen, the rule
+that decided as `kind rule N in SOURCE`, whether the host was intercepted, and
+the upstream status when one came back.
+
+```jsonl
+{"time": "2026-11-21T14:08:00.707575746Z", "method": "CONNECT", "host": "registry.npmjs.org", "port": 443, "path": "", "verdict": "allowed", "reason": "", "rule": "allow rule 1 in /work/bailey.toml", "intercepted": false}
+{"time": "2026-11-21T14:08:00.711516811Z", "method": "GET", "host": "api.anthropic.com", "port": 443, "path": "/v1/messages", "verdict": "allowed", "reason": "", "rule": "allow rule 1 in /work/bailey.toml", "intercepted": true, "status": 200}
+{"time": "2026-11-21T14:08:00.712953225Z", "method": "GET", "host": "api.anthropic.com", "port": 443, "path": "/private", "verdict": "refused", "reason": "GET /private denied by deny rule 1 in /work/bailey.toml", "rule": "deny rule 1 in /work/bailey.toml", "intercepted": true}
+```
+
+When the run ends, bailey adds one line of its own after the summary: the
+broker's counts, with the log path.
+
+```
+bailey: http broker: 41 allowed, 3 refused (log: /work/http-log.jsonl)
+```
+
 ## `[[device]]`
 
 An array of tables, one per device.

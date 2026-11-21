@@ -436,6 +436,32 @@ variables entirely, a raw socket for instance, fails at once with the name
 resolution error, which is the lockdown showing itself rather than a hang. The
 run summary reports the lockdown as `egress broker (built-in)`.
 
+### Reading the decision log
+
+When a run needs a host the broker refused, the log tells you exactly what to
+change. Give the run a `log` path, read the refused lines, and write the rule
+the refusal asks for:
+
+```sh
+bailey run -c bailey.toml -- npm install
+# fails; the log holds the decisions
+
+grep '"verdict": "refused"' http-log.jsonl
+# {"method": "CONNECT", "host": "registry.npmjs.org", "port": 443,
+#  "verdict": "refused", "reason": "CONNECT registry.npmjs.org denied: no rule allows it", ...}
+```
+
+The `host` and `port` in the refused line are the rule to add; the `reason` is
+whether a deny rule matched (drop or narrow it) or nothing allowed the host
+(add an `[[http.allow]]`). Then rerun and read the new lines: every decision
+the broker made for the run is one line, allowed ones included, with the rule
+that decided each. The counts line bailey prints after the summary says at a
+glance whether the run still refuses anything:
+
+```
+bailey: http broker: 12 allowed, 1 refused (log: /work/http-log.jsonl)
+```
+
 ### Interception
 
 TLS termination is opt-in per host. A host listed in `[http] intercept` has its
