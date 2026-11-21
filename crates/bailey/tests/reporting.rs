@@ -212,6 +212,69 @@ fn a_flag_override_is_reported_as_the_flag() {
     );
 }
 
+/// The destination rules a private run enforces are in the summary and in the
+/// JSON: each allow rule with the addresses its hostname resolved to, each
+/// deny rule, and whether DNS is answered.
+#[test]
+fn a_private_run_reports_its_destination_rules() {
+    if !bailey::backend::isolation::available() {
+        return;
+    }
+    for helper in ["pasta", "nft"] {
+        if bailey::cli::resolve_helper(helper).is_err() {
+            return;
+        }
+    }
+    let (output, _) = run_with_config(
+        "[network]\n\
+         egress_allow = [\n\
+         \x20 { host = \"localhost\", port = 443 },\n\
+         \x20 { host = \"169.254.169.254\", port = 80 },\n\
+         ]\n\
+         egress_deny = [{ host = \"203.0.113.0/24\", port = 443 }]\n",
+        &[],
+        &[],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("egress destinations: tcp localhost:443 pinned to"),
+        "the summary must name the pinned rule: {stderr}"
+    );
+    assert!(
+        stderr.contains("127.0.0.1"),
+        "the summary must name the address localhost resolved to: {stderr}"
+    );
+    assert!(
+        stderr.contains("tcp 169.254.169.254:80"),
+        "the summary must name the address rule: {stderr}"
+    );
+    assert!(
+        stderr.contains("deny 203.0.113.0/24:443"),
+        "the summary must name the deny rule: {stderr}"
+    );
+    assert!(
+        stderr.contains("dns dropped"),
+        "the summary must say DNS is dropped without a wildcard rule: {stderr}"
+    );
+
+    let (output, _) = run_with_config(
+        "[network]\negress_allow = [{ host = \"*\", port = 443 }]\n",
+        &["--json"],
+        &[],
+    );
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("dns answered by the forwarder"),
+        "the JSON must carry the DNS state of a wildcard run: {stdout}"
+    );
+}
+
 /// The private-network line answers what a run allowing egress will do, and
 /// it needs pasta, user namespaces and `nft` to answer "available".
 #[test]

@@ -204,6 +204,54 @@ impl RunReport {
     }
 }
 
+/// Describe the destination rules a private run enforces, for the summary.
+///
+/// Each allow rule with its protocol and port, each pinned name with the
+/// addresses it resolved to, each deny rule, and whether DNS questions are
+/// answered. One line, so the enforced list stays one list.
+fn egress_destinations_report(policy: &Policy, pins: &[crate::cli::Pin]) -> Vec<String> {
+    use crate::policy::{Destination, Egress};
+
+    let mut parts: Vec<String> = Vec::new();
+    if let Egress::Allow(rules) = &policy.network.egress {
+        for rule in rules {
+            let mut part = match rule.port {
+                Some(port) => format!("{} {}:{port}", rule.protocol.name(), rule.host),
+                None => format!("{} {}", rule.protocol.name(), rule.host),
+            };
+            if let Destination::Name(name) = &rule.host
+                && let Some(pin) = pins.iter().find(|pin| &pin.name == name)
+                && !pin.addresses.is_empty()
+            {
+                let addresses: Vec<String> = pin
+                    .addresses
+                    .iter()
+                    .map(|address| address.to_string())
+                    .collect();
+                part.push_str(&format!(" pinned to {}", addresses.join(" ")));
+            }
+            parts.push(part);
+        }
+    }
+    for rule in &policy.network.deny {
+        match rule.port {
+            Some(port) => parts.push(format!("deny {}:{port}", rule.host)),
+            None => parts.push(format!("deny {}", rule.host)),
+        }
+    }
+    parts
+}
+
+/// The DNS tail of the destinations report: only a run whose netfilter
+/// table carries the DNS verdict may name one.
+fn dns_destinations_report(policy: &Policy) -> String {
+    if policy.network.dns_allowed() {
+        "dns answered by the forwarder".to_owned()
+    } else {
+        "dns dropped".to_owned()
+    }
+}
+
 /// Whether a run that enters namespaces of its own creates a fresh guard user
 /// namespace first.
 ///
@@ -425,6 +473,30 @@ impl EnforceBackend {
                 decision.source,
                 decision.reason
             ));
+            // The destination rules are the private namespace's boundary, so
+            // the run names what it admits and drops: a summary that only
+            // named the mode would leave a policy naming ten hosts
+            // indistinguishable from one naming none. A brokered run enforces
+            // none of them, and its reason above says so.
+            if decision.mode == NetworkMode::Private {
+                report.applied(&format!(
+                    "egress destinations: {}; {}",
+                    egress_destinations_report(policy, &self.pins).join("; "),
+                    dns_destinations_report(policy)
+                ));
+            }
+            // A Landlock-only run still carries its own TCP port verdicts,
+            // and a summary that named only the mode would leave a run
+            // restricting ten ports indistinguishable from one restricting
+            // none. Deny, UDP and DNS verdicts cannot exist in this mode:
+            // they need the namespace it could not build, and the decision
+            // refuses them before the run starts.
+            if decision.mode == NetworkMode::LandlockOnly {
+                report.applied(&format!(
+                    "egress destinations (Landlock): {}",
+                    egress_destinations_report(policy, &self.pins).join("; ")
+                ));
+            }
         }
 
         let isolated = self.isolate && userns;

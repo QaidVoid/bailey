@@ -2880,7 +2880,56 @@ fn print_policy_to(
     }
 
     writeln!(out, "network:").expect("writing the policy report");
-    writeln!(out, "  egress: {:?}", policy.network.egress).expect("writing the policy report");
+    match &policy.network.egress {
+        crate::policy::Egress::DenyAll => {
+            writeln!(out, "  egress: denied").expect("writing the policy report");
+        }
+        crate::policy::Egress::AllowAll => {
+            writeln!(out, "  egress: allowed").expect("writing the policy report");
+        }
+        crate::policy::Egress::Allow(rules) => {
+            if rules.is_empty() {
+                writeln!(out, "  egress: denied (no rules set)")
+                    .expect("writing the policy report");
+            } else {
+                writeln!(out, "  egress: allowed to:")
+                    .expect("writing the policy report");
+                for rule in rules {
+                    match rule.port {
+                        Some(port) => writeln!(
+                            out,
+                            "    {} {}:{port}",
+                            rule.protocol.name(),
+                            rule.host
+                        )
+                        .expect("writing the policy report"),
+                        None => writeln!(out, "    {} {}", rule.protocol.name(), rule.host)
+                            .expect("writing the policy report"),
+                    };
+                }
+            }
+        }
+    }
+    for rule in &policy.network.deny {
+        match rule.port {
+            Some(port) => writeln!(out, "  deny {}:{port}", rule.host)
+                .expect("writing the policy report"),
+            None => {
+                writeln!(out, "  deny {}", rule.host).expect("writing the policy report")
+            }
+        };
+    }
+    writeln!(
+        out,
+        "  dns: {} ({})",
+        policy.network.dns.name(),
+        if policy.network.dns_allowed() {
+            "answered by the forwarder"
+        } else {
+            "dropped"
+        }
+    )
+    .expect("writing the policy report");
     writeln!(out, "  bind_ports: {:?}", policy.network.bind_ports)
         .expect("writing the policy report");
     writeln!(out, "  publish_ports: {:?}", policy.network.publish_ports)
@@ -4024,6 +4073,59 @@ mod tests {
             out.is_empty(),
             "on_violation cannot run: {:?}",
             String::from_utf8_lossy(&out)
+        );
+    }
+
+    /// `show` prints the destination rules and the DNS decision, without
+    /// resolving any name: what a policy says is the answer, not what a name
+    /// happens to point at today.
+    #[test]
+    fn show_lists_the_destination_rules_and_the_dns_decision() {
+        use crate::policy::{DenyRule, Destination, DnsSetting, EgressRule, Protocol};
+
+        let target = std::path::PathBuf::from("/bin/true");
+        let mut policy = Policy::default();
+        policy.network.egress = Egress::Allow(vec![
+            EgressRule {
+                host: Destination::Name("api.example.com".to_owned()),
+                protocol: Protocol::Tcp,
+                port: Some(443),
+            },
+            EgressRule {
+                host: Destination::Block(
+                    std::net::IpAddr::V4("203.0.113.0".parse().unwrap()),
+                    24,
+                ),
+                protocol: Protocol::Udp,
+                port: Some(53),
+            },
+        ]);
+        policy.network.deny = vec![DenyRule {
+            host: Destination::Address(
+                std::net::IpAddr::V4("169.254.169.254".parse().unwrap()),
+            ),
+            port: Some(80),
+        }];
+        policy.network.dns = DnsSetting::Allow;
+        let resolved = Resolved {
+            policy,
+            ..Default::default()
+        };
+
+        let mut out = Vec::new();
+        print_policy_to(&mut out, &resolved, &target, &NetworkArgs::default());
+        let report = String::from_utf8(out).unwrap();
+
+        assert!(
+            report.contains("  egress: allowed to:"),
+            "{report}"
+        );
+        assert!(report.contains("    tcp api.example.com:443"), "{report}");
+        assert!(report.contains("    udp 203.0.113.0/24:53"), "{report}");
+        assert!(report.contains("  deny 169.254.169.254:80"), "{report}");
+        assert!(
+            report.contains("  dns: allow (answered by the forwarder)"),
+            "{report}"
         );
     }
 
