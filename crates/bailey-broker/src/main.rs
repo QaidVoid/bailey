@@ -159,9 +159,21 @@ fn run() -> i32 {
     // Descriptor 3 is the namespaced listener; descriptor 4 is the
     // append-only log the caller opened and verified. Without the log the
     // decisions still serve, and the counts line still tells the parent
-    // how the run went.
+    // how the run went. The descriptor is taken over either way, so a
+    // descriptor the caller left open is closed here rather than carried
+    // into the confined broker.
     let listener = unsafe { TcpListener::from_raw_fd(3) };
-    let log_file = config.log.then(|| unsafe { std::fs::File::from_raw_fd(4) });
+    let log_file = if config.log {
+        Some(unsafe { std::fs::File::from_raw_fd(4) })
+    } else {
+        // The descriptor is taken over only when the caller passed one:
+        // closing a number nothing holds is an abort in Rust's runtime,
+        // not a tolerated EBADF.
+        if unsafe { libc::fcntl(4, libc::F_GETFD) } != -1 {
+            drop(unsafe { std::fs::File::from_raw_fd(4) });
+        }
+        None
+    };
     let audit = Arc::new(AuditLog::new(log_file));
     let config = Arc::new(config);
     let authority = Arc::new(authority);
