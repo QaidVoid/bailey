@@ -1242,7 +1242,7 @@ fn write_generated_files(
         }
         let file = dir.join("hosts");
         std::fs::write(&file, body)?;
-        generated.push((file, PathBuf::from("/etc/hosts")));
+        generated.push((file, generated_destination(Path::new("/etc/hosts"))));
     }
     if dns_forward {
         let file = dir.join("resolv.conf");
@@ -1250,9 +1250,33 @@ fn write_generated_files(
             &file,
             format!("nameserver {}\n", crate::cli::DNS_FORWARDER_V4),
         )?;
-        generated.push((file, PathBuf::from("/etc/resolv.conf")));
+        generated.push((file, generated_destination(Path::new("/etc/resolv.conf"))));
     }
     Ok(Some((dir, generated)))
+}
+
+/// Where a generated file has to land for a reader of `path` to find it.
+///
+/// On a host whose `/etc/resolv.conf` is a link, as systemd-resolved lays it
+/// out, the file a program reads is the link's destination. The link itself
+/// arrives in the reconstructed root with `/etc`, and a bind cannot be placed
+/// on a link, so the generated file goes where the link leads. Followed on the
+/// host, a few hops at most, and lexically, so a destination the host lacks
+/// still yields a path to create in the root.
+fn generated_destination(path: &Path) -> PathBuf {
+    let mut current = path.to_path_buf();
+    for _ in 0..8 {
+        let Ok(to) = std::fs::read_link(&current) else {
+            break;
+        };
+        let joined = if to.is_absolute() {
+            to
+        } else {
+            current.parent().unwrap_or(Path::new("/")).join(to)
+        };
+        current = crate::config::normalize_lexical(&joined);
+    }
+    current
 }
 
 /// Removes the host-visible staging directory a reconstructed root was built
@@ -4357,6 +4381,31 @@ mod tests {
     /// `build_isolation_plan` is the entry runs and tests share, so these hold
     /// wherever the run stages: under the session runtime directory when one
     /// qualifies, in the temp directory otherwise.
+    #[test]
+    fn a_generated_file_lands_where_a_link_leads() {
+        let dir = tempfile::tempdir().unwrap();
+        let etc = dir.path().join("etc");
+        let stub = dir.path().join("run/resolve/stub.conf");
+        std::fs::create_dir_all(&etc).unwrap();
+        std::fs::create_dir_all(stub.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink("../run/resolve/stub.conf", etc.join("resolv.conf")).unwrap();
+        assert_eq!(generated_destination(&etc.join("resolv.conf")), stub);
+
+        // An absolute link, and a chain of two, land at the last destination.
+        std::os::unix::fs::symlink(etc.join("resolv.conf"), etc.join("chained")).unwrap();
+        assert_eq!(generated_destination(&etc.join("chained")), stub);
+
+        // A destination the host lacks is still a path to create in the root.
+        std::os::unix::fs::symlink("../missing/file", etc.join("dangling")).unwrap();
+        assert_eq!(
+            generated_destination(&etc.join("dangling")),
+            dir.path().join("missing/file")
+        );
+
+        // A plain file, or nothing at all, stays where it is named.
+        assert_eq!(generated_destination(&etc.join("hosts")), etc.join("hosts"));
+    }
+
     #[test]
     fn the_staging_directory_is_fresh_and_private() {
         use std::os::unix::fs::PermissionsExt;

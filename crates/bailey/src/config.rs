@@ -2106,7 +2106,7 @@ pub fn expand_flag_path(raw: &str) -> Result<PathBuf, String> {
 /// past its own start keeps the `..`, because collapsing it to nothing would
 /// produce the empty path, which is a prefix of every path and so matches
 /// every rule.
-fn normalize_lexical(path: &Path) -> PathBuf {
+pub(crate) fn normalize_lexical(path: &Path) -> PathBuf {
     use std::path::Component;
 
     let absolute = path.is_absolute();
