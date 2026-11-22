@@ -999,17 +999,15 @@ fn lock_egress_to_broker(addr: std::net::Ipv4Addr, port: u16) -> anyhow::Result<
     // A dedicated table, so it is this rule that is added and removed and never
     // another's. IPv6 has no accept rule, so the inet chain drops it entirely.
     //
-    // Loopback is dropped, not accepted. pasta forwards the namespace's own
-    // 127.0.0.0/8 to the HOST's loopback, so an `oif lo accept` would let a
-    // session reach a host service on an allowed port. There is no loopback
-    // that stays inside the namespace to protect, so dropping it costs nothing
-    // and closes host-loopback reach.
+    // Loopback needs no rule of its own: the chain's policy drops whatever
+    // the broker's accept rule does not admit, and the broker itself
+    // refuses to dial a loopback address, so host-loopback services stay
+    // out of reach while the namespace's own loopback is left to the
+    // policy's verdict rather than singled out here.
     let ruleset = format!(
         "table inet bailey_egress {{\n\
          \tchain output {{\n\
          \t\ttype filter hook output priority 0; policy drop;\n\
-         \t\tip daddr 127.0.0.0/8 drop\n\
-         \t\tip6 daddr ::1 drop\n\
          \t\tip daddr {addr} tcp dport {port} accept\n\
          \t\tct state established,related accept\n\
          \t}}\n\
