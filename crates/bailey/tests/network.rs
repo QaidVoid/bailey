@@ -981,6 +981,11 @@ fn configured_broker_confines_the_run() {
     if !proxy_net_available() {
         return;
     }
+    let pasta = bailey::cli::resolve_helper("pasta").unwrap();
+    if !bailey::cli::pasta_maps_host_loopback(&pasta) {
+        common::skip("this pasta cannot map the host loopback for a broker");
+        return;
+    }
     let broker = EchoServer::start();
     let other = EchoServer::start();
     let dir = tempfile::tempdir().unwrap();

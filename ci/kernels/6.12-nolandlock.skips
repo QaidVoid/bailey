@@ -44,6 +44,7 @@ network::an_unlisted_socket_in_a_writable_grant_is_refused # socket connect cont
 network::an_unlisted_socket_is_refused_without_isolation_too # socket connect control needs Landlock ABI 9
 network::another_real_host_on_the_same_port_drops # the host's address is the sandbox's own (QEMU slirp)
 network::auto_mode_uses_the_private_namespace # the host's address is the sandbox's own (QEMU slirp)
+? network::configured_broker_confines_the_run # this pasta cannot map the host loopback for a broker
 network::deny_inside_an_allowed_range # the host's address is the sandbox's own (QEMU slirp)
 network::dns_dropped_without_a_wildcard_rule # the host's address is the sandbox's own (QEMU slirp)
 network::every_stream_protocol_respects_port_rules # landlock does not enforce port rules before ABI 4
@@ -53,5 +54,6 @@ reporting::a_granted_runtime_dir_with_no_connect_entry_prints_the_note # the not
 shell::a_command_in_the_shell_is_confined # no Landlock on this kernel
 shell::a_config_layer_can_retract_the_implicit_grant # no Landlock on this kernel
 shell::a_grandchild_process_is_confined # no Landlock on this kernel
+? shell::brokered_shell_children_reach_only_the_selected_egress_proxy # this pasta cannot map the host loopback for a broker
 skip_log::the_skip_log_receives_distinct_variant_keys[first] # the canary runs, so both keys are expected
 skip_log::the_skip_log_receives_distinct_variant_keys[second] # the canary runs, so both keys are expected

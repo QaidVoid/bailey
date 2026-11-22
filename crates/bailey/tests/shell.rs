@@ -728,6 +728,11 @@ fn brokered_shell_children_reach_only_the_selected_egress_proxy() {
     if !proxy_net_available() {
         return;
     }
+    let pasta = bailey::cli::resolve_helper("pasta").unwrap();
+    if !bailey::cli::pasta_maps_host_loopback(&pasta) {
+        common::skip("this pasta cannot map the host loopback for a broker");
+        return;
+    }
     let (root, project, _private) = workspace();
     let broker = TcpEcho::start();
     let hidden = TcpListener::bind(("127.0.0.1", 0)).unwrap();

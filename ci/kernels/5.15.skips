@@ -32,11 +32,13 @@ network::an_unlisted_socket_in_a_writable_grant_is_refused # socket connect cont
 network::an_unlisted_socket_is_refused_without_isolation_too # socket connect control needs Landlock ABI 9
 network::another_real_host_on_the_same_port_drops # the host's address is the sandbox's own (QEMU slirp)
 network::auto_mode_uses_the_private_namespace # the host's address is the sandbox's own (QEMU slirp)
+? network::configured_broker_confines_the_run # this pasta cannot map the host loopback for a broker
 network::deny_inside_an_allowed_range # the host's address is the sandbox's own (QEMU slirp)
 network::dns_dropped_without_a_wildcard_rule # the host's address is the sandbox's own (QEMU slirp)
 network::every_stream_protocol_respects_port_rules # landlock does not enforce port rules before ABI 4
 network::the_bundled_profiles_connect_exactly_to_their_listed_sockets # the contract needs Landlock ABI 9 to observe
 reporting::a_granted_runtime_dir_with_no_connect_entry_prints_the_note # the note is about kernels where socket connect is controlled
 ? reporting::doctor_reports_the_fallback_observer # a helper is discoverable on this host
+? shell::brokered_shell_children_reach_only_the_selected_egress_proxy # this pasta cannot map the host loopback for a broker
 skip_log::the_skip_log_receives_distinct_variant_keys[first] # the canary runs, so both keys are expected
 skip_log::the_skip_log_receives_distinct_variant_keys[second] # the canary runs, so both keys are expected
