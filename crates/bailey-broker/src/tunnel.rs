@@ -1111,7 +1111,7 @@ fn is_dialable(ip: IpAddr) -> bool {
             octets[0] != 127
                 && octets[0] != 0
                 && !octets.starts_with(&[169, 254])
-                && octets[0] != 224
+                && !(224..240).contains(&octets[0])
                 && octets != [255, 255, 255, 255]
         }
         IpAddr::V6(ip) => {
@@ -1222,6 +1222,30 @@ mod tests {
             &client_hello(&other_extension()),
             "example.com"
         ));
+    }
+
+    /// The whole IPv4 multicast range is refused, not only 224: a rule
+    /// cannot name a group address, and 225 through 239 are multicast like
+    /// 224 is. The loopback, unspecified, link-local and broadcast forms
+    /// stay refused beside them; a global unicast stays dialable.
+    #[test]
+    fn every_ipv4_multicast_address_is_refused() {
+        for first in 224..240 {
+            let ip = IpAddr::V4(std::net::Ipv4Addr::new(first, 0, 0, 9));
+            assert!(
+                !is_dialable(ip),
+                "{ip} is multicast and must not be dialable"
+            );
+        }
+        assert!(!is_dialable(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)));
+        assert!(!is_dialable(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)));
+        assert!(!is_dialable(IpAddr::V4(std::net::Ipv4Addr::new(
+            169, 254, 1, 1
+        ))));
+        assert!(!is_dialable(IpAddr::V4(std::net::Ipv4Addr::BROADCAST)));
+        assert!(is_dialable(IpAddr::V4(std::net::Ipv4Addr::new(
+            203, 0, 113, 9
+        ))));
     }
 
     #[test]
