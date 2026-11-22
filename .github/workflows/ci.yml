@@ -49,7 +49,7 @@ jobs:
         run: cargo run -p bailey --quiet -- doctor || true
 
       - name: Test
-        run: cargo test
+        run: cargo test --no-fail-fast
 
   # Delegation through the systemd user manager is tested only by
   # hand, because whether a runner has a user manager it may hand over a
@@ -178,7 +178,7 @@ jobs:
         run: cargo run -p bailey --quiet -- doctor || true
 
       - name: Test
-        run: cargo test
+        run: cargo test --no-fail-fast
 
       - name: Install the musl toolchain
         run: sudo apt-get update && sudo apt-get install -y musl-tools
