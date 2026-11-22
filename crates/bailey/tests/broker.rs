@@ -257,12 +257,15 @@ fn a_confined_broker_cannot_reach_the_callers_files_or_unix_sockets() {
     );
     // Sanity: the internet families are not what is broken.
     assert_eq!(probe_value(&probes, "inet-socket"), "ok", "{probes:?}");
-    // The ungranted TCP port is refused by Landlock, not by the address.
-    let tcp = probe_value(&probes, "tcp-connect");
-    assert!(
-        tcp != "ok",
-        "the broker connected to an ungranted port: {probes:?}"
-    );
+    // The ungranted TCP port is refused by Landlock, not by the address,
+    // where the kernel has network rules at all (Landlock ABI 4).
+    if bailey::backend::probe::landlock_abi().is_some_and(|abi| abi >= 4) {
+        let tcp = probe_value(&probes, "tcp-connect");
+        assert!(
+            tcp != "ok",
+            "the broker connected to an ungranted port: {probes:?}"
+        );
+    }
 
     // Hold the listeners to the end of the test: the probes must answer
     // against services that are listening.

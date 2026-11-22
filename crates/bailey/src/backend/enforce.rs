@@ -3109,8 +3109,10 @@ pub fn confine_broker(http: &crate::policy::HttpPolicy) -> io::Result<crate::bro
         // A portless allowance allows every port to its host, and no set of
         // port grants covers that, so the connect layer is left unhandled
         // and the broker's ACL is the boundary. With only ported rules, the
-        // grants cover what they can produce.
-        if !broker_connects_any_port(http) {
+        // grants cover what they can produce. Before Landlock ABI 4 there is
+        // no network right to grant, so the broker's ports go unrestricted,
+        // which its layers report.
+        if version >= 4 && !broker_connects_any_port(http) {
             for port in broker_connect_ports(http) {
                 created = created
                     .add_rule(NetPort::new(port, AccessNet::ConnectTcp))
