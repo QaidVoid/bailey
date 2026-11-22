@@ -50,8 +50,17 @@ fn project(store: &Path) -> (tempfile::TempDir, PathBuf) {
 
 /// Run `script` in an outer confined shell launched from `dir`.
 fn outer(store: &Path, dir: &Path, script: &str) -> Output {
-    let mut child = Command::new(bailey())
-        .args(["shell", "--shell", "/bin/sh"])
+    outer_with(store, dir, None, script)
+}
+
+/// The same, with a config the outer shell itself is held to.
+fn outer_with(store: &Path, dir: &Path, config: Option<&Path>, script: &str) -> Output {
+    let mut command = Command::new(bailey());
+    command.args(["shell", "--shell", "/bin/sh"]);
+    if let Some(config) = config {
+        command.arg("-c").arg(config);
+    }
+    let mut child = command
         .current_dir(dir)
         .env("XDG_DATA_HOME", store)
         .stdin(Stdio::piped())
@@ -242,6 +251,126 @@ fn a_nested_run_refuses_egress_rules_it_cannot_enforce() {
     assert!(
         stderr.contains("nested"),
         "the refusal says the run is nested: {stderr}"
+    );
+}
+
+/// An outer run allowing every host on 443 leaves the inner run the same
+/// contract whatever it inherits: a policy naming a broker is refused,
+/// because a nested run cannot establish one.
+#[test]
+fn a_nested_broker_is_refused_whatever_the_outer_allows() {
+    if !isolation_active() {
+        common::skip("isolation unavailable on this host");
+        return;
+    }
+    let store = tempfile::tempdir().unwrap();
+    let (_root, dir) = project(store.path());
+    fs::write(
+        dir.join("outer-443.toml"),
+        "[filesystem]\nread = [\".\"]\n\n[network]\n\
+         egress_allow = [{ host = \"*\", port = 443 }]\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("inner-broker.toml"),
+        "[filesystem]\nread = [\".\"]\n\n[network]\nbroker = \"127.0.0.1:8081\"\n",
+    )
+    .unwrap();
+
+    let output = outer_with(
+        store.path(),
+        &dir,
+        Some(&dir.join("outer-443.toml")),
+        "./bailey-bin run -c inner-broker.toml /bin/true\n",
+    );
+
+    assert!(
+        !output.status.success(),
+        "a nested run must refuse a policy naming a broker: stdout {} stderr {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("nested") && stderr.contains("broker"),
+        "the refusal names the nesting and the broker: {stderr}"
+    );
+}
+
+/// A port-only allowance is all a nested run can carry on its own, so it
+/// runs and its summary names the Landlock ports it applies, rather than
+/// leaving a run that restricts ten ports reading like one that restricts
+/// none.
+#[test]
+fn an_inner_run_with_a_port_only_allowance_reports_its_ports() {
+    if !isolation_active() {
+        common::skip("isolation unavailable on this host");
+        return;
+    }
+    let store = tempfile::tempdir().unwrap();
+    let (_root, dir) = project(store.path());
+    fs::write(
+        dir.join("ports.toml"),
+        "[filesystem]\nread = [\".\"]\n\n[network]\n\
+         egress_allow = [{ host = \"*\", port = 443 }, { host = \"*\", port = 80 }]\n",
+    )
+    .unwrap();
+
+    let output = outer(
+        store.path(),
+        &dir,
+        "./bailey-bin run -c ports.toml /bin/true\n",
+    );
+
+    assert!(
+        output.status.success(),
+        "a port-only allowance runs nested: stdout {} stderr {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("nested run"),
+        "the summary says the network is the sandbox's inheritance: {stderr}"
+    );
+    assert!(
+        stderr.contains("egress destinations (Landlock): tcp *:443; tcp *:80"),
+        "the summary names the ports the run's own layer carries: {stderr}"
+    );
+}
+
+/// A forward needs a namespace of the run's own to land in, so a nested
+/// run carrying one is refused.
+#[test]
+fn a_nested_forward_is_refused() {
+    if !isolation_active() {
+        common::skip("isolation unavailable on this host");
+        return;
+    }
+    let store = tempfile::tempdir().unwrap();
+    let (_root, dir) = project(store.path());
+    fs::write(
+        dir.join("forward.toml"),
+        "[filesystem]\nread = [\".\"]\n\nforward = [{ port = 8080, host_port = 9090 }]\n",
+    )
+    .unwrap();
+
+    let output = outer(
+        store.path(),
+        &dir,
+        "./bailey-bin run -c forward.toml /bin/true\n",
+    );
+
+    assert!(
+        !output.status.success(),
+        "a nested run must refuse a policy carrying a forward: stdout {} stderr {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("nested") && stderr.contains("forward"),
+        "the refusal names the nesting and the forward: {stderr}"
     );
 }
 
