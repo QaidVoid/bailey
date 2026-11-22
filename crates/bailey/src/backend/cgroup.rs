@@ -418,8 +418,34 @@ fn scope_gate_stop() -> Option<String> {
         );
     }
     systemd_init_reason()
+        .or_else(manager_tree_reason)
         .or_else(linger_reason)
         .or_else(socket_reason)
+}
+
+/// The user manager can move only processes inside its own tree, so a
+/// caller in an SSH or TTY login's session scope, or in a system service, is
+/// left out: asking anyway creates a scope the manager cannot put bailey in.
+fn manager_tree_reason() -> Option<String> {
+    let path = fs::read_to_string("/proc/self/cgroup").ok()?;
+    let own = path
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))?
+        .trim()
+        .to_owned();
+    (!inside_user_manager(&own, caller_uid())).then(|| {
+        format!(
+            "bailey runs in {own}, outside the user manager's tree, which the manager \
+             cannot move it out of; start the shell under the manager with: \
+             systemd-run --user --pty $SHELL"
+        )
+    })
+}
+
+/// Whether a cgroup path lies beneath the user manager of `uid`.
+fn inside_user_manager(cgroup: &str, uid: u32) -> bool {
+    let manager = format!("user@{uid}.service");
+    cgroup.split('/').any(|component| component == manager)
 }
 
 fn systemd_init_reason() -> Option<String> {
@@ -546,6 +572,26 @@ fn enter_supervisor_leaf() -> io::Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn only_a_caller_in_the_manager_tree_may_ask() {
+        assert!(inside_user_manager(
+            "/user.slice/user-1000.slice/user@1000.service/app.slice/term.scope",
+            1000
+        ));
+        assert!(!inside_user_manager(
+            "/user.slice/user-1000.slice/session-3.scope",
+            1000
+        ));
+        assert!(!inside_user_manager(
+            "/system.slice/hosted-compute-agent.service",
+            1000
+        ));
+        assert!(!inside_user_manager(
+            "/user.slice/user-1001.slice/user@1001.service/app.slice",
+            1000
+        ));
+    }
 
     #[test]
     fn controllers_follow_the_limits_that_are_set() {

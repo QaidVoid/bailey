@@ -27,7 +27,18 @@ fn user_manager_available() -> bool {
         return false;
     }
     let user = std::env::var("USER").unwrap_or_default();
-    Path::new("/var/lib/systemd/linger").join(&user).exists()
+    if !Path::new("/var/lib/systemd/linger").join(&user).exists() {
+        return false;
+    }
+    // The manager can move only a process inside its own tree.
+    let manager = format!("user@{}.service", unsafe { libc::getuid() });
+    std::fs::read_to_string("/proc/self/cgroup")
+        .map(|content| {
+            content
+                .split('/')
+                .any(|component| component.trim() == manager)
+        })
+        .unwrap_or(false)
 }
 
 fn config_with_limits(dir: &Path) -> PathBuf {

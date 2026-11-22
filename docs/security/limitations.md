@@ -387,9 +387,11 @@ their own.
 On a systemd host where the search finds no delegated subtree, bailey asks the
 user manager for a delegated scope instead. The manager identifies bailey by
 the connection's peer credentials, so no other process can be moved in bailey's
-place, but the terms are the manager's: it must linger, or a detached run
-would be killed at the last logout, and its private socket must be owned and
-served by the calling uid. A process the target leaves behind keeps the scope
+place, but the terms are the manager's. bailey must already run inside the
+manager's own tree, since the manager cannot move a process out of an SSH or
+TTY login's session scope or out of a system service. The manager must linger,
+or a detached run would be killed at the last logout. Its private socket must
+be owned and served by the calling uid. A process the target leaves behind keeps the scope
 alive after bailey exits, where it is visible under `systemctl --user`; the
 run's own cgroup is still removed. Hosts without systemd are unchanged and
 keep needing `BAILEY_CGROUP_ROOT`.

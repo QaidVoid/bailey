@@ -36,9 +36,10 @@ came from:
   cgroup delegation: memory, pids, cpu (systemd user scope)
 ```
 
-or the one reason a scope could not be had: no systemd, a user manager that does
-not linger (`loginctl enable-linger` to opt in), a private socket that is
-missing or not served by your uid, or the manager's own refusal.
+or the one reason a scope could not be had: no systemd, a process outside the
+user manager's tree (an SSH or TTY login, or a system service), a user manager
+that does not linger (`loginctl enable-linger` to opt in), a private socket
+that is missing or not served by your uid, or the manager's own refusal.
 
 `doctor` starts the audit helper to find out whether it can really load its
 programs, rather than guessing from the file being present. The fallback

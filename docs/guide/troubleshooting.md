@@ -151,12 +151,16 @@ There is no writable delegated cgroup v2 for your session. On a systemd system,
 running inside a user session usually provides one; running from a bare TTY or an
 unusual init may not.
 
-Over SSH on a systemd host, bailey asks the user manager for a delegated scope
-instead. `bailey doctor` names whatever stopped that, and each reason has its
-own remedy:
+On a systemd host, bailey asks the user manager for a delegated scope instead.
+`bailey doctor` names whatever stopped that, and each reason has its own
+remedy:
 
 - systemd is not init, or there is no user manager: there is nothing to ask.
   `BAILEY_CGROUP_ROOT` pointing at a delegated directory is the way out.
+- bailey runs outside the user manager's tree, as anything started from an SSH
+  or TTY login does: such a login's processes sit in a session scope the
+  manager cannot move them out of. Start the shell under the manager with
+  `systemd-run --user --pty $SHELL`, and runs from it can be given a scope.
 - The user manager does not linger: `loginctl enable-linger` starts a manager
   that runs without a session, which is what lets bailey hand the scope back
   after the run instead of taking detached jobs (`tmux`, `nohup`) down at the

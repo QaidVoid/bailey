@@ -729,7 +729,7 @@ fn brokered_shell_children_reach_only_the_selected_egress_proxy() {
         return;
     }
     let pasta = bailey::cli::resolve_helper("pasta").unwrap();
-    if !bailey::cli::pasta_maps_host_loopback(&pasta) {
+    if !bailey::cli::pasta_supports(&pasta, "--map-host-loopback") {
         common::skip("this pasta cannot map the host loopback for a broker");
         return;
     }

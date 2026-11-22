@@ -1661,16 +1661,17 @@ fn pasta_arguments(
     pasta_args
 }
 
-/// Whether `pasta` can map the host's loopback to another address, which a
-/// broker's address needs. Releases before the option existed reject it as
-/// unrecognized, so its absence from `--help` is a refusal waiting to happen.
-pub fn pasta_maps_host_loopback(pasta: &std::path::Path) -> bool {
+/// Whether `pasta` knows `option`. Releases before an option existed reject
+/// it as unrecognized, so its absence from `--help` is a refusal waiting to
+/// happen: a broker needs `--map-host-loopback`, a published port
+/// `--host-lo-to-ns-lo`.
+pub fn pasta_supports(pasta: &std::path::Path, option: &str) -> bool {
     std::process::Command::new(pasta)
         .arg("--help")
         .output()
         .map(|out| {
-            String::from_utf8_lossy(&out.stdout).contains("--map-host-loopback")
-                || String::from_utf8_lossy(&out.stderr).contains("--map-host-loopback")
+            String::from_utf8_lossy(&out.stdout).contains(option)
+                || String::from_utf8_lossy(&out.stderr).contains(option)
         })
         .unwrap_or(false)
 }
@@ -1706,12 +1707,21 @@ fn wrap_in_private_namespace(
     let egress_addr = broker
         .and_then(crate::policy::Broker::external)
         .map(|(addr, _)| addr.to_string());
-    if egress_addr.is_some() && !pasta_maps_host_loopback(&pasta) {
-        anyhow::bail!(
-            "a broker needs pasta's --map-host-loopback, which the pasta at {} \
-             does not have; install a newer pasta. The run is refused",
-            pasta.display()
-        );
+    for (needed, option, feature) in [
+        (egress_addr.is_some(), "--map-host-loopback", "a broker"),
+        (
+            !publishes.is_empty(),
+            "--host-lo-to-ns-lo",
+            "a published port",
+        ),
+    ] {
+        if needed && !pasta_supports(&pasta, option) {
+            anyhow::bail!(
+                "{feature} needs pasta's {option}, which the pasta at {} does not \
+                 have; install a newer pasta. The run is refused",
+                pasta.display()
+            );
+        }
     }
     let pasta_args = pasta_arguments(
         egress_addr.as_deref(),

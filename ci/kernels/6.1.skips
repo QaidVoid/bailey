@@ -17,8 +17,10 @@ cgroup::a_session_without_delegation_gets_a_user_scope # the session already has
 cgroup::the_scope_is_gone_after_the_run # the session already has a delegated cgroup
 enforce::a_process_limit_holds_without_a_cgroup # a delegated cgroup takes the limit here
 generate::a_recorded_run_produces_a_policy_that_run_accepts # no audit helper with capabilities on this host
+? hook::the_snippets_parse_in_the_shells_they_are_for # a shell the snippets target is not installed
 isolation::a_connect_entry_binds_its_socket_and_nothing_else # socket connect control needs Landlock ABI 9
 nesting::an_inner_run_needs_its_own_connect_entry_for_an_outer_socket # this kernel cannot restrict connecting to a unix socket
+? network::a_brokered_run_names_destination_rules_superseded # this pasta lacks an option the test needs
 network::a_cidr_allow_carries_the_block_it_names # the host's address is the sandbox's own (QEMU slirp)
 network::a_datagram_to_an_unlisted_socket_is_refused # socket connect control needs Landlock ABI 9
 network::a_listed_socket_connects # socket connect control needs Landlock ABI 9
@@ -34,6 +36,8 @@ network::auto_mode_uses_the_private_namespace # the host's address is the sandbo
 network::deny_inside_an_allowed_range # the host's address is the sandbox's own (QEMU slirp)
 network::dns_dropped_without_a_wildcard_rule # the host's address is the sandbox's own (QEMU slirp)
 network::every_stream_protocol_respects_port_rules # landlock does not enforce port rules before ABI 4
+? network::proxy_net_occupied_publication_fails_before_hooks_or_target # this pasta lacks an option the test needs
+? network::proxy_net_publishes_only_requested_loopback_tcp_and_keeps_forwarding # this pasta lacks an option the test needs
 network::the_bundled_profiles_connect_exactly_to_their_listed_sockets # the contract needs Landlock ABI 9 to observe
 reporting::a_granted_runtime_dir_with_no_connect_entry_prints_the_note # the note is about kernels where socket connect is controlled
 ? reporting::doctor_reports_the_fallback_observer # a helper is discoverable on this host

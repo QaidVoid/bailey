@@ -96,6 +96,9 @@ bailey run /usr/bin/ip -o addr show scope global
 ```
 
 It needs pasta in a trusted system location and unprivileged user namespaces.
+A broker needs a pasta with `--map-host-loopback`, and a published port one with
+`--host-lo-to-ns-lo`. Older releases, such as the one Ubuntu 24.04 ships, lack
+both, and bailey refuses such a run with the reason rather than let pasta fail.
 Where either is missing, an explicit `private` mode refuses the run rather than
 silently staying on the host's network: the request is the policy's, and a
 downgrade would lie about where the session's traffic leaves from. The namespace

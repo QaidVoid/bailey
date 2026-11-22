@@ -4764,7 +4764,10 @@ mod tests {
             resolv,
             format!("nameserver {}\n", crate::cli::DNS_FORWARDER_V4)
         );
-        assert_eq!(files[1].1, PathBuf::from("/etc/resolv.conf"));
+        assert_eq!(
+            files[1].1,
+            generated_destination(Path::new("/etc/resolv.conf"))
+        );
         let _ = std::fs::remove_dir(&dir);
 
         // Nothing to generate, no directory and no files.

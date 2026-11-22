@@ -564,6 +564,16 @@ impl Drop for EchoServer {
     }
 }
 
+/// Whether the trusted pasta lacks `option`, skipping the test if so.
+fn pasta_lacks(option: &str) -> bool {
+    let pasta = bailey::cli::resolve_helper("pasta").unwrap();
+    if bailey::cli::pasta_supports(&pasta, option) {
+        return false;
+    }
+    common::skip(&format!("this pasta lacks {option}"));
+    true
+}
+
 fn proxy_net_available() -> bool {
     if python().is_none() || !netns_available() {
         common::skip("needs python3 and user namespaces");
@@ -981,9 +991,7 @@ fn configured_broker_confines_the_run() {
     if !proxy_net_available() {
         return;
     }
-    let pasta = bailey::cli::resolve_helper("pasta").unwrap();
-    if !bailey::cli::pasta_maps_host_loopback(&pasta) {
-        common::skip("this pasta cannot map the host loopback for a broker");
+    if pasta_lacks("--map-host-loopback") {
         return;
     }
     let broker = EchoServer::start();
@@ -1663,6 +1671,9 @@ fn a_brokered_run_names_destination_rules_superseded() {
     if !proxy_net_available() {
         return;
     }
+    if pasta_lacks("--map-host-loopback") {
+        return;
+    }
     let broker = EchoServer::start();
     let outside = EchoServer::start();
     let output = run_python(
@@ -1855,6 +1866,9 @@ fn proxy_net_publishes_only_requested_loopback_tcp_and_keeps_forwarding() {
     if !proxy_net_available() {
         return;
     }
+    if pasta_lacks("--host-lo-to-ns-lo") {
+        return;
+    }
     let forward = EchoServer::start();
     let hidden = EchoServer::start();
     let inside = TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -1984,6 +1998,9 @@ with selectors.DefaultSelector() as selector:
 #[test]
 fn proxy_net_occupied_publication_fails_before_hooks_or_target() {
     if !proxy_net_available() {
+        return;
+    }
+    if pasta_lacks("--host-lo-to-ns-lo") {
         return;
     }
     let occupied = TcpListener::bind(("127.0.0.1", 0)).unwrap();
