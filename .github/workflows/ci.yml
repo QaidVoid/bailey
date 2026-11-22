@@ -35,7 +35,7 @@ jobs:
         # BPF target, which the helper's build script and the guest job below
         # drive. `--all-features` would force its `bpf` feature on and try to
         # compile it for the host, which cannot work.
-        run: cargo clippy --workspace --exclude bailey-ebpf --all-targets --all-features -- -D warnings
+        run: cargo clippy --workspace --exclude bailey-ebpf --exclude bailey-bpf-helper --all-targets --all-features -- -D warnings
 
       - name: Build
         run: cargo build --all-targets
@@ -180,7 +180,12 @@ jobs:
       - name: Test
         run: cargo test
 
+      - name: Install the musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
       - name: Check the musl release target
+        env:
+          CC_aarch64_unknown_linux_musl: musl-gcc
         run: cargo check --all-targets --target aarch64-unknown-linux-musl
 
   # The shipped binaries are musl, where the same source behaves differently:
@@ -201,10 +206,18 @@ jobs:
         with:
           key: musl
 
+      # The broker's TLS stack builds C through cc, which needs a musl compiler.
+      - name: Install the musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
       - name: Check everything compiles for the release target
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
         run: cargo check --all-targets --target x86_64-unknown-linux-musl
 
       - name: Unit tests on the release target
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
         run: cargo test --target x86_64-unknown-linux-musl --lib
 
   # The eBPF programs, checked for the BPF target.

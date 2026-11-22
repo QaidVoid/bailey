@@ -63,7 +63,13 @@ jobs:
       # than on the ones whose glibc is new enough. The built-in egress broker
       # ships beside the tool: a `bailey` that names `broker = "builtin"`
       # refuses to run without it.
+      - name: Install the musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
       - name: Build
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
         run: cargo build --release --locked --target ${{ matrix.target }} -p bailey -p bailey-broker
 
       - name: Generate the completions and the man page
