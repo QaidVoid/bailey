@@ -1,14 +1,19 @@
+audit::a_path_swapped_after_observation_is_still_confined # landlock is unavailable on this host
 audit::a_short_lived_child_is_recorded_when_scoping_by_cgroup[ebpf] # no audit helper configured
 audit::an_audit_of_a_network_mode_it_cannot_honour_names_the_gap[ebpf] # no audit helper configured
 audit::an_ungranted_egress_attempt_is_refused_during_an_audit[ebpf] # no audit helper configured
 audit::an_unmeasured_peak_says_why[ebpf] # no audit helper configured
+? audit::auto_falls_back_without_a_helper # a helper is discoverable without BAILEY_BPF_HELPER
 audit::execution_of_a_child_program_is_recorded[ebpf] # no audit helper configured
+? audit::forced_ebpf_fails_without_a_helper # a helper is discoverable without BAILEY_BPF_HELPER
 audit::peaks_are_recorded_when_the_cgroup_carries_them[ebpf] # no audit helper configured
 audit::startup_access_is_recorded[ebpf] # no audit helper configured
 audit::the_target_is_confined_during_an_audit[ebpf] # no audit helper configured
+audit::the_target_is_confined_during_an_audit[seccomp] # landlock is unavailable on this host
 audit::unconfined_is_an_explicit_opt_in[ebpf] # no audit helper configured
 audit::unconfined_is_an_explicit_opt_in[seccomp] # --unconfined needs the eBPF observer
 bailey::backend::audit::tests::every_observer_path_records_a_usage # no audit helper with capabilities on this host
+broker::below_landlock_abi_six_the_layers_are_reported_and_unix_still_fails # this kernel has no Landlock network rules to report
 cgroup::a_cgroup_root_override_suppresses_the_scope_request # needs a systemd host
 cgroup::a_session_without_delegation_gets_a_user_scope # the session already has a delegated cgroup
 cgroup::the_scope_is_gone_after_the_run # the session already has a delegated cgroup
@@ -26,8 +31,25 @@ enforce::the_file_limit_is_reported_as_enforced # Landlock unavailable
 enforce::the_url_broker_refuses_non_web_schemes_through_a_run # Landlock unavailable
 enforce::ungranted_path_is_denied # Landlock unavailable
 generate::a_recorded_run_produces_a_policy_that_run_accepts # no audit helper with capabilities on this host
+isolation::a_connect_entry_binds_its_socket_and_nothing_else # socket connect control needs Landlock ABI 9
+nesting::an_inner_run_needs_its_own_connect_entry_for_an_outer_socket # this kernel cannot restrict connecting to a unix socket
+network::a_cidr_allow_carries_the_block_it_names # the host's address is the sandbox's own (QEMU slirp)
+network::a_datagram_to_an_unlisted_socket_is_refused # socket connect control needs Landlock ABI 9
+network::a_listed_socket_connects # socket connect control needs Landlock ABI 9
+network::a_server_the_target_starts_is_reachable_from_its_child # socket connect control needs Landlock ABI 9
+network::a_socket_reached_through_proc_self_root_is_still_refused # socket connect control needs Landlock ABI 9
+network::allow_all_with_a_deny_carries_egress_and_holds_the_deny # the host's address is the sandbox's own (QEMU slirp)
+network::an_allowed_destination_is_reached_and_other_hosts_dropped # the host's address is the sandbox's own (QEMU slirp)
+network::an_unlisted_socket_in_a_writable_grant_is_refused # socket connect control needs Landlock ABI 9
+network::an_unlisted_socket_is_refused_without_isolation_too # socket connect control needs Landlock ABI 9
+network::another_real_host_on_the_same_port_drops # the host's address is the sandbox's own (QEMU slirp)
 network::auto_mode_uses_the_private_namespace # the host's address is the sandbox's own (QEMU slirp)
+network::deny_inside_an_allowed_range # the host's address is the sandbox's own (QEMU slirp)
+network::dns_dropped_without_a_wildcard_rule # the host's address is the sandbox's own (QEMU slirp)
 network::every_stream_protocol_respects_port_rules # landlock does not enforce port rules before ABI 4
+network::the_bundled_profiles_connect_exactly_to_their_listed_sockets # the contract needs Landlock ABI 9 to observe
+reporting::a_granted_runtime_dir_with_no_connect_entry_prints_the_note # the note is about kernels where socket connect is controlled
+? reporting::doctor_reports_the_fallback_observer # a helper is discoverable on this host
 shell::a_command_in_the_shell_is_confined # no Landlock on this kernel
 shell::a_config_layer_can_retract_the_implicit_grant # no Landlock on this kernel
 shell::a_grandchild_process_is_confined # no Landlock on this kernel

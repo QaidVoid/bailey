@@ -130,7 +130,7 @@ set -u
 $wait_line
 PATH="$path" $repo/target/debug/bailey doctor 2>&1 | tee "$doctor_out"
 cd $repo
-PATH="$path:$repo/target/debug" RUST_TEST_THREADS=4 cargo test --offline
+PATH="$path:$repo/target/debug" RUST_TEST_THREADS=4 cargo test --offline --no-fail-fast
 status=\$?
 echo \$status > $test_status_file
 exit \$status
