@@ -1,5 +1,76 @@
 # Changelog
 
+## [0.3.0](https://github.com/QaidVoid/bailey/compare/v0.2.4...v0.3.0) - 2026-11-22
+
+### ⛰️  Features
+
+- *(audit)* Add unprivileged seccomp fallback observer - ([e061c29](https://github.com/QaidVoid/bailey/commit/e061c299e5bd1481de7d32a6670ba19e4c22bf01))
+- *(audit)* Measure peaks and suggest resources - ([5b13fe9](https://github.com/QaidVoid/bailey/commit/5b13fe97778ca7b909ddeb65bff41a4e3f38b5f7))
+- *(broker)* Log one json line per decision and stop on sigterm - ([8c05ed3](https://github.com/QaidVoid/bailey/commit/8c05ed3b6acf924e7a4c3f7a9e3a126eaa5d6be2))
+- *(broker)* Add the request codec, tls ca and tunnel engine - ([d8d78e3](https://github.com/QaidVoid/bailey/commit/d8d78e3efaf3e096db709488868b35d8ce02acf4))
+- *(config)* Parse destination, deny and dns egress rules - ([14cf9f2](https://github.com/QaidVoid/bailey/commit/14cf9f2fd5b2c822e373c8e575610b0e8f644edc))
+- *(egress)* Report destination rules and dns in the summary - ([b8c44f9](https://github.com/QaidVoid/bailey/commit/b8c44f9489e237f46b9a1f726b4a64d7da51f172))
+- *(egress)* Enforce destination rules in the private namespace - ([0d88c9e](https://github.com/QaidVoid/bailey/commit/0d88c9e1005b3523b7fb6ae676ead054d0770804))
+- *(egress)* Resolve and pin hostname rules before the run - ([6317383](https://github.com/QaidVoid/bailey/commit/631738342d256a48b3e1b8d26a559d9b67ef22a7))
+- *(enforce)* [**breaking**] Connect needs a listed socket - ([3f57248](https://github.com/QaidVoid/bailey/commit/3f572485ae809238209f2460740fd68fa99dd34e))
+- *(http)* Wire the builtin broker into runs and the summary - ([c1f32bd](https://github.com/QaidVoid/bailey/commit/c1f32bd645c7043c79448b7a27b0c3857e8f9202))
+- *(http)* Add the bailey-broker crate and the wire protocol - ([4818e30](https://github.com/QaidVoid/bailey/commit/4818e3022bba104a2d86b27c28e357020252cc1b))
+- *(http)* Report the broker rules and credentials in show - ([ea6c961](https://github.com/QaidVoid/bailey/commit/ea6c961d267b5d472ab32f79f98620c2fc13c30a))
+- *(http)* Add the http quick grants and the builtin broker flag - ([3615f15](https://github.com/QaidVoid/bailey/commit/3615f1510c2ab61d4c30ca7c0b3b3cf56e28c371))
+- *(http)* Gate credential and log keys by layer origin - ([b3478da](https://github.com/QaidVoid/bailey/commit/b3478daf1825081dbbca0b7cb06532bd88be4c8b))
+- *(http)* Resolve intercept coverage and broker requirements - ([c9c99b6](https://github.com/QaidVoid/bailey/commit/c9c99b6c0b175d108100eeb1299518e5bd303e91))
+- *(http)* Parse the http tables and the builtin broker value - ([15e0a39](https://github.com/QaidVoid/bailey/commit/15e0a39cda659eb48cf9eee65128618dfeb82ea7))
+- *(http)* Add the canonical path and request host checks - ([03d5d06](https://github.com/QaidVoid/bailey/commit/03d5d06d200c1a5ea55bbdd57a43df0362dfbf81))
+- *(http)* Add the http rule model and matcher - ([ec6a138](https://github.com/QaidVoid/bailey/commit/ec6a1381e563f4b9337e132f088dc1f5df6ced24))
+- *(network)* Choose the network mode from the policy - ([ecab72d](https://github.com/QaidVoid/bailey/commit/ecab72d392c1ac1306904211bcc0cf131308277d))
+- *(network)* Forward and publish ports under --proxy-net - ([4fb8580](https://github.com/QaidVoid/bailey/commit/4fb85800d9e9a8ade2774c08e3d428b158f0dffe))
+- *(resources)* Ask the user manager for a delegated scope - ([8015eb9](https://github.com/QaidVoid/bailey/commit/8015eb96b6e90cab3d3c8f609af6ce68e3533ba3))
+- *(resources)* Add open-file and address-space rlimit fallbacks - ([51e407a](https://github.com/QaidVoid/bailey/commit/51e407a612ff6ae201849953093a216be5c1b4c2))
+
+### 🐛 Bug Fixes
+
+- *(audit)* Read an int syscall argument from its low half - ([5ad91a2](https://github.com/QaidVoid/bailey/commit/5ad91a223e4c027d539cb62bb7751b125b189c04))
+- *(audit)* Give a target memory read a second - ([9ab2d77](https://github.com/QaidVoid/bailey/commit/9ab2d77fecf432627c69d9c67c810e68c78ddfda))
+- *(broker)* Grant no connect port below landlock abi 4 - ([4fd64e6](https://github.com/QaidVoid/bailey/commit/4fd64e67b60f1f1c7d273eee6f81cbd62c850642))
+- *(cli)* Refuse all root-to-root uid mappings in the guard - ([4ca46ef](https://github.com/QaidVoid/bailey/commit/4ca46ef7fa1ec053e7fb4f2f0d103c928d8265dc))
+- *(enforce)* Carry a sandbox setup refusal to the user - ([ed222fb](https://github.com/QaidVoid/bailey/commit/ed222fb3ce573d6f3b641220246eac840a7ab512))
+- *(enforce)* Remove generated-file staging on the host - ([dc33bef](https://github.com/QaidVoid/bailey/commit/dc33bef01e0e62f3e4f845746c5adca68bb6881d))
+- *(enforce)* Refuse MPTCP and SMC sockets to close egress bypass - ([0c80828](https://github.com/QaidVoid/bailey/commit/0c8082877ca75e011fd8ef0a2ca81e43288791dc))
+- *(enforce)* Name the signal that killed the target - ([98d74a6](https://github.com/QaidVoid/bailey/commit/98d74a6b14a57c5280c76ae5b0366d4d27fd01df))
+- *(isolation)* Remount read-only paths where links lead - ([396da05](https://github.com/QaidVoid/bailey/commit/396da05de0b6dc08aa9e94ddce694000365d7dab))
+- *(isolation)* Refuse nested namespaces with a kernel limit - ([e6ec414](https://github.com/QaidVoid/bailey/commit/e6ec4140719a0ccf351e5c101da04c63dd05817f))
+- *(network)* Refuse a broker when pasta cannot map loopback - ([0748af9](https://github.com/QaidVoid/bailey/commit/0748af97071398197d74a8ad8ea03a2272eb67cc))
+- *(network)* Place a generated resolver where its link leads - ([d065b35](https://github.com/QaidVoid/bailey/commit/d065b35b8c7b8dff4a153add4a64ee0e54f8b462))
+- *(run)* Drop the stale-justified loopback rules in broker mode - ([212b521](https://github.com/QaidVoid/bailey/commit/212b521cc014cb538653a9b1ae53ec0509122f09))
+- *(run)* Drop the broker credentials once handed over - ([c489471](https://github.com/QaidVoid/bailey/commit/c48947100a6454b419ee4ffc8f4b19c0ae05ea8b))
+- *(tests)* Drop a needless format in the credential hook probe - ([54b0b6c](https://github.com/QaidVoid/bailey/commit/54b0b6cf23cd34f8164ef2a49db272e03a0b3ce2))
+- Hold ci on ubuntu runners and old pasta - ([115c85d](https://github.com/QaidVoid/bailey/commit/115c85dd4f17f8841e3e0d918e319982644a83e3))
+- Correct network mode handling and root guard detection - ([32b7390](https://github.com/QaidVoid/bailey/commit/32b73902be8d4e77b869945378bf4e8b6440d7aa))
+
+### 📚 Documentation
+
+- *(egress)* Document destination rules, dns and their limits - ([40d8c8e](https://github.com/QaidVoid/bailey/commit/40d8c8efbfa9106350b80b0eb6768889a2972332))
+- *(enforce)* Hold the enforcement page to the filter - ([3b6e4ee](https://github.com/QaidVoid/bailey/commit/3b6e4ee4b2de4a5f30d01bfe4b47bd0e3794d8e3))
+
+### 🎨 Styling
+
+- Apply rustfmt to the network files - ([cb47fe0](https://github.com/QaidVoid/bailey/commit/cb47fe0d8b1357c3403ba738a28e7b34eddcf324))
+
+### 🧪 Testing
+
+- *(egress)* Cover destination rules, dns and the broker - ([2efc483](https://github.com/QaidVoid/bailey/commit/2efc483183d9cc8518a0b3231fa128bbcb0bf331))
+- *(http)* Cover the log refusals and the counts line - ([ad9dcc6](https://github.com/QaidVoid/bailey/commit/ad9dcc63e940a50404c61722c7a4d3b55fee73cc))
+- *(http)* Cover broker runs, the ca bundle and credentials - ([a315532](https://github.com/QaidVoid/bailey/commit/a315532d91c37436f8f590073667fad48f1f0717))
+- *(nesting)* Cover what a nested run refuses and reports - ([f2ab16e](https://github.com/QaidVoid/bailey/commit/f2ab16e164a8657ef72ba81a971d0fcf0daa57c1))
+- Tell the private-mode refusals apart by their cause - ([aed9259](https://github.com/QaidVoid/bailey/commit/aed92594b5897cdc597300eeefdc613319bca0e2))
+- Hold the suite on ci runners and older kernels - ([ea4925c](https://github.com/QaidVoid/bailey/commit/ea4925c9ab0fb68196ca88ccb100503b73109b4f))
+
+### ⚙️ Miscellaneous Tasks
+
+- *(ci)* Track kernel matrix fixtures and skip log canary - ([daf5f9b](https://github.com/QaidVoid/bailey/commit/daf5f9b7683ad5bcebaa3fe7f80f4564a946db41))
+- *(fmt)* Apply the current rustfmt to the workspace - ([810290c](https://github.com/QaidVoid/bailey/commit/810290cecdc502edc1e13d6bb3b49ca9f5671aa3))
+- Run the suite on a kernel matrix - ([3a98976](https://github.com/QaidVoid/bailey/commit/3a989763bee6bc70571609aa746022a44480174a))
+
 ## [0.2.4](https://github.com/QaidVoid/bailey/compare/v0.2.3...v0.2.4) - 2026-10-12
 
 ### ⛰️  Features

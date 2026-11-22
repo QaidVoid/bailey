@@ -7,7 +7,7 @@ repository.workspace = true
 description = "The built-in HTTP egress broker bailey spawns beside the sandbox"
 
 [dependencies]
-bailey = { path = "../bailey", version = "0.2.4" }
+bailey = { path = "../bailey", version = "0.3.0" }
 serde_json = "1"
 libc = "0.2"
 rcgen = "0.13"
