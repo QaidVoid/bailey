@@ -3767,6 +3767,12 @@ mod tests {
     /// the `seccomp_data` layout defines, and refuse exactly MPTCP and SMC.
     /// The probe is built field by field, so a wrong offset in the guards
     /// reads the wrong word and fails here.
+    /// An architecture other than the one the filter was built for.
+    #[cfg(target_arch = "x86_64")]
+    const FOREIGN_AUDIT_ARCH: u32 = 0xc000_00b7;
+    #[cfg(target_arch = "aarch64")]
+    const FOREIGN_AUDIT_ARCH: u32 = 0xc000_003e;
+
     #[test]
     fn the_socket_guards_read_the_low_words_of_the_family_and_protocol() {
         assert_eq!(std::mem::offset_of!(SeccompDataProbe, args), 16);
@@ -3849,7 +3855,7 @@ mod tests {
             "a non-socket call must leave the guard block untouched"
         );
         assert_eq!(
-            probe(socket, 0xc000_00b7, libc::AF_INET, 0),
+            probe(socket, FOREIGN_AUDIT_ARCH, libc::AF_INET, 0),
             Some(SECCOMP_RET_ERRNO | libc::EPERM as u32),
             "a foreign architecture must still be refused with EPERM"
         );

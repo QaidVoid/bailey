@@ -134,7 +134,7 @@ fn policy_toml(work: &Path, sources: &[(&str, &str, &str)], deny_private: bool) 
 /// intercepted, both stubbed upstreams recording every header. The secret
 /// reaches each upstream as the attached header and is found nowhere else:
 /// not in the target's environment, not in the hook's, not in the broker's
-/// `/proc` environ, not in `ps`, and descriptor 7 is gone for the hook and
+/// `/proc` environ, not in `ps`, and descriptor 77 is gone for the hook and
 /// the target alike.
 #[test]
 fn a_credential_rides_the_broker_and_lands_nowhere_else() {
@@ -159,7 +159,7 @@ fn a_credential_rides_the_broker_and_lands_nowhere_else() {
                 &work,
                 &[
                     ("cred.test", "bearer", "env:BAILEY_TEST_SECRET"),
-                    ("cred2.test", "header:x-api-key", "fd:7"),
+                    ("cred2.test", "header:x-api-key", "fd:77"),
                 ],
                 true
             ),
@@ -171,14 +171,14 @@ fn a_credential_rides_the_broker_and_lands_nowhere_else() {
     let secret_path = dir.path().join("secret.txt");
     fs::write(&secret_path, SECRET).unwrap();
 
-    // The probe the hook runs: it tries descriptor 7 and names what it
+    // The probe the hook runs: it tries descriptor 77 and names what it
     // sees of the secret's variable, into a file the test reads after.
     fs::write(
         work.join("hook_probe.py"),
         "import os, sys\n\
          try:\n\
-         \x20   os.lseek(7, 0, os.SEEK_SET)\n\
-         \x20   data = os.read(7, 64)\n\
+         \x20   os.lseek(77, 0, os.SEEK_SET)\n\
+         \x20   data = os.read(77, 64)\n\
          \x20   seen = 'LEAKED:' + data.decode(errors='replace')\n\
          except OSError as e:\n\
          \x20   seen = 'EBADF' if e.errno == 9 else 'ERRNO:%d' % e.errno\n\
@@ -187,7 +187,7 @@ fn a_credential_rides_the_broker_and_lands_nowhere_else() {
     )
     .unwrap();
 
-    // The target's probe: descriptor 7, the variable, and two requests
+    // The target's probe: descriptor 77, the variable, and two requests
     // through the broker, the first carrying an Authorization of its own
     // for the broker to replace.
     let target_probe = r#"
@@ -196,8 +196,8 @@ from urllib.parse import urlparse
 
 out = {}
 try:
-    os.lseek(7, 0, os.SEEK_SET)
-    data = os.read(7, 64)
+    os.lseek(77, 0, os.SEEK_SET)
+    data = os.read(77, 64)
     out['fd7'] = 'LEAKED:' + data.decode(errors='replace')
 except OSError as e:
     out['fd7'] = 'EBADF' if e.errno == 9 else 'ERRNO:%d' % e.errno
@@ -370,24 +370,24 @@ for address in ('10.0.0.7', '10.0.0.8'):
     threading.Thread(target=server.serve_forever, daemon=True).start()
     servers.append(server)
 
-# The descriptor source: a secret regular file on descriptor 7, with no
+# The descriptor source: a secret regular file on descriptor 77, with no
 # close-on-exec flag. Descriptor 7 must be free; the dup happens before
 # bailey is spawned, and pass_fds carries it across.
 try:
-    fcntl.fcntl(7, fcntl.F_GETFD)
-    print(json.dumps({'error': 'descriptor 7 is not free'}))
+    fcntl.fcntl(77, fcntl.F_GETFD)
+    print(json.dumps({'error': 'descriptor 77 is not free'}))
     sys.exit(3)
 except OSError:
     pass
 source = os.open(secret_path, os.O_RDONLY)
-os.dup2(source, 7)
+os.dup2(source, 77)
 os.close(source)
 
 env = dict(os.environ)
 env['BAILEY_TEST_SECRET'] = SECRET
 run = subprocess.Popen(
     [bailey_path, 'run', '-c', config_path, '/usr/bin/python3', work + '/target_probe.py'],
-    cwd=work, pass_fds=(7,), env=env,
+    cwd=work, pass_fds=(77,), env=env,
     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 def find_broker(timeout=20):
@@ -583,7 +583,7 @@ print(json.dumps(report), flush=True)
     let hook = fs::read_to_string(work.join("hook-fd7.txt")).unwrap();
     assert!(
         hook.starts_with("EBADF SECRET=ABSENT"),
-        "the hook must find neither descriptor 7 nor the variable: {hook}"
+        "the hook must find neither descriptor 77 nor the variable: {hook}"
     );
 
     // The broker's own environment, however it was asked for, holds no

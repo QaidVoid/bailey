@@ -1177,6 +1177,10 @@ mod tests {
 
     #[test]
     fn a_guard_of_one_leaves_room_for_exactly_one_child_namespace() {
+        if !crate::backend::isolation::available() {
+            skip("user namespaces unavailable on this host");
+            return;
+        }
         assert_eq!(
             child_exit_code(|| {
                 let uid = unsafe { libc::getuid() };
@@ -1201,6 +1205,10 @@ mod tests {
 
     #[test]
     fn a_guard_of_zero_refuses_the_first_child_namespace() {
+        if !crate::backend::isolation::available() {
+            skip("user namespaces unavailable on this host");
+            return;
+        }
         assert_eq!(
             child_exit_code(|| {
                 if create_guard_namespace(0).is_err() {
@@ -1217,6 +1225,10 @@ mod tests {
 
     #[test]
     fn raising_the_limit_in_an_inner_namespace_does_not_lift_the_guard() {
+        if !crate::backend::isolation::available() {
+            skip("user namespaces unavailable on this host");
+            return;
+        }
         assert_eq!(
             child_exit_code(|| {
                 let uid = unsafe { libc::getuid() };

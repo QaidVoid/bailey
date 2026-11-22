@@ -477,6 +477,12 @@ fn a_foreign_descriptor_does_not_reach_the_broker() {
 /// still fail, because the seccomp family filter is the boundary.
 #[test]
 fn below_landlock_abi_six_the_layers_are_reported_and_unix_still_fails() {
+    // The hook lowers the ABI bailey believes in. It cannot raise what the
+    // kernel has, so a kernel below ABI 4 has nothing to pretend with.
+    if !bailey::backend::probe::landlock_abi().is_some_and(|abi| abi >= 4) {
+        common::skip("this kernel has no Landlock network rules to report");
+        return;
+    }
     let forced = std::ffi::OsString::from("4");
 
     // The layers, from the ready line.

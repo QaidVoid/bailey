@@ -174,3 +174,15 @@ pub fn assert_every_namespace_route_refused(layout: &str, stdout: &str) {
         "{layout}: the target must not gain capabilities in a new user namespace: {stdout}"
     );
 }
+
+/// Whether the running kernel is at least `major.minor`, read from
+/// `/proc/sys/kernel/osrelease`.
+#[allow(dead_code)]
+pub fn kernel_at_least(major: u32, minor: u32) -> bool {
+    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap_or_default();
+    let mut numbers = release
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .map(|part| part.parse::<u32>().unwrap_or(0));
+    (numbers.next().unwrap_or(0), numbers.next().unwrap_or(0)) >= (major, minor)
+}

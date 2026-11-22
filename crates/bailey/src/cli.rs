@@ -5052,7 +5052,11 @@ mod tests {
         let mut policy = Policy::default();
         policy.network.mode = crate::policy::NetworkMode::Private;
         policy.network.dns = crate::policy::DnsSetting::Deny;
-        prepare_network(&mut policy, &NetworkArgs::default(), true, false, None).unwrap();
+        // A host without pasta or nft refuses private mode for that reason,
+        // which says nothing about DNS.
+        if let Err(err) = prepare_network(&mut policy, &NetworkArgs::default(), true, false, None) {
+            assert!(!err.to_string().contains("DNS"), "{err}");
+        }
     }
 
     /// The resolver is libc's, asked on the host before anything forks, so a

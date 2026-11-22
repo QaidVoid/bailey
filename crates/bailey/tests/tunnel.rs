@@ -748,14 +748,15 @@ with open('/etc/hosts', 'w') as hosts:
 with open('/etc/resolv.conf', 'w') as resolv:
     resolv.write('nameserver 127.0.0.1\n')
 
-# The listener the broker serves; descriptor 3 in the broker. Bound first,
-# so it takes the lowest free descriptor.
+# The listener the broker serves; descriptor 3 in the broker. A caller can
+# leave descriptor 3 open, so the listener is placed there rather than
+# assumed to land on it.
 listener = socket.socket()
 listener.bind(('127.0.0.1', 0))
 listener.listen(16)
 port = listener.getsockname()[1]
-listener_fd = listener.fileno()
-assert listener_fd == 3, f'the listener landed on {listener_fd}'
+if listener.fileno() != 3:
+    os.dup2(listener.fileno(), 3)
 
 # Loopback in a fresh network namespace starts down.
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)

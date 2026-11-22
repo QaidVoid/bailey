@@ -175,6 +175,11 @@ fn an_inner_run_needs_its_own_connect_entry_for_an_outer_socket() {
         common::skip("/usr/bin/python3 unavailable");
         return;
     }
+    // Connecting to a pathname socket became a Landlock right at ABI 9.
+    if !bailey::backend::probe::landlock_abi().is_some_and(|abi| abi >= 9) {
+        common::skip("this kernel cannot restrict connecting to a unix socket");
+        return;
+    }
     let store = tempfile::tempdir().unwrap();
     let (_root, dir) = project(store.path());
     // The second config adds the connect entry the first leaves out.

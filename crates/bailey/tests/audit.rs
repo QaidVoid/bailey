@@ -37,11 +37,24 @@ fn the_helper_is_found_on_path() {
     let bailey_copy = elsewhere.join("bailey");
     fs::copy(bailey(), &bailey_copy).unwrap();
 
-    let output = Command::new(&bailey_copy)
-        .arg("doctor")
-        .env("PATH", dir.path())
-        .env_remove("BAILEY_BPF_HELPER")
-        .output()
+    // The copy was just written, and a test forking in parallel can hold its
+    // descriptor for a moment, which the kernel answers with ETXTBSY.
+    let output = (0..100)
+        .find_map(|_| {
+            match Command::new(&bailey_copy)
+                .arg("doctor")
+                .env("PATH", dir.path())
+                .env_remove("BAILEY_BPF_HELPER")
+                .output()
+            {
+                Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    None
+                }
+                other => Some(other),
+            }
+        })
+        .expect("the copy became executable")
         .unwrap();
     let report = String::from_utf8_lossy(&output.stdout);
 
@@ -264,6 +277,13 @@ fn confined_during_audit(observer: &str, helper: Option<&Path>) {
 
 #[test]
 fn the_target_is_confined_during_an_audit() {
+    // An audit cannot isolate yet, so Landlock is what confines it.
+    if bailey::backend::probe::landlock_abi().is_none() {
+        for observer in observers() {
+            common::skip_variant(observer, "landlock is unavailable on this host");
+        }
+        return;
+    }
     let helper = helper();
     for observer in observers() {
         confined_during_audit(observer, helper.as_deref());
@@ -539,6 +559,12 @@ fn peaks_recorded(observer: &str, helper: Option<&Path>) {
 /// holds more tasks at once than its own process, and allocates something.
 #[test]
 fn peaks_are_recorded_when_the_cgroup_carries_them() {
+    // `memory.peak` arrived in 5.19 and `pids.peak` in 6.1.
+    if !common::kernel_at_least(6, 1) {
+        common::skip_variant("ebpf", "this kernel reports no pids.peak");
+        common::skip_variant("seccomp", "this kernel reports no pids.peak");
+        return;
+    }
     if bailey::backend::cgroup::usable_root(&["memory", "pids"]).is_none() {
         common::skip_variant("ebpf", "no cgroup carrying memory and pids to measure in");
         common::skip_variant(
@@ -623,6 +649,10 @@ fn an_unmeasured_peak_says_why() {
 fn a_fallback_trace_carries_measured_usage() {
     if !fallback_available() {
         common::skip("the fallback observer is unavailable on this host");
+        return;
+    }
+    if !common::kernel_at_least(6, 1) {
+        common::skip("this kernel reports no pids.peak");
         return;
     }
     if bailey::backend::cgroup::usable_root(&[]).is_none() {
@@ -826,6 +856,10 @@ fn a_path_swapped_after_observation_is_still_confined() {
     };
     if !fallback_available() {
         common::skip("the fallback observer is unavailable on this host");
+        return;
+    }
+    if bailey::backend::probe::landlock_abi().is_none() {
+        common::skip("landlock is unavailable on this host");
         return;
     }
 
