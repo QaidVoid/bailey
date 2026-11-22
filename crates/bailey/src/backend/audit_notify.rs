@@ -45,7 +45,7 @@ use crate::event::{AccessEvent, AccessKind, Resolution, Resource};
 /// filesystem can block for seconds. The supervisor waits this long on the
 /// reader thread, then counts the access as dropped, continues the syscall,
 /// and replaces the reader.
-pub(crate) const MEMORY_READ_TIMEOUT: Duration = Duration::from_millis(100);
+pub(crate) const MEMORY_READ_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Abandonments over a whole run after which memory reads stop entirely.
 ///
@@ -1119,7 +1119,15 @@ mod tests {
             .events
             .iter()
             .find(|event| event.resource == Resource::Path(target.clone()))
-            .expect("the relative open resolves against the child's directory");
+            .unwrap_or_else(|| {
+                panic!(
+                    "the relative open resolves against the child's directory: \
+                     {} event(s), {} dropped: {:?}",
+                    outcome.events.len(),
+                    outcome.dropped,
+                    outcome.events
+                )
+            });
         assert_eq!(opened.resolution, Resolution::Userspace);
         assert_eq!(opened.kind, AccessKind::Read);
     }
