@@ -5073,10 +5073,10 @@ mod tests {
         let mut policy = Policy::default();
         policy.network.mode = crate::policy::NetworkMode::Private;
         policy.network.dns = crate::policy::DnsSetting::Deny;
-        // A host without pasta or nft refuses private mode for that reason,
-        // which says nothing about DNS.
+        // A host without pasta, nft or user namespaces refuses private mode
+        // for that reason, which is not the refusal above.
         if let Err(err) = prepare_network(&mut policy, &NetworkArgs::default(), true, false, None) {
-            assert!(!err.to_string().contains("DNS"), "{err}");
+            assert!(!err.to_string().contains("--no-isolate"), "{err}");
         }
     }
 
