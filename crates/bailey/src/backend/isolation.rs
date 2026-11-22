@@ -591,7 +591,12 @@ fn mount_tmpfs(target: &Path, size_bytes: u64, mode: &str) -> io::Result<()> {
 fn remount_read_only(new_root: &Path, paths: &[ReadOnly]) -> io::Result<()> {
     for entry in paths {
         let path = &entry.visible;
-        let relative = path.strip_prefix("/").unwrap_or(path);
+        let named = path.strip_prefix("/").unwrap_or(path);
+        // A directory on the way may be a link the root carries, such as
+        // `/usr/sbin` inside a bound `/usr`. The walk below stops at links, so
+        // the parent is resolved first, inside the root, where the link leads.
+        let resolved = parent_in_root(new_root, named)?;
+        let relative = resolved.as_path();
         if resolve_beneath(new_root, relative)?.is_none() {
             // A path this host does not have was never bound, so there is
             // nothing to remount and nothing to protect: a policy may name
@@ -827,6 +832,83 @@ fn mount_ca_bundle(new_root: &Path, source: &Path, overlays: &[PathBuf]) -> io::
         landed += 1;
     }
     Ok(landed)
+}
+
+/// `struct open_how`, the argument `openat2` takes.
+#[repr(C)]
+struct OpenHow {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
+
+/// `RESOLVE_IN_ROOT`: absolute links and `..` stay beneath the starting
+/// directory, so nothing resolved this way can leave the sandbox root.
+const RESOLVE_IN_ROOT: u64 = 0x10;
+/// `RESOLVE_NO_MAGICLINKS`: `/proc/<pid>/fd` style links are refused.
+const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+
+/// `relative` with the links in its parent directories resolved inside
+/// `root`, and its final component kept as named.
+///
+/// Links are followed only as far as the root reaches: an absolute link or a
+/// `..` resolves against `root` itself, never the host. A parent that does
+/// not exist is returned as named, so the caller's own existence check
+/// answers for it.
+fn parent_in_root(root: &Path, relative: &Path) -> io::Result<PathBuf> {
+    let (Some(parent), Some(name)) = (relative.parent(), relative.file_name()) else {
+        return Ok(relative.to_path_buf());
+    };
+    if parent.as_os_str().is_empty() {
+        return Ok(relative.to_path_buf());
+    }
+    let root_c = CString::new(root.as_os_str().as_encoded_bytes())
+        .map_err(|_| io::Error::other("the sandbox root holds a nul"))?;
+    let parent_c = CString::new(parent.as_os_str().as_encoded_bytes())
+        .map_err(|_| io::Error::other("a read-only path holds a nul"))?;
+    let root_fd = unsafe {
+        libc::open(
+            root_c.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if root_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let root_fd = unsafe { OwnedFd::from_raw_fd(root_fd) };
+    let how = OpenHow {
+        flags: (libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+        mode: 0,
+        resolve: RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS,
+    };
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            root_fd.as_raw_fd(),
+            parent_c.as_ptr(),
+            &how as *const OpenHow,
+            std::mem::size_of::<OpenHow>(),
+        )
+    };
+    if fd < 0 {
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ENOENT) | Some(libc::ENOTDIR) => Ok(relative.to_path_buf()),
+            _ => Err(error),
+        };
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+    let landed = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd()))?;
+    let inside = landed
+        .strip_prefix(root)
+        .map(Path::to_path_buf)
+        .map_err(|_| {
+            io::Error::other(format!(
+                "the read-only path {} resolved outside the sandbox root",
+                relative.display()
+            ))
+        })?;
+    Ok(inside.join(name))
 }
 
 /// Resolve an existing path beneath `root` without following a symlink.

@@ -1067,6 +1067,55 @@ fn a_connect_entry_binds_its_socket_and_nothing_else() {
         "the unlisted socket must not be visible in the runtime directory: {stdout}"
     );
 }
+
+/// A target found through a linked directory still runs.
+///
+/// Distributions that merged `/usr/sbin` into `/usr/bin` leave the old name as
+/// a link, so a `PATH` that lists it first finds the target through the link.
+/// The target's implicit grant was then remounted read-only by a walk that
+/// stops at links, and the whole run failed before the target started.
+#[test]
+fn a_target_found_through_a_linked_directory_runs() {
+    if !isolation_active() {
+        common::skip("isolation unavailable on this host");
+        return;
+    }
+    // The link sits inside a granted tree, as `/usr/sbin` does inside `/usr`,
+    // so the sandbox root carries the link itself.
+    let dir = tempfile::tempdir().unwrap();
+    let tree = dir.path().join("tree");
+    let real = tree.join("real");
+    fs::create_dir_all(&real).unwrap();
+    fs::write(real.join("prog"), "#!/bin/sh\necho ran\n").unwrap();
+    fs::set_permissions(real.join("prog"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let linked = tree.join("linked");
+    std::os::unix::fs::symlink("real", &linked).unwrap();
+    let config = dir.path().join("bailey.toml");
+    fs::write(
+        &config,
+        format!(
+            "[filesystem]\nread = [\"{tree}\"]\nexecute = [\"{tree}\"]\n",
+            tree = tree.display()
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(bailey())
+        .env("PATH", format!("{}:/usr/bin:/bin", linked.display()))
+        .args(["run", "-c"])
+        .arg(&config)
+        .arg("prog")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success() && stdout.contains("ran"),
+        "the target must run: {stdout}{stderr}"
+    );
+}
+
 /// A refusal made while the sandbox is built reaches the user as written.
 ///
 /// The child that builds the sandbox can only hand `Command` an errno, so a
