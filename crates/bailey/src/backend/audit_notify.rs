@@ -77,6 +77,16 @@ const PATH_MAX: usize = 4096;
 /// Directory descriptor meaning "resolve against the caller's working
 /// directory".
 const AT_FDCWD: i64 = -100;
+
+/// A syscall's `int` argument, from the 64-bit register that carries it.
+///
+/// The ABI leaves the upper 32 bits undefined, and a caller that loads
+/// `AT_FDCWD` with a 32-bit move leaves them zero, so the register reads
+/// `0xffffff9c` rather than -100. The kernel reads only the low half, and so
+/// does this.
+fn int_arg(value: u64) -> i64 {
+    i64::from(value as u32 as i32)
+}
 /// `execveat` flag meaning the path argument is empty and `dirfd` names the
 /// file itself.
 const AT_EMPTY_PATH: u64 = 0x1000;
@@ -741,7 +751,7 @@ fn handle_notification(reads: &mut Reads, pid: u32, nr: i64, args: [u64; 6], fir
             if args[3] & AT_EMPTY_PATH != 0 {
                 // The kernel opens the file `dirfd` names; the path argument
                 // is ignored.
-                return match base_directory_path(pid, args[0] as i64) {
+                return match base_directory_path(pid, int_arg(args[0])) {
                     Some(path) => Step::Recorded(event(
                         AccessKind::Execute,
                         Resource::Path(path),
@@ -751,20 +761,21 @@ fn handle_notification(reads: &mut Reads, pid: u32, nr: i64, args: [u64; 6], fir
                     None => Step::Dropped,
                 };
             }
-            match resolve_path(reads, pid, args[1], args[0] as i64, Resolve::Plain) {
+            match resolve_path(reads, pid, args[1], int_arg(args[0]), Resolve::Plain) {
                 Ok((resource, resolution)) => {
                     Step::Recorded(event(AccessKind::Execute, resource, pid, resolution))
                 }
                 Err(err) => failed(err),
             }
         }
-        libc::SYS_openat => match resolve_path(reads, pid, args[1], args[0] as i64, Resolve::Plain)
-        {
-            Ok((resource, resolution)) => {
-                Step::Recorded(event(access_of(args[2]), resource, pid, resolution))
+        libc::SYS_openat => {
+            match resolve_path(reads, pid, args[1], int_arg(args[0]), Resolve::Plain) {
+                Ok((resource, resolution)) => {
+                    Step::Recorded(event(access_of(args[2]), resource, pid, resolution))
+                }
+                Err(err) => failed(err),
             }
-            Err(err) => failed(err),
-        },
+        }
         OPEN_ARM => match resolve_path(reads, pid, args[0], AT_FDCWD, Resolve::Plain) {
             Ok((resource, resolution)) => {
                 Step::Recorded(event(access_of(args[1]), resource, pid, resolution))
@@ -805,7 +816,7 @@ fn handle_notification(reads: &mut Reads, pid: u32, nr: i64, args: [u64; 6], fir
             } else {
                 Resolve::Plain
             };
-            match resolve_path(reads, pid, args[1], args[0] as i64, resolve) {
+            match resolve_path(reads, pid, args[1], int_arg(args[0]), resolve) {
                 Ok((resource, resolution)) => {
                     Step::Recorded(event(kind, resource, pid, resolution))
                 }
@@ -1097,6 +1108,14 @@ mod tests {
         assert_eq!(opened.kind, AccessKind::Read);
         assert_eq!(opened.resolution, Resolution::Absolute);
         assert!(outcome.dropped == 0, "nothing was dropped");
+    }
+
+    #[test]
+    fn an_int_argument_is_read_from_the_low_half_of_its_register() {
+        // `AT_FDCWD` loaded with a 32-bit move, and with a sign-extending one.
+        assert_eq!(int_arg(0x0000_0000_ffff_ff9c), AT_FDCWD);
+        assert_eq!(int_arg(0xffff_ffff_ffff_ff9c), AT_FDCWD);
+        assert_eq!(int_arg(7), 7);
     }
 
     #[test]
