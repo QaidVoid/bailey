@@ -908,146 +908,164 @@ impl EnforceBackend {
         // then wait on. Namespaces and the reconstructed root are set up
         // first, then Landlock is applied against the new root, then seccomp
         // closes the syscall surface last.
+        // Close-on-exec, so a successful exec leaves the parent reading
+        // nothing, and a failed setup leaves its message behind.
+        let (setup_error_read, setup_error_write) =
+            nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC)
+                .map_err(|err| BackendError::Io(io::Error::from_raw_os_error(err as i32)))?;
+        let setup_error_fd = setup_error_write.as_raw_fd();
         unsafe {
             command.pre_exec(move || {
-                set_no_new_privs()?;
-                // Set before the namespaces and before seccomp: an rlimit is
-                // inherited across fork and exec, so every process the target
-                // goes on to start carries it too, and lowering it here cannot
-                // be undone by a target that has no privilege to raise it.
-                if let Some(bytes) = file_bytes {
-                    set_file_size_limit(bytes)?;
-                }
-                // A process may raise its own soft limit as far as the hard
-                // one, so leaving the hard limit unlimited lets a target
-                // arrange its own core dump. Where that dump goes is the
-                // host's `core_pattern`, which may be a program that runs
-                // outside the sandbox with the target's memory.
-                set_no_core_dumps()?;
-                if stop_before_exec {
-                    // Trace ourselves, so the kernel stops this process at
-                    // `execve` rather than before it. Stopping earlier would
-                    // deadlock: the parent's spawn does not return until this
-                    // process execs or fails.
-                    libc::ptrace(
-                        libc::PTRACE_TRACEME,
-                        0,
-                        std::ptr::null_mut::<libc::c_void>(),
-                        std::ptr::null_mut::<libc::c_void>(),
-                    );
-                }
-                // Before the namespaces, while the host's cgroup filesystem is
-                // still reachable.
-                if let Some(procs) = &procs {
-                    std::fs::write(procs, "0")?;
-                }
-                if let Some(isolation) = &isolation {
-                    isolation::enter(isolation, create_guard)
-                        .map_err(|error| io::Error::other(format!("enter: {error}")))?;
-                } else if network_only {
-                    network::enter_isolated(create_guard)?;
-                }
-                // After the namespaces, where the count starts at this process:
-                // set before them it would charge the fork isolation makes to
-                // reach PID 1 against the policy's number.
-                if let Some(max) = pids_via_rlimit {
-                    set_process_limit(max)?;
-                }
-                // Inside the namespace now and before any policy: the forward
-                // listeners must bind the sandbox's own loopback, and Landlock
-                // comes after. The descriptors cross to the parent and are
-                // closed here at exec.
-                if let Some(fd) = forward_fd {
-                    forward::arm(fd, &forward_ports)?;
-                }
-                // Landlock and self-serve mounts cannot be combined: this
-                // kernel refuses a new filesystem to any process under a
-                // Landlock domain, and a FUSE mount is a new filesystem.
-                // Confinement then rests on the reconstructed root alone,
-                // which is why the config refuses the mount-backed
-                // restrictions the target could take down.
-                if !keep_mount {
-                    plan.apply()?;
-                }
-                // Both rlimits land after the setup steps that open
-                // descriptors or map memory (the namespace and root
-                // reconstruction, the forward listeners, the Landlock
-                // ruleset), so the target's numbers bound the target's tree
-                // rather than the run's own scaffolding. Seccomp and the
-                // capability drop after them need neither new descriptors nor
-                // meaningful address space. The PID 1 supervisor that spawns
-                // the target under isolation comes after and is bounded,
-                // which is correct: it is part of the target's tree.
-                if let Some(count) = open_files {
-                    set_open_files_limit(count)?;
-                }
-                if let Some(bytes) = address_space_via_rlimit {
-                    set_address_space_limit(bytes)?;
-                }
-                seccompiler::apply_filter(&seccomp)
-                    .map_err(|err| io::Error::other(format!("seccomp: {err}")))?;
-                // Last, so everything above still has what it needs. With no
-                // capabilities left, a user namespace a target reaches through
-                // `clone` maps nothing the target could not already name, and
-                // the mount syscalls it would need inside one are denied
-                // outright; `unshare` and `setns` are denied for the same
-                // reason.
-                drop_capabilities(keep_mount)?;
-                // The fallback audit's observer, armed last of all: nothing
-                // bailey does in the child after this point is notified
-                // except the final exec, and the listener crosses to the
-                // supervisor before the target can name anything. The child
-                // end of the handover socket is close-on-exec, so it does not
-                // survive into the target either.
-                if let Some(handover) = audit_listener {
-                    // An inherited listener means this audit is nested
-                    // inside another fallback audit, and a stack holds
-                    // exactly one. The outer run arms the marker with its
-                    // target's environment, so the marker is what refuses
-                    // cleanly. Mainstream kernels answer the second install
-                    // with EBUSY (EINVAL where the arming task is a fork of
-                    // an observed process), which covers a listener nobody
-                    // marked; some kernels let the install stand and fail
-                    // the exec instead, and the errno mapping below is what
-                    // names those.
-                    if std::env::var_os(AUDIT_LISTENER_MARKER).is_some() {
-                        return Err(io::Error::other(
-                            "a seccomp listener already observes this \
+                let result = (|| -> io::Result<()> {
+                    set_no_new_privs()?;
+                    // Set before the namespaces and before seccomp: an rlimit is
+                    // inherited across fork and exec, so every process the target
+                    // goes on to start carries it too, and lowering it here cannot
+                    // be undone by a target that has no privilege to raise it.
+                    if let Some(bytes) = file_bytes {
+                        set_file_size_limit(bytes)?;
+                    }
+                    // A process may raise its own soft limit as far as the hard
+                    // one, so leaving the hard limit unlimited lets a target
+                    // arrange its own core dump. Where that dump goes is the
+                    // host's `core_pattern`, which may be a program that runs
+                    // outside the sandbox with the target's memory.
+                    set_no_core_dumps()?;
+                    if stop_before_exec {
+                        // Trace ourselves, so the kernel stops this process at
+                        // `execve` rather than before it. Stopping earlier would
+                        // deadlock: the parent's spawn does not return until this
+                        // process execs or fails.
+                        libc::ptrace(
+                            libc::PTRACE_TRACEME,
+                            0,
+                            std::ptr::null_mut::<libc::c_void>(),
+                            std::ptr::null_mut::<libc::c_void>(),
+                        );
+                    }
+                    // Before the namespaces, while the host's cgroup filesystem is
+                    // still reachable.
+                    if let Some(procs) = &procs {
+                        std::fs::write(procs, "0")?;
+                    }
+                    if let Some(isolation) = &isolation {
+                        isolation::enter(isolation, create_guard)
+                            .map_err(|error| io::Error::other(format!("enter: {error}")))?;
+                    } else if network_only {
+                        network::enter_isolated(create_guard)?;
+                    }
+                    // After the namespaces, where the count starts at this process:
+                    // set before them it would charge the fork isolation makes to
+                    // reach PID 1 against the policy's number.
+                    if let Some(max) = pids_via_rlimit {
+                        set_process_limit(max)?;
+                    }
+                    // Inside the namespace now and before any policy: the forward
+                    // listeners must bind the sandbox's own loopback, and Landlock
+                    // comes after. The descriptors cross to the parent and are
+                    // closed here at exec.
+                    if let Some(fd) = forward_fd {
+                        forward::arm(fd, &forward_ports)?;
+                    }
+                    // Landlock and self-serve mounts cannot be combined: this
+                    // kernel refuses a new filesystem to any process under a
+                    // Landlock domain, and a FUSE mount is a new filesystem.
+                    // Confinement then rests on the reconstructed root alone,
+                    // which is why the config refuses the mount-backed
+                    // restrictions the target could take down.
+                    if !keep_mount {
+                        plan.apply()?;
+                    }
+                    // Both rlimits land after the setup steps that open
+                    // descriptors or map memory (the namespace and root
+                    // reconstruction, the forward listeners, the Landlock
+                    // ruleset), so the target's numbers bound the target's tree
+                    // rather than the run's own scaffolding. Seccomp and the
+                    // capability drop after them need neither new descriptors nor
+                    // meaningful address space. The PID 1 supervisor that spawns
+                    // the target under isolation comes after and is bounded,
+                    // which is correct: it is part of the target's tree.
+                    if let Some(count) = open_files {
+                        set_open_files_limit(count)?;
+                    }
+                    if let Some(bytes) = address_space_via_rlimit {
+                        set_address_space_limit(bytes)?;
+                    }
+                    seccompiler::apply_filter(&seccomp)
+                        .map_err(|err| io::Error::other(format!("seccomp: {err}")))?;
+                    // Last, so everything above still has what it needs. With no
+                    // capabilities left, a user namespace a target reaches through
+                    // `clone` maps nothing the target could not already name, and
+                    // the mount syscalls it would need inside one are denied
+                    // outright; `unshare` and `setns` are denied for the same
+                    // reason.
+                    drop_capabilities(keep_mount)?;
+                    // The fallback audit's observer, armed last of all: nothing
+                    // bailey does in the child after this point is notified
+                    // except the final exec, and the listener crosses to the
+                    // supervisor before the target can name anything. The child
+                    // end of the handover socket is close-on-exec, so it does not
+                    // survive into the target either.
+                    if let Some(handover) = audit_listener {
+                        // An inherited listener means this audit is nested
+                        // inside another fallback audit, and a stack holds
+                        // exactly one. The outer run arms the marker with its
+                        // target's environment, so the marker is what refuses
+                        // cleanly. Mainstream kernels answer the second install
+                        // with EBUSY (EINVAL where the arming task is a fork of
+                        // an observed process), which covers a listener nobody
+                        // marked; some kernels let the install stand and fail
+                        // the exec instead, and the errno mapping below is what
+                        // names those.
+                        if std::env::var_os(AUDIT_LISTENER_MARKER).is_some() {
+                            return Err(io::Error::other(
+                                "a seccomp listener already observes this \
                              process, and a fallback audit cannot run \
                              nested",
-                        ));
-                    }
-                    audit_notify::arm(handover).map_err(|err| {
-                        if err
-                            .raw_os_error()
-                            .is_some_and(|errno| errno == libc::EBUSY || errno == libc::EINVAL)
-                        {
-                            io::Error::other(
-                                "a seccomp listener already observes this \
+                            ));
+                        }
+                        audit_notify::arm(handover).map_err(|err| {
+                            if err
+                                .raw_os_error()
+                                .is_some_and(|errno| errno == libc::EBUSY || errno == libc::EINVAL)
+                            {
+                                io::Error::other(
+                                    "a seccomp listener already observes this \
                                  process, and a fallback audit cannot run \
                                  nested",
-                            )
-                        } else {
-                            err
-                        }
-                    })?;
+                                )
+                            } else {
+                                err
+                            }
+                        })?;
+                    }
+                    // This process is PID 1 of the sandbox. Exec'ing the target
+                    // here would make the target the namespace's init, and the
+                    // kernel reaps nothing for an init: every orphan the target
+                    // leaves would stay a zombie pinning a host PID until the run
+                    // ended. The target runs as a child instead, and this process
+                    // waits, reaping what reparents to it. Only a non-isolated run
+                    // falls through to the exec below.
+                    if isolation.is_some() {
+                        isolation::run_as_init(
+                            &target_program,
+                            &target_args,
+                            &target_env,
+                            target_cwd.as_deref(),
+                        )?;
+                    }
+                    Ok(())
+                })();
+                // An error that carries only a message reaches the parent as a
+                // bare EINVAL, which is all `Command` passes back, so the
+                // message goes down the pipe first.
+                if let Err(error) = &result
+                    && error.raw_os_error().is_none()
+                {
+                    let message = error.to_string();
+                    libc::write(setup_error_fd, message.as_ptr().cast(), message.len());
                 }
-                // This process is PID 1 of the sandbox. Exec'ing the target
-                // here would make the target the namespace's init, and the
-                // kernel reaps nothing for an init: every orphan the target
-                // leaves would stay a zombie pinning a host PID until the run
-                // ended. The target runs as a child instead, and this process
-                // waits, reaping what reparents to it. Only a non-isolated run
-                // falls through to the exec below.
-                if isolation.is_some() {
-                    isolation::run_as_init(
-                        &target_program,
-                        &target_args,
-                        &target_env,
-                        target_cwd.as_deref(),
-                    )?;
-                }
-                Ok(())
+                result
             });
         }
 
@@ -1077,7 +1095,22 @@ impl EnforceBackend {
             up
         });
 
-        let child = command.spawn().map_err(BackendError::Io)?;
+        let spawned = command.spawn();
+        let child = match spawned {
+            Ok(child) => child,
+            Err(error) => {
+                drop(setup_error_write);
+                let mut message = String::new();
+                let _ = io::Read::read_to_string(
+                    &mut std::fs::File::from(setup_error_read),
+                    &mut message,
+                );
+                if !message.is_empty() {
+                    return Err(BackendError::Command(message));
+                }
+                return Err(BackendError::Io(error));
+            }
+        };
         // The parent's copy of the child end must close before the handover is
         // read, or the socket never reaches an end when the sandbox dies.
         drop(forward_child_end);

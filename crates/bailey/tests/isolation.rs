@@ -1067,3 +1067,48 @@ fn a_connect_entry_binds_its_socket_and_nothing_else() {
         "the unlisted socket must not be visible in the runtime directory: {stdout}"
     );
 }
+/// A refusal made while the sandbox is built reaches the user as written.
+///
+/// The child that builds the sandbox can only hand `Command` an errno, so a
+/// refusal that is a message arrived as "Invalid argument" and said nothing
+/// about what was wrong.
+#[test]
+fn a_refusal_while_building_the_sandbox_names_its_reason() {
+    if !isolation_active() {
+        common::skip("isolation unavailable on this host");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    fs::create_dir_all(&project).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let secret = outside.path().join("secret");
+    fs::write(&secret, "x").unwrap();
+    std::os::unix::fs::symlink(&secret, project.join("escape")).unwrap();
+
+    let config = dir.path().join("bailey.toml");
+    fs::write(
+        &config,
+        format!(
+            "[filesystem]\nread = [\"{project}\"]\nread_only = [\"{escape}\"]\n",
+            project = project.display(),
+            escape = project.join("escape").display()
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(bailey())
+        .args(["run", "-c"])
+        .arg(&config)
+        .arg("/bin/true")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "the run must be refused: {stderr}"
+    );
+    assert!(stderr.contains("leaves the sandbox"), "{stderr}");
+    assert!(!stderr.contains("Invalid argument"), "{stderr}");
+}

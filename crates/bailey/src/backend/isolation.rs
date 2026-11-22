@@ -790,13 +790,27 @@ fn mount_ca_bundle(new_root: &Path, source: &Path, overlays: &[PathBuf]) -> io::
             MsFlags::MS_BIND,
             None::<&str>,
         )
-        .map_err(errno)?;
+        .map_err(|err| {
+            io::Error::other(format!(
+                "binding the CA bundle {} onto {}: {err}",
+                source.display(),
+                path.display()
+            ))
+        })?;
         // Named by its real path rather than the descriptor, for the same
         // reason `conceal_all` names its target that way. The mount inherits
         // its flags from the host filesystem the bundle sits on, so the
         // remount repeats what `locked_flags` says the kernel refuses to see
         // dropped, exactly as `remount_read_only` does for its grants.
-        let carried = statvfs(&visible).map_err(errno)?.flags().bits();
+        let carried = statvfs(&visible)
+            .map_err(|err| {
+                io::Error::other(format!(
+                    "reading the mount flags of the CA bundle at {}: {err}",
+                    path.display()
+                ))
+            })?
+            .flags()
+            .bits();
         mount(
             None::<&str>,
             &visible,
@@ -804,7 +818,12 @@ fn mount_ca_bundle(new_root: &Path, source: &Path, overlays: &[PathBuf]) -> io::
             MsFlags::MS_REMOUNT | MsFlags::MS_BIND | MsFlags::MS_RDONLY | locked_flags(carried),
             None::<&str>,
         )
-        .map_err(errno)?;
+        .map_err(|err| {
+            io::Error::other(format!(
+                "remounting the CA bundle at {} read-only: {err}",
+                path.display()
+            ))
+        })?;
         landed += 1;
     }
     Ok(landed)
